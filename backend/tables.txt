@@ -1,0 +1,29 @@
+### Supabase Table Reference
+
+Run these commands in your Supabase SQL Editor to set up the chat history functionality.
+
+---
+
+1. Create Sessions Table:
+CREATE TABLE sessions (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  title TEXT NOT NULL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+2. Create Messages Table:
+CREATE TABLE messages (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
+  role TEXT NOT NULL, -- 'user' or 'assistant'
+  content TEXT NOT NULL, -- stores the prompt or the generated code
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+3. Enable Realtime (Optional but Recommended):
+ALTER PUBLICATION supabase_realtime ADD TABLE messages;
+ALTER PUBLICATION supabase_realtime ADD TABLE sessions;
+
+---
+
+Note: Ensure you have "Enable Row Level Security (RLS)" turned off for these tables initially for development, or add policies to allow anonymous insert/select.

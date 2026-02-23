@@ -5,6 +5,8 @@ import os
 import socket
 from dotenv import load_dotenv
 from google import genai
+from supabase import create_client, Client
+from typing import Optional
 
 load_dotenv()
 
@@ -25,14 +27,73 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
+# Supabase Config
+supabase_url = os.getenv("SUPABASE_URL")
+supabase_key = os.getenv("SUPABASE_ANON_KEY")
+
+supabase: Optional[Client] = None
+if supabase_url and supabase_key:
+    supabase = create_client(supabase_url, supabase_key)
+else:
+    print("Warning: Supabase environment variables not found")
+
 class PromptRequest(BaseModel):
     prompt: str
+    session_id: Optional[str] = None
 
+class SessionCreate(BaseModel):
+    title: str
+
+class SessionUpdate(BaseModel):
+    title: str
 
 @app.get("/")
 async def read_root():
     return {"message": "FastAPI backend is running"}
 
+# --- Chat History Endpoints ---
+
+@app.get("/sessions")
+async def get_sessions():
+    if not supabase: return []
+    try:
+        response = supabase.table("sessions").select("*").order("created_at", desc=True).execute()
+        return response.data
+    except Exception as e:
+        print(f"Supabase error (get_sessions): {e}")
+        return []
+
+@app.post("/sessions")
+async def create_session(session: SessionCreate):
+    if not supabase: raise HTTPException(status_code=503, detail="Supabase not configured")
+    try:
+        response = supabase.table("sessions").insert({"title": session.title}).execute()
+        return response.data[0]
+    except Exception as e:
+        print(f"Supabase error (create_session): {e}")
+        raise HTTPException(status_code=500, detail="Failed to create session. Ensure database tables exist.")
+
+@app.patch("/sessions/{session_id}")
+async def update_session(session_id: str, session: SessionUpdate):
+    if not supabase: raise HTTPException(status_code=503, detail="Supabase not configured")
+    try:
+        response = supabase.table("sessions").update({"title": session.title}).eq("id", session_id).execute()
+        return response.data[0]
+    except Exception as e:
+        print(f"Supabase error (update_session): {e}")
+        raise HTTPException(status_code=500, detail="Failed to rename session.")
+
+@app.get("/sessions/{session_id}/messages")
+async def get_messages(session_id: str):
+    if not supabase: return []
+    try:
+        response = supabase.table("messages").select("*").eq("session_id", session_id).order("created_at").execute()
+        return response.data
+    except Exception as e:
+        print(f"Supabase error (get_messages): {e}")
+        return []
+
+# --- Generation Endpoint ---
 
 @app.post("/generate")
 async def generate_freecad_code(request: PromptRequest):
@@ -41,18 +102,39 @@ async def generate_freecad_code(request: PromptRequest):
 
     try:
         system_instruction = (
-            "You are a FreeCAD Python script generator. "
-            "Generate ONLY the Python code to create the requested object in FreeCAD. "
-            "Do not include markdown or explanations."
+            "You are a FreeCAD Python expert. Generate ONLY a working Python script for FreeCAD. "
+            "Follow these rules strictly:\n"
+            "1. Use 'import Part', 'import FreeCAD', and 'import PartDesign'.\n"
+            "2. For simple shapes, use 'Part.makeBox', 'Part.makeCylinder', etc.\n"
+            "3. For complex shapes like involute gears, do NOT use 'Part::InvoluteGear' directly. "
+            "Instead, use the 'PartDesign' or 'Part' module API correctly (e.g., standard primitives or extruding a wire).\n"
+            "4. Always add the object to the document using 'App.ActiveDocument.addObject' and 'doc.recompute()'.\n"
+            "5. NO markdown formatting, NO explanations, ONLY the Python code."
         )
 
         response = client.models.generate_content(
             model="gemini-3-flash-preview",
             contents=f"{system_instruction}\n\nUser prompt: {request.prompt}",
         )
+        
+        generated_code = response.text
 
-        return {"code": response.text}
+        # Save to Supabase if session_id is provided
+        if supabase and request.session_id:
+            try:
+                supabase.table("messages").insert({
+                    "session_id": request.session_id, "role": "user", "content": request.prompt
+                }).execute()
+                supabase.table("messages").insert({
+                    "session_id": request.session_id, "role": "assistant", "content": generated_code
+                }).execute()
+            except Exception as e:
+                print(f"Supabase save error: {e}")
+                # We don't raise an exception here because we want to return the code anyway
+
+        return {"code": generated_code}
     except Exception as e:
+        print(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/run-in-freecad")
