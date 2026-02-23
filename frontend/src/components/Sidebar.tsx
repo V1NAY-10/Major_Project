@@ -77,6 +77,37 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         }
     };
 
+    const handleSelectSession = async (id: string) => {
+        if (id === currentSessionId) return;
+
+        // Trigger sync before switching
+        try {
+            await fetch(`http://127.0.0.1:8000/sessions/${id}/sync`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ previous_session_id: currentSessionId }),
+            });
+        } catch (err) {
+            console.error("Failed to sync session with FreeCAD", err);
+        }
+
+        onSelectSession(id);
+    };
+
+    const handleNewChatClick = async () => {
+        // Trigger sync to "new" state before resetting
+        try {
+            await fetch(`http://127.0.0.1:8000/sessions/new/sync`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ previous_session_id: currentSessionId }),
+            });
+        } catch (err) {
+            console.error("Failed to sync new chat with FreeCAD", err);
+        }
+        onNewChat();
+    };
+
     return (
         <>
             <button
@@ -89,7 +120,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
             <div className={`fixed inset-y-0 left-0 z-40 w-64 bg-black/40 backdrop-blur-2xl border-r border-white/10 transition-transform duration-300 transform ${isOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0 flex flex-col`}>
                 <div className="p-4 flex flex-col h-full">
                     <button
-                        onClick={onNewChat}
+                        onClick={handleNewChatClick}
                         className="flex items-center gap-3 w-full p-4 mb-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-white font-medium transition-all group"
                     >
                         <Plus size={18} className="group-hover:rotate-90 transition-transform" />
@@ -119,7 +150,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
                                 ) : (
                                     <div className="relative">
                                         <button
-                                            onClick={() => onSelectSession(session.id)}
+                                            onClick={() => handleSelectSession(session.id)}
                                             className={`flex items-center gap-3 w-full p-3 rounded-xl text-left text-sm transition-all pr-10 ${currentSessionId === session.id
                                                 ? "bg-purple-600/30 text-purple-200 border border-purple-500/30"
                                                 : "text-white/70 hover:bg-white/5 hover:text-white"

@@ -47,6 +47,9 @@ class SessionCreate(BaseModel):
 class SessionUpdate(BaseModel):
     title: str
 
+class SyncRequest(BaseModel):
+    previous_session_id: Optional[str] = None
+
 @app.get("/")
 async def read_root():
     return {"message": "FastAPI backend is running"}
@@ -93,6 +96,32 @@ async def get_messages(session_id: str):
         print(f"Supabase error (get_messages): {e}")
         return []
 
+@app.post("/sessions/{session_id}/sync")
+async def sync_session(session_id: str, request: SyncRequest):
+    """Signals the FreeCAD listener to save the current doc and switch to a new one."""
+    import json
+    command = {
+        "action": "sync_session",
+        "current_id": session_id,
+        "previous_id": request.previous_session_id
+    }
+    # Send as internal command prefix
+    internal_cmd = f"__INTERNAL_CMD__{json.dumps(command)}"
+    
+    print(f"--- Syncing session: {session_id} (Prev: {request.previous_session_id}) ---")
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect(("127.0.0.1", 6666))
+            s.sendall(internal_cmd.encode('utf-8'))
+            data = s.recv(1024)
+            if data == b"OK":
+                return {"status": "success"}
+    except Exception as e:
+        print(f"Sync error: {e}")
+        # Don't fail the whole request, maybe the listener isn't running
+        return {"status": "error", "message": str(e)}
+
 # --- Generation Endpoint ---
 
 @app.post("/generate")
@@ -104,12 +133,12 @@ async def generate_freecad_code(request: PromptRequest):
         system_instruction = (
             "You are a FreeCAD Python expert. Generate ONLY a working Python script for FreeCAD. "
             "Follow these rules strictly:\n"
-            "1. Use 'import Part', 'import FreeCAD', and 'import PartDesign'.\n"
+            "1. Use 'import Part', 'import FreeCAD as App', and 'import PartDesign'.\n"
             "2. For simple shapes, use 'Part.makeBox', 'Part.makeCylinder', etc.\n"
-            "3. For complex shapes like involute gears, do NOT use 'Part::InvoluteGear' directly. "
-            "Instead, use the 'PartDesign' or 'Part' module API correctly (e.g., standard primitives or extruding a wire).\n"
-            "4. Always add the object to the document using 'App.ActiveDocument.addObject' and 'doc.recompute()'.\n"
-            "5. NO markdown formatting, NO explanations, ONLY the Python code."
+            "3. For complex shapes like involute gears, use the 'PartDesign' or 'Part' module API correctly.\n"
+            "4. A document is pre-initialized. Use: 'doc = App.ActiveDocument'. NEVER use 'App.newDocument()'.\n"
+            "5. Add objects using 'doc.addObject' and always call 'doc.recompute()'.\n"
+            "6. NO markdown, NO explanations, NO comments outside the code blocks. ONLY Python code."
         )
 
         response = client.models.generate_content(
@@ -118,6 +147,17 @@ async def generate_freecad_code(request: PromptRequest):
         )
         
         generated_code = response.text
+
+        # Basic sanitization: Extract only the content within markdown code blocks if present
+        if "```" in generated_code:
+            import re
+            match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", generated_code, re.DOTALL)
+            if match:
+                generated_code = match.group(1).strip()
+            else:
+                # Fallback: Strip lines starting with backticks
+                lines = generated_code.splitlines()
+                generated_code = "\n".join([l for l in lines if not l.strip().startswith("```")]).strip()
 
         # Save to Supabase if session_id is provided
         if supabase and request.session_id:

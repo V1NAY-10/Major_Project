@@ -92,6 +92,13 @@ export default function Home() {
         const sessionData = await res.json();
         sessionId = sessionData.id;
         setCurrentSessionId(sessionId);
+
+        // Trigger sync for the first time
+        await fetch(`http://127.0.0.1:8000/sessions/${sessionId}/sync`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ previous_session_id: null }),
+        });
       } catch (err) {
         console.error("Failed to create session", err);
         // Continue anyway if backend supabase is not configured
