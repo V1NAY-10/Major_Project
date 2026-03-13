@@ -3,6 +3,8 @@ import { useState, useEffect, useRef } from "react";
 import { Send, Zap, Loader2 } from "lucide-react";
 import Sidebar from "@/components/Sidebar";
 import ChatMessage from "@/components/ChatMessage";
+import { API_URL } from "@/lib/api";
+import { useUser } from "@clerk/nextjs";
 
 interface Message {
   id?: string;
@@ -11,6 +13,7 @@ interface Message {
 }
 
 export default function Home() {
+  const { user } = useUser();
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -30,16 +33,16 @@ export default function Home() {
   }, [messages, loading]);
 
   useEffect(() => {
-    if (currentSessionId) {
-      fetchMessages(currentSessionId);
-    } else {
+    if (currentSessionId && user?.id) {
+      fetchMessages(currentSessionId, user.id);
+    } else if (!currentSessionId) {
       setMessages([]);
     }
-  }, [currentSessionId]);
+  }, [currentSessionId, user?.id]);
 
-  const fetchMessages = async (sessionId: string) => {
+  const fetchMessages = async (sessionId: string, userId: string) => {
     try {
-      const response = await fetch(`http://127.0.0.1:8000/sessions/${sessionId}/messages`);
+      const response = await fetch(`${API_URL}/sessions/${sessionId}/messages?user_id=${userId}`);
       const data = await response.json();
       setMessages(data);
     } catch (err) {
@@ -58,7 +61,7 @@ export default function Home() {
     setError("");
     setSuccessMsg("");
     try {
-      const response = await fetch("http://127.0.0.1:8000/run-in-freecad", {
+      const response = await fetch(`${API_URL}/run-in-freecad`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: code }),
@@ -84,20 +87,20 @@ export default function Home() {
     if (!sessionId) {
       try {
         const title = prompt.slice(0, 30) + (prompt.length > 30 ? "..." : "");
-        const res = await fetch("http://127.0.0.1:8000/sessions", {
+        const res = await fetch(`${API_URL}/sessions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title }),
+          body: JSON.stringify({ title, user_id: user?.id }),
         });
         const sessionData = await res.json();
         sessionId = sessionData.id;
         setCurrentSessionId(sessionId);
 
         // Trigger sync for the first time
-        await fetch(`http://127.0.0.1:8000/sessions/${sessionId}/sync`, {
+        await fetch(`${API_URL}/sessions/${sessionId}/sync`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ previous_session_id: null }),
+          body: JSON.stringify({ previous_session_id: null, user_id: user?.id }),
         });
       } catch (err) {
         console.error("Failed to create session", err);
@@ -113,7 +116,7 @@ export default function Home() {
     setError("");
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/generate", {
+      const response = await fetch(`${API_URL}/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: currentPrompt, session_id: sessionId }),
@@ -132,7 +135,7 @@ export default function Home() {
   };
 
   return (
-    <div className="flex h-screen bg-[#050505] text-white overflow-hidden font-sans">
+    <div className="flex h-screen bg-background text-foreground overflow-hidden font-sans transition-colors duration-300">
       <Sidebar
         currentSessionId={currentSessionId}
         onSelectSession={setCurrentSessionId}
@@ -144,7 +147,7 @@ export default function Home() {
         <div className="absolute inset-0 bg-linear-to-b from-purple-900/10 via-transparent to-transparent pointer-events-none" />
 
         {/* Header */}
-        <header className="sticky top-0 z-30 p-4 border-b border-white/5 bg-black/20 backdrop-blur-xl flex items-center justify-between">
+        <header className="sticky top-0 z-30 p-4 border-b border-border bg-background/20 backdrop-blur-xl flex items-center justify-between">
           <div className="flex items-center gap-2">
             <div className="p-1.5 bg-purple-600 rounded-lg">
               <Zap size={18} fill="white" />
@@ -162,11 +165,11 @@ export default function Home() {
         <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-4 custom-scrollbar">
           {messages.length === 0 && !loading && (
             <div className="h-full flex flex-col items-center justify-center text-center space-y-4 max-w-md mx-auto">
-              <div className="w-16 h-16 bg-white/5 rounded-3xl flex items-center justify-center mb-4 border border-white/10">
+              <div className="w-16 h-16 bg-foreground/5 rounded-3xl flex items-center justify-center mb-4 border border-border">
                 <Zap size={32} className="text-purple-400" />
               </div>
               <h2 className="text-2xl font-bold">What are we building?</h2>
-              <p className="text-white/40 text-sm">
+              <p className="text-foreground/40 text-sm">
                 Describe a 3D object, and I'll generate the FreeCAD Python code for you.
               </p>
               <div className="grid grid-cols-1 gap-2 w-full mt-8">
@@ -174,7 +177,7 @@ export default function Home() {
                   <button
                     key={suggestion}
                     onClick={() => setPrompt(suggestion)}
-                    className="p-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-left text-xs transition-all"
+                    className="p-3 bg-foreground/5 hover:bg-foreground/10 border border-border rounded-xl text-left text-xs transition-all"
                   >
                     {suggestion}
                   </button>
@@ -194,9 +197,9 @@ export default function Home() {
 
           {loading && (
             <div className="flex justify-start mb-6">
-              <div className="bg-white/5 backdrop-blur-md border border-white/10 rounded-2xl p-4 flex items-center gap-3">
+              <div className="bg-foreground/5 backdrop-blur-md border border-border rounded-2xl p-4 flex items-center gap-3">
                 <Loader2 size={16} className="animate-spin text-purple-400" />
-                <span className="text-sm text-white/60">Generating code...</span>
+                <span className="text-sm text-foreground/60">Generating code...</span>
               </div>
             </div>
           )}
@@ -211,7 +214,7 @@ export default function Home() {
         </div>
 
         {/* Input Area */}
-        <div className="p-4 md:p-8 bg-linear-to-t from-black via-black/80 to-transparent">
+        <div className="p-4 md:p-8 bg-linear-to-t from-background via-background/80 to-transparent">
           <form
             onSubmit={handleGenerate}
             className="max-w-3xl mx-auto relative group"
@@ -226,7 +229,7 @@ export default function Home() {
                 }
               }}
               placeholder="Ask me to generate a 3D model..."
-              className="w-full bg-white/5 hover:bg-white/10 focus:bg-white/10 border border-white/10 focus:border-purple-500/50 rounded-2xl p-4 pr-14 text-white placeholder-white/20 focus:outline-hidden transition-all resize-none shadow-2xl min-h-[60px] max-h-32"
+              className="w-full bg-foreground/5 hover:bg-foreground/10 focus:bg-foreground/10 border border-border focus:border-primary/50 rounded-2xl p-4 pr-14 text-foreground placeholder-foreground/20 focus:outline-hidden transition-all resize-none shadow-2xl min-h-[60px] max-h-32"
             />
             <button
               type="submit"
@@ -236,7 +239,7 @@ export default function Home() {
               {loading ? <Loader2 size={20} className="animate-spin" /> : <Send size={20} />}
             </button>
           </form>
-          <p className="text-[10px] text-center mt-3 text-white/20 uppercase tracking-widest">
+          <p className="text-[10px] text-center mt-3 text-foreground/20 uppercase tracking-widest">
             FreeCAD Python Code Generator • Powered by Gemini Flash
           </p>
         </div>

@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-google-genai
+openai
 pydantic
 python-dotenv
-supabase
+motor
+dnspython
 

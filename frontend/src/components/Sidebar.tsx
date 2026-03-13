@@ -1,6 +1,9 @@
 "use client";
 import { Plus, MessageSquare, Menu, X, Edit2, Check, Sun, Moon, Settings, LogOut } from "lucide-react";
+import { UserButton, useUser, useClerk } from "@clerk/nextjs";
 import { useState, useEffect, useRef } from "react";
+import { useTheme } from "next-themes";
+import { API_URL } from "@/lib/api";
 
 interface Session {
     id: string;
@@ -19,13 +22,22 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editValue, setEditValue] = useState("");
     const [showProfileMenu, setShowProfileMenu] = useState(false);
-    const [isDarkMode, setIsDarkMode] = useState(true);
+    const { theme, setTheme, resolvedTheme } = useTheme();
+    const { user } = useUser();
+    const { signOut } = useClerk();
+    const [mounted, setMounted] = useState(false);
 
     const profileMenuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
-        fetchSessions();
-    }, [currentSessionId]);
+        setMounted(true);
+    }, []);
+
+    useEffect(() => {
+        if (user?.id) {
+            fetchSessions(user.id);
+        }
+    }, [currentSessionId, user?.id]);
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
@@ -37,9 +49,10 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         return () => document.removeEventListener("mousedown", handleClickOutside);
     }, []);
 
-    const fetchSessions = async () => {
+    const fetchSessions = async (userId: string) => {
+        if (!userId || userId === "null" || userId === "undefined") return;
         try {
-            const response = await fetch("http://127.0.0.1:8000/sessions");
+            const response = await fetch(`${API_URL}/sessions?user_id=${userId}`);
             if (!response.ok) throw new Error("Failed to fetch sessions");
             const sessionsData = await response.json();
             setSessions(Array.isArray(sessionsData) ? sessionsData : []);
@@ -62,7 +75,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         }
 
         try {
-            const response = await fetch(`http://127.0.0.1:8000/sessions/${editingId}`, {
+            const response = await fetch(`${API_URL}/sessions/${editingId}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ title: editValue.trim() }),
@@ -82,10 +95,10 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
 
         // Trigger sync before switching
         try {
-            await fetch(`http://127.0.0.1:8000/sessions/${id}/sync`, {
+            await fetch(`${API_URL}/sessions/${id}/sync`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ previous_session_id: currentSessionId }),
+                body: JSON.stringify({ previous_session_id: currentSessionId, user_id: user?.id }),
             });
         } catch (err) {
             console.error("Failed to sync session with FreeCAD", err);
@@ -97,10 +110,10 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
     const handleNewChatClick = async () => {
         // Trigger sync to "new" state before resetting
         try {
-            await fetch(`http://127.0.0.1:8000/sessions/new/sync`, {
+            await fetch(`${API_URL}/sessions/new/sync`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ previous_session_id: currentSessionId }),
+                body: JSON.stringify({ previous_session_id: currentSessionId, user_id: user?.id }),
             });
         } catch (err) {
             console.error("Failed to sync new chat with FreeCAD", err);
@@ -117,18 +130,18 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
                 {isOpen ? <X size={20} /> : <Menu size={20} />}
             </button>
 
-            <div className={`fixed inset-y-0 left-0 z-40 w-64 bg-black/40 backdrop-blur-2xl border-r border-white/10 transition-transform duration-300 transform ${isOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0 flex flex-col`}>
+            <div className={`fixed inset-y-0 left-0 z-40 w-64 bg-sidebar backdrop-blur-2xl border-r border-sidebar-border transition-transform duration-300 transform ${isOpen ? "translate-x-0" : "-translate-x-full"} md:translate-x-0 flex flex-col`}>
                 <div className="p-4 flex flex-col h-full">
                     <button
                         onClick={handleNewChatClick}
-                        className="flex items-center gap-3 w-full p-4 mb-6 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-white font-medium transition-all group"
+                        className="flex items-center gap-3 w-full p-4 mb-6 bg-background/5 hover:bg-background border border-border rounded-2xl text-foreground font-semibold shadow-xs hover:shadow-sm transition-all group"
                     >
                         <Plus size={18} className="group-hover:rotate-90 transition-transform" />
                         New Chat
                     </button>
 
                     <div className="flex-1 overflow-y-auto space-y-2 custom-scrollbar">
-                        <h3 className="px-4 text-[10px] uppercase tracking-widest font-bold text-white/40 mb-2">History</h3>
+                        <h3 className="px-4 text-[10px] uppercase tracking-widest font-bold text-foreground/40 mb-2">History</h3>
                         {sessions.map((session) => (
                             <div key={session.id} className="relative group/item">
                                 {editingId === session.id ? (
@@ -151,9 +164,9 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
                                     <div className="relative">
                                         <button
                                             onClick={() => handleSelectSession(session.id)}
-                                            className={`flex items-center gap-3 w-full p-3 rounded-xl text-left text-sm transition-all pr-10 ${currentSessionId === session.id
-                                                ? "bg-purple-600/30 text-purple-200 border border-purple-500/30"
-                                                : "text-white/70 hover:bg-white/5 hover:text-white"
+                                            className={`flex items-center gap-3 w-full p-3 rounded-xl text-left text-sm transition-all pr-10 border ${currentSessionId === session.id
+                                                ? "bg-primary/10 text-primary border-primary/30 shadow-xs"
+                                                : "text-foreground/70 border-transparent hover:bg-foreground/5 hover:text-foreground"
                                                 }`}
                                         >
                                             <MessageSquare size={16} className="shrink-0" />
@@ -171,44 +184,57 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
                         ))}
                     </div>
 
-                    <div className="mt-auto pt-4 border-t border-white/10 relative">
+                    <div className="mt-auto pt-4 border-t border-border relative">
                         {showProfileMenu && (
                             <div
                                 ref={profileMenuRef}
-                                className="absolute bottom-16 left-2 right-2 bg-[#1a1a1a] border border-white/10 rounded-2xl p-2 shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-200 z-50"
+                                className="absolute bottom-16 left-2 right-2 bg-card border border-border rounded-2xl p-2 shadow-lg dark:shadow-2xl animate-in fade-in slide-in-from-bottom-2 duration-200 z-50"
                             >
                                 <button
-                                    onClick={() => setIsDarkMode(!isDarkMode)}
-                                    className="flex items-center gap-3 w-full p-3 hover:bg-white/5 rounded-xl text-xs text-white/70 hover:text-white transition-all"
+                                    onClick={() => setTheme(resolvedTheme === "dark" ? "light" : "dark")}
+                                    className="flex items-center gap-3 w-full p-3 hover:bg-foreground/5 rounded-xl text-xs text-foreground/70 hover:text-foreground transition-all"
                                 >
-                                    {isDarkMode ? <Sun size={14} /> : <Moon size={14} />}
-                                    {isDarkMode ? "Light Mode" : "Dark Mode"}
+                                    {mounted && resolvedTheme === "dark" ? <Sun size={14} /> : <Moon size={14} />}
+                                    {mounted && resolvedTheme === "dark" ? "Light Mode" : "Dark Mode"}
                                 </button>
-                                <button className="flex items-center gap-3 w-full p-3 hover:bg-white/5 rounded-xl text-xs text-white/70 hover:text-white transition-all">
+                                <button className="flex items-center gap-3 w-full p-3 hover:bg-foreground/5 rounded-xl text-xs text-foreground/70 hover:text-foreground transition-all">
                                     <Settings size={14} />
                                     Settings
                                 </button>
-                                <div className="h-px bg-white/5 my-1" />
-                                <button className="flex items-center gap-3 w-full p-3 hover:bg-red-500/10 rounded-xl text-xs text-red-400 hover:text-red-300 transition-all">
+                                <div className="h-px bg-border my-1" />
+                                <button 
+                                    onClick={() => signOut({ redirectUrl: "/sign-in" })}
+                                    className="flex items-center gap-3 w-full p-3 hover:bg-red-500/10 rounded-xl text-xs text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-all font-medium"
+                                >
                                     <LogOut size={14} />
                                     Log out
                                 </button>
                             </div>
                         )}
 
-                        <button
-                            onClick={() => setShowProfileMenu(!showProfileMenu)}
-                            className="flex items-center justify-between w-full p-2 hover:bg-white/5 rounded-2xl transition-all"
+                        <div
+                            className="flex items-center justify-between w-full p-2 hover:bg-foreground/5 rounded-2xl transition-all"
                         >
                             <div className="flex items-center gap-3">
-                                <div className="w-8 h-8 rounded-full bg-linear-to-br from-indigo-500 to-purple-600 shadow-lg" />
+                                <UserButton appearance={{
+                                    elements: {
+                                        userButtonAvatarBox: 'w-8 h-8 rounded-full shadow-lg border border-border',
+                                    }
+                                }} />
                                 <div className="flex flex-col text-left">
-                                    <span className="text-xs font-medium text-white">FreeCAD AI</span>
-                                    <span className="text-[10px] text-white/40 uppercase">Major Project</span>
+                                    <span className="text-xs font-semibold text-foreground truncate max-w-[120px]">
+                                        {user?.fullName || user?.primaryEmailAddress?.emailAddress || "User"}
+                                    </span>
+                                    <span className="text-[10px] text-foreground/50 font-medium uppercase tracking-wider">Major Project</span>
                                 </div>
                             </div>
-                            <Menu size={14} className="text-white/20" />
-                        </button>
+                             <button 
+                                onClick={() => setShowProfileMenu(!showProfileMenu)}
+                                className="p-2 hover:bg-foreground/5 rounded-lg transition-colors"
+                            >
+                                <Menu size={16} className="text-foreground/40 hover:text-foreground transition-colors" />
+                            </button>
+                        </div>
                     </div>
                 </div>
             </div>

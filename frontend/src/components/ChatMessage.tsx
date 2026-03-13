@@ -26,8 +26,8 @@ export default function ChatMessage({ role, content, onRunInFreeCAD }: ChatMessa
     return (
         <div className={`flex ${isAssistant ? "justify-start" : "justify-end"} mb-6 animate-in fade-in slide-in-from-bottom-2 duration-300`}>
             <div className={`max-w-[85%] rounded-2xl p-4 shadow-lg ${isAssistant
-                    ? "bg-white/10 backdrop-blur-md border border-white/20 text-white"
-                    : "bg-purple-600 text-white"
+                    ? "bg-foreground/5 backdrop-blur-md border border-border text-foreground"
+                    : "bg-primary text-white shadow-primary/20"
                 }`}>
                 <div className="flex items-center justify-between mb-2">
                     <span className="text-[10px] uppercase tracking-widest font-bold opacity-50">
