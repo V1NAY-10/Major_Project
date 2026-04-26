@@ -1,8 +1,9 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
-import { Send, Zap, Loader2 } from "lucide-react";
+import { Send, Zap, Loader2, MessageSquare, FileBox } from "lucide-react";
 import Sidebar from "@/components/Sidebar";
 import ChatMessage from "@/components/ChatMessage";
+import CADPanel from "@/components/CADPanel";
 import { API_URL } from "@/lib/api";
 import { useUser } from "@clerk/nextjs";
 
@@ -12,8 +13,11 @@ interface Message {
   content: string;
 }
 
+type Tab = "chat" | "cad";
+
 export default function Home() {
   const { user } = useUser();
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -147,13 +151,40 @@ export default function Home() {
         <div className="absolute inset-0 bg-linear-to-b from-purple-900/10 via-transparent to-transparent pointer-events-none" />
 
         {/* Header */}
-        <header className="sticky top-0 z-30 p-4 border-b border-border bg-background/20 backdrop-blur-xl flex items-center justify-between">
-          <div className="flex items-center gap-2">
+        <header className="sticky top-0 z-30 p-4 border-b border-border bg-background/20 backdrop-blur-xl flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2 shrink-0">
             <div className="p-1.5 bg-purple-600 rounded-lg">
               <Zap size={18} fill="white" />
             </div>
             <h1 className="font-bold tracking-tight">FreeCAD AI</h1>
           </div>
+
+          {/* Tab switcher */}
+          <div className="flex items-center gap-1 bg-foreground/5 border border-border rounded-xl p-1">
+            <button
+              onClick={() => setActiveTab("chat")}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                activeTab === "chat"
+                  ? "bg-primary text-white shadow-sm"
+                  : "text-foreground/50 hover:text-foreground"
+              }`}
+            >
+              <MessageSquare size={13} />
+              Chat
+            </button>
+            <button
+              onClick={() => setActiveTab("cad")}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                activeTab === "cad"
+                  ? "bg-primary text-white shadow-sm"
+                  : "text-foreground/50 hover:text-foreground"
+              }`}
+            >
+              <FileBox size={13} />
+              CAD Tester
+            </button>
+          </div>
+
           {successMsg && (
             <div className="px-3 py-1 bg-green-500/20 border border-green-500/30 rounded-full text-green-400 text-xs animate-pulse">
               {successMsg}
@@ -161,8 +192,17 @@ export default function Home() {
           )}
         </header>
 
+        {/* CAD Tester Tab */}
+        {activeTab === "cad" && (
+          <div className="flex-1 overflow-y-auto">
+            <CADPanel />
+          </div>
+        )}
+
         {/* Chat Area */}
-        <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-4 custom-scrollbar">
+        <div className={`flex-1 overflow-y-auto p-4 md:p-8 space-y-4 custom-scrollbar ${
+          activeTab !== "chat" ? "hidden" : ""
+        }`}>
           {messages.length === 0 && !loading && (
             <div className="h-full flex flex-col items-center justify-center text-center space-y-4 max-w-md mx-auto">
               <div className="w-16 h-16 bg-foreground/5 rounded-3xl flex items-center justify-center mb-4 border border-border">
@@ -213,8 +253,10 @@ export default function Home() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Input Area */}
-        <div className="p-4 md:p-8 bg-linear-to-t from-background via-background/80 to-transparent">
+        {/* Input Area — only shown on chat tab */}
+        <div className={`p-4 md:p-8 bg-linear-to-t from-background via-background/80 to-transparent ${
+          activeTab !== "chat" ? "hidden" : ""
+        }`}>
           <form
             onSubmit={handleGenerate}
             className="max-w-3xl mx-auto relative group"

@@ -10,6 +10,11 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from typing import Optional, List
 
+# CAD AI module imports
+from app.cad_ai.routes import router as cad_router
+from app.cad_ai.cad_context_manager import session_has_cad, get_cad_context
+from app.cad_ai.prompt_builder import build_cad_prompt
+
 load_dotenv()
 
 app = FastAPI()
@@ -21,6 +26,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Mount CAD AI routes (prefix=/cad)
+app.include_router(cad_router)
+
 
 api_key = os.getenv("OPENROUTER_API_KEY")
 
@@ -175,25 +184,40 @@ async def generate_freecad_code(request: PromptRequest):
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
 
     try:
-        system_instruction = (
-            "You are a FreeCAD Python expert. Generate ONLY a working Python script for FreeCAD. "
-            "Follow these rules strictly:\n"
-            "1. Use 'import Part', 'import FreeCAD as App', and 'import PartDesign'.\n"
-            "2. For simple shapes, use 'Part.makeBox', 'Part.makeCylinder', etc.\n"
-            "3. For complex shapes like involute gears, use the 'PartDesign' or 'Part' module API correctly.\n"
-            "4. A document is pre-initialized. Use: 'doc = App.ActiveDocument'. NEVER use 'App.newDocument()'.\n"
-            "5. Add objects using 'doc.addObject' and always call 'doc.recompute()'.\n"
-            "6. NO markdown, NO explanations, NO comments outside the code blocks. ONLY Python code."
-        )
+        # ── CAD-aware branch ────────────────────────────────────────────
+        # If the session has uploaded CAD context, inject it into the
+        # prompt so the LLM can generate *modification* code rather than
+        # building from scratch.  Original behaviour is fully preserved
+        # when no CAD context exists.
+        # ────────────────────────────────────────────────────────────────
+        has_cad = request.session_id and session_has_cad(request.session_id)
+
+        if has_cad:
+            cad_ctx = get_cad_context(request.session_id)
+            parsed_data = cad_ctx["parsed_data"]
+            messages = build_cad_prompt(request.prompt, parsed_data)
+        else:
+            # Original system prompt — untouched
+            system_instruction = (
+                "You are a FreeCAD Python expert. Generate ONLY a working Python script for FreeCAD. "
+                "Follow these rules strictly:\n"
+                "1. Use 'import Part', 'import FreeCAD as App', and 'import PartDesign'.\n"
+                "2. For simple shapes, use 'Part.makeBox', 'Part.makeCylinder', etc.\n"
+                "3. For complex shapes like involute gears, use the 'PartDesign' or 'Part' module API correctly.\n"
+                "4. A document is pre-initialized. Use: 'doc = App.ActiveDocument'. NEVER use 'App.newDocument()'.\n"
+                "5. Add objects using 'doc.addObject' and always call 'doc.recompute()'.\n"
+                "6. NO markdown, NO explanations, NO comments outside the code blocks. ONLY Python code."
+            )
+            messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": f"User prompt: {request.prompt}"},
+            ]
 
         response = client.chat.completions.create(
             model="google/gemini-2.0-flash-001",
-            messages=[
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"User prompt: {request.prompt}"}
-            ]
+            messages=messages,
         )
-        
+
         generated_code = response.choices[0].message.content
 
         # Basic sanitization: Extract only the content within markdown code blocks if present
@@ -213,14 +237,14 @@ async def generate_freecad_code(request: PromptRequest):
                 now = datetime.datetime.now(datetime.timezone.utc)
                 await db.messages.insert_many([
                     {
-                        "session_id": request.session_id, 
-                        "role": "user", 
+                        "session_id": request.session_id,
+                        "role": "user",
                         "content": request.prompt,
                         "created_at": now
                     },
                     {
-                        "session_id": request.session_id, 
-                        "role": "assistant", 
+                        "session_id": request.session_id,
+                        "role": "assistant",
                         "content": generated_code,
                         "created_at": now + datetime.timedelta(seconds=1)
                     }
@@ -229,7 +253,7 @@ async def generate_freecad_code(request: PromptRequest):
                 print(f"MongoDB save error: {e}")
                 # We don't raise an exception here because we want to return the code anyway
 
-        return {"code": generated_code}
+        return {"code": generated_code, "cad_context_used": has_cad}
     except Exception as e:
         print(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
