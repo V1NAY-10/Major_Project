@@ -3,35 +3,7 @@ import { Layers, Circle, Box, Minus, Triangle } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-interface Component {
-  id: string;
-  type: string;
-  semantic_label?: string[];
-  editable: boolean;
-  radius?: number;
-  diameter?: number;
-  length?: number;
-  width?: number;
-  height?: number;
-  major_radius?: number;
-  minor_radius?: number;
-  semi_angle_deg?: number;
-  ref_radius?: number;
-  orientation?: string;
-  [key: string]: unknown;
-}
-
-export interface ParsedData {
-  summary?: {
-    component_count?: number;
-    total_feature_instances?: number;
-    compression_ratio?: number;
-    topology?: { solids?: number; faces?: number; edges?: number };
-    volume?: number;
-  };
-  components?: Component[];
-  relationships?: { source: string; relation: string; target: string }[];
-}
+import { ParsedData, Component } from "@/types/cad";
 
 interface PatternSummaryProps {
   data: ParsedData;

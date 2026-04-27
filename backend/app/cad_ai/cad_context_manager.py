@@ -11,13 +11,14 @@ fail at startup with a clear ImportError.
 
 import uuid
 import json
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, List
+import io
 
 from .cad_memory_store import cad_store
 from .prompt_builder import build_explain_prompt, build_cad_prompt
 
 # ── Direct import — no fallback ─────────────────────────────────────────────
-from app.cad.services.step_parser import parse_step, STEPParseError
+from app.cad.services.parsers import parse_step, STEPParseError
 
 
 # ── CAD File Parsing ────────────────────────────────────────────────────────
@@ -111,7 +112,47 @@ def store_cad_context(session_id: str, file_id: str, parsed_data: dict, stl_data
     cad_store.store(session_id, file_id, parsed_data, stl_data, raw_cad_data)
 
 
-def get_cad_context(session_id: str) -> Optional[Dict[str, Any]]:
+async def store_cad_blobs(file_id: str, stl_data: bytes = None, raw_cad_data: bytes = None):
+    """Store large CAD blobs in GridFS."""
+    from main import fs
+    if fs is None:
+        return None, None
+
+    stl_fs_id = None
+    raw_fs_id = None
+
+    if stl_data:
+        stl_fs_id = await fs.upload_from_stream(
+            f"{file_id}.stl",
+            stl_data,
+            metadata={"file_id": file_id, "type": "stl"}
+        )
+    
+    if raw_cad_data:
+        raw_fs_id = await fs.upload_from_stream(
+            f"{file_id}.raw",
+            raw_cad_data,
+            metadata={"file_id": file_id, "type": "raw"}
+        )
+    
+    return stl_fs_id, raw_fs_id
+
+
+async def get_cad_blob(fs_id) -> Optional[bytes]:
+    """Retrieve a blob from GridFS."""
+    from main import fs
+    if fs is None or fs_id is None:
+        return None
+    
+    try:
+        grid_out = await fs.open_download_stream(fs_id)
+        return await grid_out.read()
+    except Exception as e:
+        print(f"Error reading from GridFS: {e}")
+        return None
+
+
+async def get_cad_context(session_id: str) -> Optional[Dict[str, Any]]:
     """Retrieve stored CAD context for a session (or None)."""
     context = cad_store.get(session_id)
     if context:
@@ -120,21 +161,22 @@ def get_cad_context(session_id: str) -> Optional[Dict[str, Any]]:
     # If not in memory, try to restore from MongoDB
     from main import db
     from bson import ObjectId
-    import asyncio
 
     if db is not None and session_id:
         try:
-            # We use a synchronous-looking check or a local helper since this might be called in sync context
-            # but FastAPI is async, so this is fine.
-            # However, cad_context_manager is often called from routes.
-            # Let's assume we can use the loop.
-            loop = asyncio.get_event_loop()
-            session = loop.run_until_complete(db.sessions.find_one({"_id": ObjectId(session_id)}))
+            session = await db.sessions.find_one({"_id": ObjectId(session_id)})
             
             if session and "cad_file_id" in session:
                 parsed_data = session.get("cad_parsed_data")
                 raw_data = session.get("cad_raw_data")
                 stl_data = session.get("cad_stl_data")
+                
+                # Try GridFS if not in main document
+                if raw_data is None and "cad_raw_fs_id" in session:
+                    raw_data = await get_cad_blob(session["cad_raw_fs_id"])
+                if stl_data is None and "cad_stl_fs_id" in session:
+                    stl_data = await get_cad_blob(session["cad_stl_fs_id"])
+
                 file_id = session.get("cad_file_id")
                 
                 if parsed_data:
@@ -147,9 +189,40 @@ def get_cad_context(session_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_cad_context_by_file(file_id: str) -> Optional[Dict[str, Any]]:
-    """Retrieve stored CAD context by file_id."""
-    return cad_store.get_by_file_id(file_id)
+async def get_cad_context_by_file(file_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieve stored CAD context by file_id, restoring from MongoDB if needed."""
+    context = cad_store.get_by_file_id(file_id)
+    if context:
+        return context
+
+    # Try to restore from MongoDB
+    from main import db
+
+    if db is not None and file_id:
+        try:
+            session = await db.sessions.find_one({"cad_file_id": file_id})
+            
+            if session:
+                parsed_data = session.get("cad_parsed_data")
+                raw_data = session.get("cad_raw_data")
+                stl_data = session.get("cad_stl_data")
+
+                # Try GridFS if not in main document
+                if raw_data is None and "cad_raw_fs_id" in session:
+                    raw_data = await get_cad_blob(session["cad_raw_fs_id"])
+                if stl_data is None and "cad_stl_fs_id" in session:
+                    stl_data = await get_cad_blob(session["cad_stl_fs_id"])
+
+                session_id = str(session["_id"])
+                
+                if parsed_data:
+                    # Restore to memory
+                    cad_store.store(session_id, file_id, parsed_data, stl_data, raw_data)
+                    return cad_store.get_by_file_id(file_id)
+        except Exception as e:
+            print(f"Failed to restore CAD context by file_id from DB: {e}")
+
+    return None
 
 
 def session_has_cad(session_id: str) -> bool:

@@ -1,22 +1,20 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
-import { Send, Zap, Loader2, MessageSquare, FileBox, Paperclip, X, ChevronRight, ChevronLeft } from "lucide-react";
-import Sidebar from "@/components/Sidebar";
-import ChatMessage from "@/components/ChatMessage";
-import CADViewer from "@/components/CADViewer";
-import PatternSummary, { ParsedData } from "@/components/PatternSummary";
-import IntentResponse from "@/components/IntentResponse";
-import { API_URL } from "@/lib/api";
+import { useState, useEffect, useRef } from "react";
+import { Zap, MessageSquare, FileBox, X, ChevronRight, ChevronLeft } from "lucide-react";
 import { useUser } from "@clerk/nextjs";
 
-interface Message {
-  id?: string;
-  role: "user" | "assistant";
-  content: string;
-  code?: string;
-  intents?: any[];
-  preview?: any[];
-}
+// Components
+import Sidebar from "@/components/ui/Sidebar";
+import ChatMessage from "@/components/chat/ChatMessage";
+import ChatInput from "@/components/chat/ChatInput";
+import CADViewer from "@/components/cad/CADViewer";
+import PatternSummary from "@/components/cad/PatternSummary";
+import IntentResponse from "@/components/cad/IntentResponse";
+
+// Hooks & Utils
+import { API_URL } from "@/lib/api";
+import { useCADSession } from "@/hooks/useCADSession";
+import { Message } from "@/types/chat";
 
 export default function Home() {
   const { user } = useUser();
@@ -26,17 +24,21 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [successMsg, setSuccessMsg] = useState("");
-  
-  // CAD State
-  const [cadFileId, setCadFileId] = useState<string | null>(null);
-  const [cadParsedData, setCadParsedData] = useState<ParsedData | null>(null);
-  const [cadModelUrl, setCadModelUrl] = useState<string | null>(null);
-  const [cadFileName, setCadFileName] = useState<string | null>(null);
-  const [isUploadingCad, setIsUploadingCad] = useState(false);
   const [showCadPanel, setShowCadPanel] = useState(true);
 
+  const { 
+    fileId: cadFileId, 
+    parsedData: cadParsedData, 
+    modelUrl: cadModelUrl, 
+    fileName: cadFileName, 
+    isUploading: isUploadingCad,
+    resetCadState,
+    fetchSessionDetails,
+    handleUpload,
+    updateModelUrl
+  } = useCADSession();
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -55,33 +57,7 @@ export default function Home() {
       setMessages([]);
       resetCadState();
     }
-  }, [currentSessionId, user?.id]);
-
-  const resetCadState = () => {
-    setCadFileId(null);
-    setCadParsedData(null);
-    setCadModelUrl(null);
-    setCadFileName(null);
-  };
-
-  const fetchSessionDetails = async (sessionId: string, userId: string) => {
-    try {
-      const res = await fetch(`${API_URL}/sessions/${sessionId}?user_id=${userId}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.cad_file_id) {
-          setCadFileId(data.cad_file_id);
-          setCadFileName(data.cad_filename);
-          setCadParsedData(data.cad_parsed_data);
-          setCadModelUrl(`${API_URL}/cad/model/${data.cad_file_id}`);
-        } else {
-          resetCadState();
-        }
-      }
-    } catch (err) {
-      console.error("Failed to fetch session details", err);
-    }
-  };
+  }, [currentSessionId, user?.id, fetchSessionDetails, resetCadState]);
 
   const fetchMessages = async (sessionId: string, userId: string) => {
     try {
@@ -100,15 +76,11 @@ export default function Home() {
     resetCadState();
   };
 
-  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !user?.id) return;
-
-    setIsUploadingCad(true);
+  const onFileUpload = async (file: File) => {
+    if (!user?.id) return;
     setError("");
 
     let sessionId = currentSessionId;
-    // Ensure session exists
     if (!sessionId) {
       try {
         const title = `CAD: ${file.name}`;
@@ -125,31 +97,16 @@ export default function Home() {
       }
     }
 
-    const formData = new FormData();
-    formData.append("file", file);
-    if (sessionId) formData.append("session_id", sessionId);
-
     try {
-      const res = await fetch(`${API_URL}/cad/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!res.ok) throw new Error("Upload failed");
-      
-      const data = await res.json();
-      setCadFileId(data.file_id);
-      setCadFileName(data.filename);
-      setCadParsedData(data.parsed_data);
-      setCadModelUrl(`${API_URL}/cad/model/${data.file_id}`);
-      
-      setMessages(prev => [...prev, { role: "assistant", content: `I've uploaded and parsed **${data.filename}**. You can now ask questions about it or request modifications.` }]);
+      const data = await handleUpload(file, sessionId, user.id);
+      setMessages(prev => [...prev, { 
+        role: "assistant", 
+        content: `I've uploaded and parsed **${data.filename}**. You can now ask questions about it or request modifications.` 
+      }]);
       setSuccessMsg("CAD Uploaded!");
       setTimeout(() => setSuccessMsg(""), 3000);
     } catch (err: any) {
       setError(err.message || "Failed to upload CAD");
-    } finally {
-      setIsUploadingCad(false);
-      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
 
@@ -175,15 +132,15 @@ export default function Home() {
     if (e) e.preventDefault();
     if (!prompt.trim() || loading) return;
 
-    setError(""); // Clear error immediately
+    setError("");
     let sessionId = currentSessionId;
-    if (!sessionId) {
+    if (!sessionId && user?.id) {
       try {
         const title = prompt.slice(0, 30);
         const res = await fetch(`${API_URL}/sessions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title, user_id: user?.id }),
+          body: JSON.stringify({ title, user_id: user.id }),
         });
         const sessionData = await res.json();
         sessionId = sessionData.id;
@@ -204,8 +161,8 @@ export default function Home() {
       });
 
       if (!response.ok) {
-          const errorData = await response.json().catch(() => ({}));
-          throw new Error(errorData.detail || "Failed to generate response");
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || "Failed to generate response");
       }
 
       const data = await response.json();
@@ -224,10 +181,28 @@ export default function Home() {
     }
   };
 
-  // Clear error when typing
-  useEffect(() => {
-    if (prompt) setError("");
-  }, [prompt]);
+  const handleApplyModifications = async (intents: any[]) => {
+    if (!cadFileId) return;
+    try {
+      const res = await fetch(`${API_URL}/cad/modify-model`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ file_id: cadFileId, intents }),
+      });
+      const data = await res.json();
+      if (data.mesh_url) {
+        updateModelUrl(cadFileId);
+        setSuccessMsg("Model Updated!");
+        setTimeout(() => setSuccessMsg(""), 3000);
+        setMessages(prev => [...prev, {
+          role: "assistant",
+          content: "I have successfully applied your modifications to the model! Both your software preview and FreeCAD have been updated. Is there anything else you would like to change?"
+        }]);
+      }
+    } catch (err) {
+      console.error("Apply failed", err);
+    }
+  };
 
   return (
     <div className="flex h-screen bg-background text-foreground overflow-hidden font-sans">
@@ -274,7 +249,7 @@ export default function Home() {
               </div>
             )}
 
-            {messages.map((msg: any, i) => (
+            {messages.map((msg, i) => (
               <div key={i} className="space-y-4 max-w-full">
                 <ChatMessage
                   role={msg.role}
@@ -292,24 +267,7 @@ export default function Home() {
                     </div>
                     <IntentResponse 
                         intent={{ intents: msg.intents, preview: msg.preview || [], warnings: [] }} 
-                        onApply={async () => {
-                            if (!cadFileId) return;
-                            try {
-                                const res = await fetch(`${API_URL}/cad/modify-model`, {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ file_id: cadFileId, intents: msg.intents }),
-                                });
-                                const data = await res.json();
-                                if (data.mesh_url) {
-                                    setCadModelUrl(`${API_URL}${data.mesh_url}`);
-                                    setSuccessMsg("Model Updated!");
-                                    setTimeout(() => setSuccessMsg(""), 3000);
-                                }
-                            } catch (err) {
-                                console.error("Apply failed", err);
-                            }
-                        }}
+                        onApply={() => handleApplyModifications(msg.intents!)}
                     />
                   </div>
                 )}
@@ -336,51 +294,18 @@ export default function Home() {
             <div ref={messagesEndRef} className="h-4" />
           </div>
 
-          {/* Input Area */}
-          <div className="p-4 md:p-8 shrink-0 bg-linear-to-t from-background via-background to-transparent">
-            <form onSubmit={handleGenerate} className="max-w-3xl mx-auto relative group">
-              <input
-                type="file"
-                ref={fileInputRef}
-                onChange={handleFileUpload}
-                accept=".step,.stp"
-                className="hidden"
-              />
-              <div className="flex items-end gap-2 bg-foreground/5 hover:bg-foreground/10 focus-within:bg-foreground/10 border border-white/5 focus-within:border-purple-500/40 rounded-3xl p-2 transition-all shadow-2xl backdrop-blur-xl">
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={isUploadingCad}
-                  className="p-4 text-foreground/30 hover:text-purple-400 transition-all transform hover:scale-110 disabled:opacity-30"
-                  title="Attach CAD File"
-                >
-                  {isUploadingCad ? <Loader2 size={20} className="animate-spin text-purple-400" /> : <Paperclip size={20} />}
-                </button>
-                <textarea
-                  value={prompt}
-                  onChange={(e) => setPrompt(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      handleGenerate();
-                    }
-                  }}
-                  placeholder={cadFileId ? "How should we modify this model?" : "Generate a 3D model or upload a file..."}
-                  className="flex-1 bg-transparent border-none focus:ring-0 p-4 text-sm text-foreground placeholder-foreground/20 resize-none min-h-[56px] max-h-32 scrollbar-none"
-                />
-                <button
-                  type="submit"
-                  disabled={loading || !prompt.trim()}
-                  className="p-4 bg-purple-600 hover:bg-purple-500 disabled:opacity-20 rounded-2xl transition-all shadow-lg shadow-purple-500/20 transform hover:scale-105 active:scale-95 group-disabled:hover:scale-100"
-                >
-                  {loading ? <Loader2 size={20} className="animate-spin text-white" /> : <Send size={20} className="text-white" />}
-                </button>
-              </div>
-            </form>
-          </div>
+          <ChatInput 
+            prompt={prompt}
+            setPrompt={setPrompt}
+            loading={loading}
+            isUploadingCad={isUploadingCad}
+            onUpload={onFileUpload}
+            onSubmit={handleGenerate}
+            hasCad={!!cadFileId}
+          />
         </div>
 
-        {/* CAD Preview Panel (Fixed Right Side) */}
+        {/* CAD Preview Panel */}
         {cadFileId && (
           <div className={`flex-none border-l border-white/5 bg-card/30 backdrop-blur-3xl transition-all duration-500 flex flex-col h-full ${showCadPanel ? "w-[450px]" : "w-0 overflow-hidden border-none"}`}>
             <div className="p-5 border-b border-white/5 flex items-center justify-between shrink-0">
@@ -415,7 +340,7 @@ export default function Home() {
           </div>
         )}
 
-        {/* Re-open CAD panel button (Floating) */}
+        {/* Re-open CAD panel button */}
         {cadFileId && !showCadPanel && (
           <button
             onClick={() => setShowCadPanel(true)}
@@ -428,4 +353,3 @@ export default function Home() {
     </div>
   );
 }
-

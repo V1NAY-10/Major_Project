@@ -53,9 +53,11 @@ def _solid_cylinder_info(solid):
 
     best = None   # (radius, ax2)
 
+    from OCP.TopoDS import TopoDS
     exp = TopExp_Explorer(solid, TopAbs_FACE)
     while exp.More():
-        face = exp.Current()
+        shape = exp.Current()
+        face = TopoDS.Face_s(shape)
         adaptor = BRepAdaptor_Surface(face, True)
         if adaptor.GetType() == GeomAbs_Cylinder:
             cyl = adaptor.Cylinder()

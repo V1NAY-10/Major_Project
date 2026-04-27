@@ -12,7 +12,7 @@ import uuid
 import re
 import os
 import datetime
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
@@ -27,8 +27,9 @@ from .cad_context_manager import (
     get_cad_context_by_file,
     session_has_cad,
     get_explain_messages,
+    store_cad_blobs,
 )
-from app.cad.services.step_parser import STEPParseError
+from app.cad.services.parsers import STEPParseError
 
 load_dotenv()
 
@@ -110,20 +111,60 @@ async def upload_cad_file(
     # Store in memory
     store_cad_context(session_id, file_id, parsed_data, stl_data, content)
 
+    # Automatically send to FreeCAD if listener is running
+    import tempfile, socket, os
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
+        tmp.write(content)
+        temp_path = tmp.name
+
+    fc_script = f"""import FreeCAD as App
+import Part
+doc = App.ActiveDocument
+if not doc:
+    doc = App.newDocument('CAD_Session')
+try:
+    Part.insert(r'{temp_path}', doc.Name)
+    doc.recompute()
+except Exception as e:
+    print(e)
+"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1)
+            s.connect(("127.0.0.1", 6666))
+            s.sendall(fc_script.encode('utf-8'))
+            s.recv(1024)
+    except:
+        pass # FreeCAD listener not running
+
     # Store in MongoDB if session exists
     if db is not None and session_id:
         try:
             from bson import ObjectId
+            
+            # If data is large, use GridFS
+            update_data: Dict[str, Any] = {
+                "cad_file_id": file_id,
+                "cad_filename": filename,
+                "cad_parsed_data": parsed_data,
+                "updated_at": datetime.datetime.now(datetime.timezone.utc)
+            }
+            
+            MAX_DOC_SIZE = 15 * 1024 * 1024 # 15MB limit
+            total_blob_size = len(content) + (len(stl_data) if stl_data else 0)
+            
+            if total_blob_size > MAX_DOC_SIZE:
+                print(f"CAD blobs too large ({total_blob_size} bytes), using GridFS.")
+                stl_fs_id, raw_fs_id = await store_cad_blobs(file_id, stl_data, content)
+                update_data["cad_stl_fs_id"] = stl_fs_id
+                update_data["cad_raw_fs_id"] = raw_fs_id
+            else:
+                update_data["cad_raw_data"] = content
+                update_data["cad_stl_data"] = stl_data
+
             await db.sessions.update_one(
                 {"_id": ObjectId(session_id)},
-                {"$set": {
-                    "cad_file_id": file_id,
-                    "cad_filename": filename,
-                    "cad_parsed_data": parsed_data,
-                    "cad_raw_data": content,
-                    "cad_stl_data": stl_data,
-                    "updated_at": datetime.datetime.now(datetime.timezone.utc)
-                }}
+                {"$set": update_data}
             )
         except Exception as e:
             print(f"MongoDB CAD update error: {e}")
@@ -149,9 +190,9 @@ async def explain_cad(file_id: str, body: ExplainRequest = ExplainRequest()):
     # Resolve CAD context
     context = None
     if body.session_id:
-        context = get_cad_context(body.session_id)
+        context = await get_cad_context(body.session_id)
     if context is None:
-        context = get_cad_context_by_file(file_id)
+        context = await get_cad_context_by_file(file_id)
     if context is None:
         raise HTTPException(status_code=404, detail=f"No CAD context found for file_id '{file_id}'.")
 
@@ -185,8 +226,8 @@ async def interpret_cad_intent(body: InterpretRequest):
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured.")
 
     import json
-    from .services.size_ranker import rank_patterns
-    from .services.preview_generator import generate_preview
+    from .services.ai_utils import rank_patterns_by_size as rank_patterns
+    from .services.ai_utils import generate_intent_preview as generate_preview
 
     components = body.parsed_data.get("components", [])
     rankings = rank_patterns(components)
@@ -296,7 +337,7 @@ async def interpret_cad_intent(body: InterpretRequest):
 @router.get("/context/{session_id}")
 async def get_session_cad_context(session_id: str):
     """Retrieve the stored CAD context for a session."""
-    context = get_cad_context(session_id)
+    context = await get_cad_context(session_id)
     if context is None:
         raise HTTPException(
             status_code=404,
@@ -323,7 +364,7 @@ async def modify_cad_model(body: ModifyModelRequest):
     Apply modifications to the real geometry based on intents,
     re-mesh, and return the new mesh URL.
     """
-    context = get_cad_context_by_file(body.file_id)
+    context = await get_cad_context_by_file(body.file_id)
     if not context or "raw_cad_data" not in context or not context["raw_cad_data"]:
         raise HTTPException(status_code=404, detail="CAD data not found.")
         
@@ -365,17 +406,41 @@ async def modify_cad_model(body: ModifyModelRequest):
         if db is not None and session_id:
             try:
                 from bson import ObjectId
+                
+                update_data = {
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc)
+                }
+                
+                if len(new_stl) > 15 * 1024 * 1024:
+                    stl_fs_id, _ = await store_cad_blobs(body.file_id, stl_data=new_stl)
+                    update_data["cad_stl_fs_id"] = stl_fs_id
+                    update_data["cad_stl_data"] = None # Clear old if existed
+                else:
+                    update_data["cad_stl_data"] = new_stl
+                    update_data["cad_stl_fs_id"] = None # Clear old if existed
+
                 await db.sessions.update_one(
                     {"_id": ObjectId(session_id)},
-                    {"$set": {
-                        "cad_stl_data": new_stl,
-                        "updated_at": datetime.datetime.now(datetime.timezone.utc)
-                    }}
+                    {"$set": update_data}
                 )
             except Exception as e:
                 print(f"MongoDB CAD modify update error: {e}")
         
         import uuid
+        
+        # Also sync modifications with FreeCAD if running
+        try:
+            import socket
+            script_res = await generate_freecad_script(GenerateScriptRequest(intents=body.intents))
+            fc_script = script_res["script"]
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.connect(("127.0.0.1", 6666))
+                s.sendall(fc_script.encode('utf-8'))
+                s.recv(1024)
+        except Exception as e:
+            print(f"Failed to sync modification with FreeCAD: {e}")
+
         # Return a cache-busting URL so the frontend viewer reloads
         return {
             "mesh_url": f"/cad/model/{body.file_id}?t={uuid.uuid4().hex[:8]}",
@@ -397,7 +462,7 @@ async def get_cad_mesh(file_id: str):
     """
     Return the STL or OBJ file converted from the uploaded CAD file.
     """
-    context = get_cad_context_by_file(file_id)
+    context = await get_cad_context_by_file(file_id)
     if not context or "stl_data" not in context or not context["stl_data"]:
         raise HTTPException(status_code=404, detail="Mesh data not found for this file.")
     

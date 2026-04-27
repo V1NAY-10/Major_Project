@@ -23,7 +23,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "http://192.168.29.245:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -48,9 +48,12 @@ mongodb_uri = os.getenv("MONGODB_URI")
 db_name = os.getenv("MONGODB_DB_NAME", "freecad_ai")
 
 db = None
+fs = None
 if mongodb_uri:
+    from motor.motor_asyncio import AsyncIOMotorGridFSBucket
     client_db = AsyncIOMotorClient(mongodb_uri)
     db = client_db[db_name]
+    fs = AsyncIOMotorGridFSBucket(db)
 else:
     print("Warning: MONGODB_URI not found in environment variables")
 
@@ -59,6 +62,9 @@ def format_doc(doc):
     if doc is None: return None
     doc["id"] = str(doc["_id"])
     del doc["_id"]
+    for key, value in list(doc.items()):
+        if isinstance(value, ObjectId):
+            doc[key] = str(value)
     return doc
 
 class PromptRequest(BaseModel):
@@ -198,14 +204,35 @@ async def generate_response(request: PromptRequest):
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
 
     try:
-        has_cad = request.session_id and session_has_cad(request.session_id)
+        # Save user message to DB
+        if db is not None and request.session_id:
+            now = datetime.datetime.now(datetime.timezone.utc)
+            await db.messages.insert_one({
+                "session_id": request.session_id,
+                "role": "user",
+                "content": request.prompt,
+                "created_at": now
+            })
+
+        # Fetch chat history (limit to last 20 messages for context)
+        chat_history = []
+        if db is not None and request.session_id:
+            # We sort by created_at to get chronological order
+            cursor = db.messages.find({"session_id": request.session_id}).sort("created_at", 1)
+            docs = await cursor.to_list(length=20)
+            for doc in docs:
+                if doc.get("role") in ["user", "assistant"] and doc.get("content"):
+                    chat_history.append({"role": doc["role"], "content": doc["content"]})
+        else:
+            chat_history = [{"role": "user", "content": request.prompt}]
+
+        cad_ctx = await get_cad_context(request.session_id) if request.session_id else None
+        has_cad = cad_ctx is not None
         parsed_data = None
         
         # ── CAD-aware branch ────────────────────────────────────────────
         if has_cad:
-            cad_ctx = get_cad_context(request.session_id)
-            if cad_ctx:
-                parsed_data = cad_ctx.get("parsed_data")
+            parsed_data = cad_ctx.get("parsed_data")
 
             # First, get a conversational response (text + code)
             system_instruction = (
@@ -223,10 +250,7 @@ async def generate_response(request: PromptRequest):
                 "- Always call 'doc.recompute()' at the end."
             )
             
-            messages = [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": request.prompt},
-            ]
+            messages = [{"role": "system", "content": system_instruction}] + chat_history
 
             response = client.chat.completions.create(
                 model="google/gemini-2.0-flash-001",
@@ -277,10 +301,7 @@ async def generate_response(request: PromptRequest):
                 "If asked to create a model, provide ONLY the Python script in a ```python ... ``` block. "
                 "Otherwise, answer the user's question normally."
             )
-            messages = [
-                {"role": "system", "content": system_instruction},
-                {"role": "user", "content": request.prompt},
-            ]
+            messages = [{"role": "system", "content": system_instruction}] + chat_history
             response = client.chat.completions.create(
                 model="google/gemini-2.0-flash-001",
                 messages=messages,
@@ -307,9 +328,6 @@ async def generate_response(request: PromptRequest):
                 "code": generated_code,
                 "cad_context_used": False
             }
-    except Exception as e:
-        print(f"Generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         print(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
