@@ -1,6 +1,6 @@
 "use client";
 import { useState, useEffect, useRef } from "react";
-import { Zap, MessageSquare, FileBox, X, ChevronRight, ChevronLeft } from "lucide-react";
+import { Zap, MessageSquare, FileBox, X, ChevronRight, ChevronLeft, Download } from "lucide-react";
 import { useUser } from "@clerk/nextjs";
 
 // Components
@@ -326,6 +326,16 @@ export default function Home() {
                 <div className="absolute top-4 left-4 z-10 px-3 py-1 bg-black/60 backdrop-blur-md border border-white/10 rounded-full text-[9px] font-bold text-white/50 uppercase tracking-widest opacity-0 group-hover/viewer:opacity-100 transition-opacity">
                     Interactive Preview
                 </div>
+
+                <a
+                  href={`${API_URL}/cad/download/${cadFileId}`}
+                  download
+                  className="absolute top-4 right-4 z-10 p-2 bg-purple-600/80 hover:bg-purple-600 backdrop-blur-md border border-purple-500/30 rounded-xl text-white opacity-0 group-hover/viewer:opacity-100 transition-all shadow-lg hover:shadow-purple-500/50"
+                  title="Download Modified CAD (STL)"
+                >
+                  <Download size={16} />
+                </a>
+
                 <CADViewer modelUrl={cadModelUrl} />
               </div>
               

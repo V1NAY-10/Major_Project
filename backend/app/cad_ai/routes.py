@@ -457,6 +457,27 @@ async def modify_cad_model(body: ModifyModelRequest):
             "mesh_url": f"/cad/model/{body.file_id}"
         }
 
+@router.get("/download/{file_id}")
+async def download_cad_mesh(file_id: str):
+    """
+    Download the modified STL file.
+    """
+    context = await get_cad_context_by_file(file_id)
+    if not context or "stl_data" not in context or not context["stl_data"]:
+        raise HTTPException(status_code=404, detail="Mesh data not found.")
+    
+    filename = context.get("cad_filename", f"modified_{file_id}.stl")
+    if "." in filename:
+        filename = filename.rsplit(".", 1)[0] + ".stl"
+    else:
+        filename += ".stl"
+        
+    return Response(
+        content=context["stl_data"], 
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
 @router.get("/model/{file_id}")
 async def get_cad_mesh(file_id: str):
     """
