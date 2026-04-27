@@ -7,6 +7,10 @@ export const getApiUrl = () => {
   // If in a browser, use the current hostname to derive the backend URL
   if (typeof window !== "undefined") {
     const hostname = window.location.hostname;
+    // Force IPv4 for localhost to prevent IPv6 connection refused issues
+    if (hostname === "localhost") {
+      return "http://127.0.0.1:8000";
+    }
     return `http://${hostname}:8000`;
   }
 

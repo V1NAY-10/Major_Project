@@ -10,7 +10,7 @@ import { Loader2 } from "lucide-react";
 
 interface CADViewerProps {
   modelUrl: string | null;
-  highlightText: string | null;
+  highlightText?: string | null;
 }
 
 export default function CADViewer({ modelUrl, highlightText }: CADViewerProps) {

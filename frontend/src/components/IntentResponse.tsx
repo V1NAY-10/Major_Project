@@ -1,5 +1,6 @@
 "use client";
-import { CheckCircle2, Target, Zap, Hash, FileText } from "lucide-react";
+import { useState } from "react";
+import { CheckCircle2, Target, Zap, Hash, FileText, Loader2 } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -17,6 +18,7 @@ interface IntentResponseProps {
     preview?: Array<any>;
     warnings?: Array<{ warning: string }>;
   };
+  onApply?: () => Promise<void>;
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -39,10 +41,21 @@ const FIELD_META = [
   { key: "reason", label: "Reason", icon: <FileText size={14} className="text-foreground/40" />, valueClass: "text-foreground/60 italic" },
 ];
 
-export default function IntentResponse({ intent }: IntentResponseProps) {
+export default function IntentResponse({ intent, onApply }: IntentResponseProps) {
+  const [applying, setApplying] = useState(false);
   const intentsList = intent.intents || [];
   const previews = intent.preview || [];
   const warnings = intent.warnings || [];
+
+  const handleApply = async () => {
+    if (!onApply) return;
+    setApplying(true);
+    try {
+        await onApply();
+    } finally {
+        setApplying(false);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
@@ -129,6 +142,18 @@ export default function IntentResponse({ intent }: IntentResponseProps) {
           </div>
         );
       })}
+
+      {/* Apply Button */}
+      {onApply && (
+        <button
+          onClick={handleApply}
+          disabled={applying}
+          className="w-full mt-2 py-3 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded-xl font-bold text-sm shadow-lg shadow-purple-500/20 transition-all flex items-center justify-center gap-2"
+        >
+          {applying ? <Loader2 size={18} className="animate-spin" /> : <Zap size={18} fill="white" />}
+          {applying ? "Modifying Geometry..." : "Apply Changes to 3D Model"}
+        </button>
+      )}
 
       {/* Raw JSON toggle */}
       <details className="group mt-2">

@@ -113,7 +113,38 @@ def store_cad_context(session_id: str, file_id: str, parsed_data: dict, stl_data
 
 def get_cad_context(session_id: str) -> Optional[Dict[str, Any]]:
     """Retrieve stored CAD context for a session (or None)."""
-    return cad_store.get(session_id)
+    context = cad_store.get(session_id)
+    if context:
+        return context
+
+    # If not in memory, try to restore from MongoDB
+    from main import db
+    from bson import ObjectId
+    import asyncio
+
+    if db is not None and session_id:
+        try:
+            # We use a synchronous-looking check or a local helper since this might be called in sync context
+            # but FastAPI is async, so this is fine.
+            # However, cad_context_manager is often called from routes.
+            # Let's assume we can use the loop.
+            loop = asyncio.get_event_loop()
+            session = loop.run_until_complete(db.sessions.find_one({"_id": ObjectId(session_id)}))
+            
+            if session and "cad_file_id" in session:
+                parsed_data = session.get("cad_parsed_data")
+                raw_data = session.get("cad_raw_data")
+                stl_data = session.get("cad_stl_data")
+                file_id = session.get("cad_file_id")
+                
+                if parsed_data:
+                    # Restore to memory
+                    cad_store.store(session_id, file_id, parsed_data, stl_data, raw_data)
+                    return cad_store.get(session_id)
+        except Exception as e:
+            print(f"Failed to restore CAD context from DB: {e}")
+
+    return None
 
 
 def get_cad_context_by_file(file_id: str) -> Optional[Dict[str, Any]]:

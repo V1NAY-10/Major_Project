@@ -11,6 +11,7 @@ Endpoints:
 import uuid
 import re
 import os
+import datetime
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
@@ -62,10 +63,11 @@ async def upload_cad_file(
     session_id: Optional[str] = Form(default=None),
 ):
     """
-    Upload a CAD file, parse it, and store the result in-memory for the session.
-
-    Returns the file_id and parsed structure.
+    Upload a CAD file, parse it, and store the result in-memory and MongoDB.
     """
+    # Import db from main to persist parsing
+    from main import db
+
     # Validate extension
     filename = file.filename or "unknown"
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
@@ -80,7 +82,7 @@ async def upload_cad_file(
     if not content:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-    # Parse — no legacy fallback; if OCC fails, return an error
+    # Parse
     file_id = str(uuid.uuid4())
     try:
         parsed_data = parse_cad_file(content, filename)
@@ -105,8 +107,26 @@ async def upload_cad_file(
         except Exception as e:
             print(f"Mesh conversion error: {e}")
 
-    # Store in memory (overwrites any previous CAD for this session)
+    # Store in memory
     store_cad_context(session_id, file_id, parsed_data, stl_data, content)
+
+    # Store in MongoDB if session exists
+    if db is not None and session_id:
+        try:
+            from bson import ObjectId
+            await db.sessions.update_one(
+                {"_id": ObjectId(session_id)},
+                {"$set": {
+                    "cad_file_id": file_id,
+                    "cad_filename": filename,
+                    "cad_parsed_data": parsed_data,
+                    "cad_raw_data": content,
+                    "cad_stl_data": stl_data,
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc)
+                }}
+            )
+        except Exception as e:
+            print(f"MongoDB CAD update error: {e}")
 
     return {
         "file_id": file_id,
@@ -339,6 +359,21 @@ async def modify_cad_model(body: ModifyModelRequest):
             new_stl, 
             context["raw_cad_data"]
         )
+
+        # Persist the new STL to MongoDB
+        from main import db
+        if db is not None and session_id:
+            try:
+                from bson import ObjectId
+                await db.sessions.update_one(
+                    {"_id": ObjectId(session_id)},
+                    {"$set": {
+                        "cad_stl_data": new_stl,
+                        "updated_at": datetime.datetime.now(datetime.timezone.utc)
+                    }}
+                )
+            except Exception as e:
+                print(f"MongoDB CAD modify update error: {e}")
         
         import uuid
         # Return a cache-busting URL so the frontend viewer reloads

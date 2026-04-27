@@ -9,6 +9,8 @@ from openai import OpenAI
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from typing import Optional, List
+import json
+import re
 
 # CAD AI module imports
 from app.cad_ai.routes import router as cad_router
@@ -21,7 +23,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -144,6 +146,18 @@ async def get_messages(session_id: str, user_id: str):
         print(f"MongoDB error (get_messages): {e}")
         return []
 
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str, user_id: str):
+    if db is None: raise HTTPException(status_code=503, detail="Database not configured")
+    try:
+        session = await db.sessions.find_one({"_id": ObjectId(session_id), "user_id": user_id})
+        if not session:
+             raise HTTPException(status_code=404, detail="Session not found")
+        return format_doc(session)
+    except Exception as e:
+        print(f"MongoDB error (get_session): {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/sessions/{session_id}/sync")
 async def sync_session(session_id: str, request: SyncRequest):
     """Signals the FreeCAD listener to save the current doc and switch to a new one."""
@@ -179,81 +193,123 @@ async def sync_session(session_id: str, request: SyncRequest):
 # --- Generation Endpoint ---
 
 @app.post("/generate")
-async def generate_freecad_code(request: PromptRequest):
+async def generate_response(request: PromptRequest):
     if not api_key or api_key == "your_openrouter_api_key_here":
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
 
     try:
-        # ── CAD-aware branch ────────────────────────────────────────────
-        # If the session has uploaded CAD context, inject it into the
-        # prompt so the LLM can generate *modification* code rather than
-        # building from scratch.  Original behaviour is fully preserved
-        # when no CAD context exists.
-        # ────────────────────────────────────────────────────────────────
         has_cad = request.session_id and session_has_cad(request.session_id)
-
+        parsed_data = None
+        
+        # ── CAD-aware branch ────────────────────────────────────────────
         if has_cad:
             cad_ctx = get_cad_context(request.session_id)
-            parsed_data = cad_ctx["parsed_data"]
-            messages = build_cad_prompt(request.prompt, parsed_data)
-        else:
-            # Original system prompt — untouched
+            if cad_ctx:
+                parsed_data = cad_ctx.get("parsed_data")
+
+            # First, get a conversational response (text + code)
             system_instruction = (
-                "You are a FreeCAD Python expert. Generate ONLY a working Python script for FreeCAD. "
-                "Follow these rules strictly:\n"
-                "1. Use 'import Part', 'import FreeCAD as App', and 'import PartDesign'.\n"
-                "2. For simple shapes, use 'Part.makeBox', 'Part.makeCylinder', etc.\n"
-                "3. For complex shapes like involute gears, use the 'PartDesign' or 'Part' module API correctly.\n"
-                "4. A document is pre-initialized. Use: 'doc = App.ActiveDocument'. NEVER use 'App.newDocument()'.\n"
-                "5. Add objects using 'doc.addObject' and always call 'doc.recompute()'.\n"
-                "6. NO markdown, NO explanations, NO comments outside the code blocks. ONLY Python code."
+                "You are an expert CAD AI assistant. You can both answer engineering questions and modify 3D models.\n\n"
+                "CONTEXT:\n"
+                f"Parsed CAD Data: {json.dumps(parsed_data, indent=2) if parsed_data else 'No active CAD data found.'}\n\n"
+                "USER CAPABILITIES:\n"
+                "1. If the user asks a question about the model, answer concisely in text.\n"
+                "2. If the user asks to MODIFY the model, generate a FreeCAD Python script.\n"
+                "3. ALWAYS wrap Python code in ```python ... ``` blocks.\n\n"
+                "FREECAD SCRIPT RULES:\n"
+                "- Use 'import Part', 'import FreeCAD as App', 'import PartDesign'.\n"
+                "- Use 'doc = App.ActiveDocument'.\n"
+                "- Access existing objects by name from the 'Parsed CAD Data' provided.\n"
+                "- Always call 'doc.recompute()' at the end."
+            )
+            
+            messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": request.prompt},
+            ]
+
+            response = client.chat.completions.create(
+                model="google/gemini-2.0-flash-001",
+                messages=messages,
+            )
+
+            full_response = response.choices[0].message.content
+            generated_code = ""
+            if "```" in full_response:
+                match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", full_response, re.DOTALL)
+                if match: generated_code = match.group(1).strip()
+
+            # If there's code, or the prompt looks like a modification, run the "Intent Interpreter"
+            intents_data = None
+            if generated_code or any(word in request.prompt.lower() for word in ["increase", "decrease", "change", "modify", "remove", "add"]):
+                try:
+                    from app.cad_ai.routes import interpret_cad_intent, InterpretRequest
+                    intent_res = await interpret_cad_intent(InterpretRequest(prompt=request.prompt, parsed_data=parsed_data or {}))
+                    intents_data = intent_res
+                except Exception as e:
+                    print(f"Intent interpretation failed in unified flow: {e}")
+
+            # Save and return
+            if db is not None and request.session_id:
+                now = datetime.datetime.now(datetime.timezone.utc)
+                await db.messages.insert_one({
+                    "session_id": request.session_id,
+                    "role": "assistant",
+                    "content": full_response,
+                    "code": generated_code,
+                    "intents": intents_data.get("intents") if intents_data else None,
+                    "preview": intents_data.get("preview") if intents_data else None,
+                    "created_at": now
+                })
+
+            return {
+                "content": full_response,
+                "code": generated_code,
+                "intents": intents_data.get("intents") if intents_data else None,
+                "preview": intents_data.get("preview") if intents_data else None,
+                "cad_context_used": True
+            }
+
+        else:
+            # Original non-CAD flow
+            system_instruction = (
+                "You are a FreeCAD Python expert. Generate helpful responses. "
+                "If asked to create a model, provide ONLY the Python script in a ```python ... ``` block. "
+                "Otherwise, answer the user's question normally."
             )
             messages = [
                 {"role": "system", "content": system_instruction},
-                {"role": "user", "content": f"User prompt: {request.prompt}"},
+                {"role": "user", "content": request.prompt},
             ]
+            response = client.chat.completions.create(
+                model="google/gemini-2.0-flash-001",
+                messages=messages,
+            )
+            full_response = response.choices[0].message.content
+            generated_code = ""
+            if "```" in full_response:
+                match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", full_response, re.DOTALL)
+                if match: generated_code = match.group(1).strip()
+            
+            # Save to DB even for non-CAD
+            if db is not None and request.session_id:
+                 now = datetime.datetime.now(datetime.timezone.utc)
+                 await db.messages.insert_one({
+                    "session_id": request.session_id,
+                    "role": "assistant",
+                    "content": full_response,
+                    "code": generated_code,
+                    "created_at": now
+                })
 
-        response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-001",
-            messages=messages,
-        )
-
-        generated_code = response.choices[0].message.content
-
-        # Basic sanitization: Extract only the content within markdown code blocks if present
-        if "```" in generated_code:
-            import re
-            match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", generated_code, re.DOTALL)
-            if match:
-                generated_code = match.group(1).strip()
-            else:
-                # Fallback: Strip lines starting with backticks
-                lines = generated_code.splitlines()
-                generated_code = "\n".join([l for l in lines if not l.strip().startswith("```")]).strip()
-
-        # Save to MongoDB if session_id is provided
-        if db is not None and request.session_id:
-            try:
-                now = datetime.datetime.now(datetime.timezone.utc)
-                await db.messages.insert_many([
-                    {
-                        "session_id": request.session_id,
-                        "role": "user",
-                        "content": request.prompt,
-                        "created_at": now
-                    },
-                    {
-                        "session_id": request.session_id,
-                        "role": "assistant",
-                        "content": generated_code,
-                        "created_at": now + datetime.timedelta(seconds=1)
-                    }
-                ])
-            except Exception as e:
-                print(f"MongoDB save error: {e}")
-                # We don't raise an exception here because we want to return the code anyway
-
-        return {"code": generated_code, "cad_context_used": has_cad}
+            return {
+                "content": full_response,
+                "code": generated_code,
+                "cad_context_used": False
+            }
+    except Exception as e:
+        print(f"Generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         print(f"Generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
