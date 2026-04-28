@@ -257,6 +257,9 @@ async def generate_response(request: PromptRequest):
                 messages=messages,
             )
 
+            if not response or not getattr(response, "choices", None):
+                raise HTTPException(status_code=500, detail="LLM provider returned an empty response. Please retry.")
+
             full_response = response.choices[0].message.content
             generated_code = ""
             if "```" in full_response:
@@ -306,6 +309,10 @@ async def generate_response(request: PromptRequest):
                 model="google/gemini-2.0-flash-001",
                 messages=messages,
             )
+            
+            if not response or not getattr(response, "choices", None):
+                 raise HTTPException(status_code=500, detail="LLM provider returned an empty response. Please retry.")
+                 
             full_response = response.choices[0].message.content
             generated_code = ""
             if "```" in full_response:

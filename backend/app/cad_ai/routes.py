@@ -206,6 +206,10 @@ async def explain_cad(file_id: str, body: ExplainRequest = ExplainRequest()):
             model="google/gemini-2.0-flash-001",
             messages=messages,
         )
+        
+        if not response or not getattr(response, "choices", None):
+            raise HTTPException(status_code=500, detail="LLM provider returned an empty response. Please retry.")
+            
         explanation = response.choices[0].message.content
 
         return {
@@ -266,7 +270,13 @@ async def interpret_cad_intent(body: InterpretRequest):
             messages=messages,
             response_format={"type": "json_object"}
         )
+        
+        if not response or not getattr(response, "choices", None):
+            raise HTTPException(status_code=500, detail="LLM provider returned an empty response for intent interpretation.")
+            
         intent_json = response.choices[0].message.content
+        if not intent_json:
+            raise HTTPException(status_code=500, detail="LLM returned an empty content for intent interpretation.")
         
         if intent_json.startswith("```json"):
             intent_json = intent_json[7:-3].strip()
