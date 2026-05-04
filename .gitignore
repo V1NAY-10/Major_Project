@@ -43,4 +43,6 @@ next-env.d.ts
 # Python
 __pycache__/
 *.pyc
-
+.venv
+.venv-3.11/
+venv/

@@ -88,10 +88,9 @@ async def upload_cad_file(
     try:
         parsed_data = parse_cad_file(content, filename)
     except STEPParseError as e:
-        raise HTTPException(
-            status_code=422,
-            detail=f"STEP parsing failed: {str(e)}",
-        )
+        print(f"CAD parsing warning: {e}. Falling back to generic parsing.")
+        from .cad_context_manager import _parse_generic
+        parsed_data = _parse_generic(content, filename)
     except Exception as e:
         print(f"CAD parse error: {type(e).__name__}: {e}")
         raise HTTPException(
@@ -115,16 +114,27 @@ async def upload_cad_file(
     import tempfile, socket, os
     with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
         tmp.write(content)
-        temp_path = tmp.name
+        temp_path = tmp.name.replace('\\', '/')
 
     fc_script = f"""import FreeCAD as App
-import Part
+import ImportGui
+import FreeCADGui as Gui
 doc = App.ActiveDocument
 if not doc:
     doc = App.newDocument('CAD_Session')
 try:
-    Part.insert(r'{temp_path}', doc.Name)
+    # Clear existing objects safely (collect names first to avoid iterator invalidation)
+    obj_names = [o.Name for o in doc.Objects]
+    for name in obj_names:
+        try:
+            doc.removeObject(name)
+        except Exception:
+            pass
     doc.recompute()
+    ImportGui.insert(r'{temp_path}', doc.Name)
+    doc.recompute()
+    if Gui.ActiveDocument and Gui.ActiveDocument.ActiveView:
+        Gui.SendMsgToActiveView("ViewFit")
 except Exception as e:
     print(e)
 """
@@ -220,6 +230,99 @@ async def explain_cad(file_id: str, body: ExplainRequest = ExplainRequest()):
         print(f"CAD explain LLM error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def interpret_cad_intent_sync(body: InterpretRequest):
+    from .services.structure_analyzer import CompositeStructureAnalyzer
+    from .services.intent_disambiguator import IntentDisambiguator
+    from .services.confirmation_manager import ConfirmationManager
+    from .services.llm_interpreter import LLM_SYSTEM_PROMPT
+    import json
+    
+    components = body.parsed_data.get("components", [])
+    
+    # Step 1: Structure analysis
+    analyzer = CompositeStructureAnalyzer(distance_threshold=150.0)
+    clusters = analyzer.analyze(components)
+    
+    # Step 2: Use LLM to decode the structured intent
+    clusters_context = json.dumps([{"cluster_id": c.cluster_id, "component_type": c.component_type, "member_ids": c.member_ids, "primary_geometry": c.primary_geometry, "secondary_geometries": c.secondary_geometries, "confidence": c.confidence, "editing_hints": c.editing_hints, "spatial_location": getattr(c, "spatial_location", "unknown")} for c in clusters], indent=2)
+    
+    # Since the guide uses llm to decode structured intent first, let's call the LLM:
+    messages = [
+        {"role": "system", "content": LLM_SYSTEM_PROMPT},
+        {"role": "user", "content": f"User prompt: {body.prompt}\n\nAvailable composite clusters:\n{clusters_context}\n\nAvailable parsed features:\n{json.dumps(components, indent=2)}\n\nRespond with JSON following the format specified in your system prompt."}
+    ]
+    
+    response = llm_client.chat.completions.create(
+        model="google/gemini-2.0-flash-001",
+        messages=messages,
+    )
+    
+    intent_json = response.choices[0].message.content or "{}"
+    
+    # Strip markdown code fences if present
+    if "```json" in intent_json:
+        import re as _re
+        m = _re.search(r"```json\s*(.*?)\s*```", intent_json, _re.DOTALL)
+        intent_json = m.group(1) if m else intent_json
+    elif "```" in intent_json:
+        import re as _re
+        m = _re.search(r"```\s*(.*?)\s*```", intent_json, _re.DOTALL)
+        intent_json = m.group(1) if m else intent_json
+    
+    # Find the first JSON object in the response (handles extra text around it)
+    import re as _re
+    json_match = _re.search(r"\{.*\}", intent_json, _re.DOTALL)
+    intent_json = json_match.group(0) if json_match else "{}"
+    
+    try:
+        raw_output = json.loads(intent_json)
+    except json.JSONDecodeError:
+        print(f"[Interpret] Failed to parse LLM JSON: {intent_json[:200]}")
+        raw_output = {}
+    
+    # Step 3: We can use the intent_disambiguator here if we want to run the python logic, but the guide's LLM prompt returns exactly the json structure we need. Let's return what LLM gave, formatted.
+    
+    # Format the output so main.py doesn't break
+    # main.py expects: intents_data.get("intents") and intents_data.get("preview")
+    from .services.ai_utils import generate_intent_preview as generate_preview
+    
+    final_intents = []
+    previews = []
+    
+    raw_intents = raw_output.get("intents", [])
+    for cmd in raw_intents:
+        target_id = cmd.get("target_pattern")
+        comp = next((c for c in components if c.get("id") == target_id), None)
+        
+        if comp:
+            ftype = comp.get("type", "").replace("_pattern", "")
+            label = ftype.capitalize() + ("s" if comp.get("count", 1) > 1 else "")
+            if "role" in comp:
+                label = f"{label} ({comp['role']})"
+            cmd["target_label"] = label
+            cmd["pattern_data"] = comp
+            try:
+                previews.append(generate_preview(cmd))
+            except Exception:
+                pass
+        else:
+            # No matching component found, still include the intent
+            cmd.setdefault("target_label", target_id or "Unknown")
+            cmd.setdefault("pattern_data", {})
+            
+        final_intents.append(cmd)
+        
+    return {
+        "status": raw_output.get("status", "ready_to_execute"),
+        "intents": final_intents,
+        "preview": previews,
+        "secondary_modifications": raw_output.get("secondary_modifications", []),
+        "clusters_detected": raw_output.get("clusters_involved", []),
+        "confidence": raw_output.get("confidence", 1.0),
+        "alternative_interpretations": raw_output.get("alternatives", []),
+        "warnings": []
+    }
+
 @router.post("/interpret")
 async def interpret_cad_intent(body: InterpretRequest):
     """
@@ -228,119 +331,13 @@ async def interpret_cad_intent(body: InterpretRequest):
     """
     if not api_key:
         raise HTTPException(status_code=500, detail="OpenRouter API key not configured.")
-
-    import json
-    from .services.ai_utils import rank_patterns_by_size as rank_patterns
-    from .services.ai_utils import generate_intent_preview as generate_preview
-
-    components = body.parsed_data.get("components", [])
-    rankings = rank_patterns(components)
-
-    system_prompt = (
-        "You are a CAD data abstraction assistant.\n"
-        "Given a user prompt and parsed CAD data, interpret the user's intent into a list of actions.\n\n"
-        f"Available Size Rankings:\n{json.dumps(rankings, indent=2)}\n\n"
-        "Rules for mapping relative sizes (small, large, biggest):\n"
-        "- 'small' or 'smallest': ALWAYS pick the 'smallest' from the rankings for that type.\n"
-        "- 'large': ALWAYS pick the 'second_largest' from the rankings. NEVER pick the 'largest' for 'large'.\n"
-        "- 'biggest' or 'largest': ALWAYS pick the 'largest' from the rankings.\n"
-        "- Example: If a user says 'large cylinder' and 'biggest cylinder', they MUST map to different pattern IDs.\n\n"
-        "Rules for multi-command parsing:\n"
-        "- You MUST split the user input into separate commands if there are multiple actions requested (e.g., separated by 'and', commas, line breaks, or multiple action verbs).\n"
-        "- Each distinct command must produce exactly ONE command object in the `raw_commands` list.\n\n"
-        "Return a JSON object with a single key `raw_commands`: a list of command objects.\n"
-        "Each command object must have:\n"
-        "{\n"
-        "  \"target_pattern\": \"string (exact ID from rankings, e.g., 'comp_1')\",\n"
-        "  \"action\": \"string (e.g., 'increase_diameter', 'decrease_height')\",\n"
-        "  \"value\": \"number (You MUST deduce the exact new value. Read the original diameter/radius from the Parsed CAD Data. If the prompt just says 'increase', you must do the math to provide a real numerical value. NEVER return null or a string like 'default').\",\n"
-        "  \"reason\": \"string (brief explanation of why this target was chosen)\"\n"
-        "}\n"
-        "Return ONLY the JSON object, with no markdown wrapping or additional text."
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Parsed CAD Data:\n{json.dumps(body.parsed_data, indent=2)}\n\nUser Prompt: {body.prompt}"}
-    ]
-
+        
     try:
-        response = llm_client.chat.completions.create(
-            model="google/gemini-2.0-flash-001",
-            messages=messages,
-            response_format={"type": "json_object"}
-        )
-        
-        if not response or not getattr(response, "choices", None):
-            raise HTTPException(status_code=500, detail="LLM provider returned an empty response for intent interpretation.")
-            
-        intent_json = response.choices[0].message.content
-        if not intent_json:
-            raise HTTPException(status_code=500, detail="LLM returned an empty content for intent interpretation.")
-        
-        if intent_json.startswith("```json"):
-            intent_json = intent_json[7:-3].strip()
-        elif intent_json.startswith("```"):
-            intent_json = intent_json[3:-3].strip()
-            
-        raw_output = json.loads(intent_json)
-        raw_commands = raw_output.get("raw_commands", [])
-
-        # Conflict resolution and Missing value handling
-        intents_dict = {}
-        warnings = []
-        seen_warnings = set()
-        for cmd in raw_commands:
-            target_id = cmd.get("target_pattern")
-            if not target_id:
-                continue
-
-            if target_id in intents_dict and target_id not in seen_warnings:
-                warnings.append({
-                    "warning": f"Conflicting operations on same pattern ({target_id}). Last command applied."
-                })
-                seen_warnings.add(target_id)
-            intents_dict[target_id] = cmd
-
-        # Formatting
-        final_intents = []
-        previews = []
-        for target_id, cmd in intents_dict.items():
-            # Get human readable label
-            comp = next((c for c in components if c["id"] == target_id), None)
-            
-            # Fallback if the LLM hallucinated a pattern_ prefix
-            if not comp and target_id.startswith("pattern_"):
-                comp = next((c for c in components if c.get("pattern_id") == target_id), None)
-                if comp:
-                    target_id = comp["id"]  # Fix it so the rest of the flow uses the right ID
-                    
-            if not comp:
-                raise ValueError(f"Could not resolve target ID '{target_id}' to any known component.")
-                
-            label = target_id
-            if comp:
-                ftype = comp.get("type", "").replace("_pattern", "")
-                label = ftype.capitalize() + ("s" if comp.get("count", 1) > 1 else "")
-                if "role" in comp:
-                    label = f"{label} ({comp['role']})"
-
-            # Add full pattern data
-            cmd["target_pattern"] = target_id
-            cmd["target_label"] = label
-            cmd["pattern_data"] = comp
-            
-            final_intents.append(cmd)
-            previews.append(generate_preview(cmd))
-
-        return {
-            "intents": final_intents,
-            "preview": previews,
-            "warnings": warnings
-        }
-
+        return interpret_cad_intent_sync(body)
     except Exception as e:
-        print(f"CAD interpret LLM error: {e}")
+        print(f"CAD interpret error: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -386,19 +383,27 @@ async def modify_cad_model(body: ModifyModelRequest):
         raw_data = context["raw_cad_data"]
         intents = body.intents
 
-        # ThreadPoolExecutor to enforce 5-second hard limit
+        if not intents:
+            print("[CAD Modifier] No intents provided — returning original model URL.")
+            return {
+                "mesh_url": f"/cad/model/{body.file_id}",
+                "warnings": ["No modification intents were parsed. The model is unchanged."]
+            }
+
+        print(f"[CAD Modifier] Applying {len(intents)} intent(s): {[i.get('action') for i in intents]}")
+
+        # ThreadPoolExecutor to enforce hard limit
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(modify_geometry_and_export, raw_data, intents, fallback_stl)
             try:
-                new_stl, warnings = future.result(timeout=30.0)
+                new_stl, new_step, warnings = future.result(timeout=30.0)
             except concurrent.futures.TimeoutError:
                 print("[CAD Modifier] TIMEOUT: Modification exceeded 30 seconds.")
-                # We do not crash the server, but we return a safe fallback response
                 return {
                     "error": "Geometry modification timeout",
                     "reason": "The requested modification took too long and was aborted.",
                     "fallback": True,
-                    "mesh_url": f"/cad/model/{body.file_id}" # return original
+                    "mesh_url": f"/cad/model/{body.file_id}"
                 }
         
         # Save the new STL into the cache so /model/{file_id} returns it
@@ -408,7 +413,7 @@ async def modify_cad_model(body: ModifyModelRequest):
             body.file_id, 
             context["parsed_data"], 
             new_stl, 
-            context["raw_cad_data"]
+            new_step
         )
 
         # Persist the new STL to MongoDB
@@ -421,6 +426,7 @@ async def modify_cad_model(body: ModifyModelRequest):
                     "updated_at": datetime.datetime.now(datetime.timezone.utc)
                 }
                 
+                # Update STL
                 if len(new_stl) > 15 * 1024 * 1024:
                     stl_fs_id, _ = await store_cad_blobs(body.file_id, stl_data=new_stl)
                     update_data["cad_stl_fs_id"] = stl_fs_id
@@ -428,6 +434,15 @@ async def modify_cad_model(body: ModifyModelRequest):
                 else:
                     update_data["cad_stl_data"] = new_stl
                     update_data["cad_stl_fs_id"] = None # Clear old if existed
+                    
+                # Update STEP (raw_cad_data)
+                if len(new_step) > 15 * 1024 * 1024:
+                    _, raw_fs_id = await store_cad_blobs(body.file_id, raw_cad_data=new_step)
+                    update_data["cad_raw_fs_id"] = raw_fs_id
+                    update_data["cad_raw_data"] = None # Clear old if existed
+                else:
+                    update_data["cad_raw_data"] = new_step
+                    update_data["cad_raw_fs_id"] = None # Clear old if existed
 
                 await db.sessions.update_one(
                     {"_id": ObjectId(session_id)},
@@ -440,9 +455,34 @@ async def modify_cad_model(body: ModifyModelRequest):
         
         # Also sync modifications with FreeCAD if running
         try:
-            import socket
-            script_res = await generate_freecad_script(GenerateScriptRequest(intents=body.intents))
-            fc_script = script_res["script"]
+            import socket, tempfile, os
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".step")
+            tmp_path = tmp_path.replace('\\', '/')
+            with os.fdopen(tmp_fd, "wb") as f:
+                f.write(new_step)
+            
+            fc_script = f"""import FreeCAD as App
+import ImportGui
+import FreeCADGui as Gui
+doc = App.ActiveDocument
+if not doc:
+    doc = App.newDocument('CAD_Session')
+try:
+    # Clear existing objects safely (collect names first to avoid iterator invalidation)
+    obj_names = [o.Name for o in doc.Objects]
+    for name in obj_names:
+        try:
+            doc.removeObject(name)
+        except Exception:
+            pass
+    doc.recompute()
+    ImportGui.insert(r'{tmp_path}', doc.Name)
+    doc.recompute()
+    if Gui.ActiveDocument and Gui.ActiveDocument.ActiveView:
+        Gui.SendMsgToActiveView("ViewFit")
+except Exception as e:
+    print(e)
+"""
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
                 s.connect(("127.0.0.1", 6666))
@@ -549,3 +589,34 @@ async def generate_freecad_script(body: GenerateScriptRequest):
 
     return {"script": "\n".join(script)}
 
+class GeometryReasoningRequest(BaseModel):
+    components: Optional[list] = None
+    primitives: Optional[list] = None
+    instruction: str
+
+@router.post("/geometry-reasoning")
+async def apply_geometry_reasoning(body: GeometryReasoningRequest):
+    """
+    Applies deterministic geometry reasoning based on the provided components
+    and instructions.
+    """
+    from .services.geometry_reasoning import GeometryReasoningEngine
+    engine = GeometryReasoningEngine()
+    
+    comp_list = body.components if body.components is not None else body.primitives or []
+
+    try:
+        result = engine.process_model(comp_list, body.instruction)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/cad/vocab/{session_id}")
+async def define_component_term(session_id: str, term: str, cluster_id: str):
+    """
+    Frontend: User right-clicks a component, says "I call this the arm"
+    Backend: Learns the term for this session
+    """
+    vocab = SessionVocabulary(db)
+    await vocab.define_term(session_id, term, cluster_id)
+    return {"status": "learned", "term": term, "cluster_id": cluster_id}

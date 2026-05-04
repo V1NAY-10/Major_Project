@@ -5,6 +5,7 @@ export interface Message {
   code?: string;
   intents?: any[];
   preview?: any[];
+  intent_response?: any;
 }
 
 export interface ChatState {

@@ -267,13 +267,24 @@ def modify_geometry_and_export(
         print("[CAD Modifier] Meshing modified shape...")
         BRepMesh_IncrementalMesh(final_shape, 0.1, False, 0.5)
 
-        print("[CAD Modifier] Exporting MODIFIED shape to STL...")
+        print("[CAD Modifier] Exporting MODIFIED shape to STL and STEP...")
         writer = StlAPI_Writer()
         writer.Write(final_shape, tmp_stl_path)
         print(f"[CAD Modifier] STL written → {tmp_stl_path}")
 
+        from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+        from OCP.Interface import Interface_Static
+        
+        step_writer = STEPControl_Writer()
+        Interface_Static.SetCVal_s("write.step.schema", "AP214")
+        step_writer.Transfer(final_shape, STEPControl_AsIs)
+        step_writer.Write(tmp_path)
+
         with open(tmp_stl_path, "rb") as f:
             stl_bytes = f.read()
+            
+        with open(tmp_path, "rb") as f:
+            step_bytes = f.read()
 
         if len(stl_bytes) < 84:          # 84 bytes is the minimum valid binary STL header
             raise ValueError(
@@ -281,14 +292,14 @@ def modify_geometry_and_export(
                 "mesh step may have produced no triangles."
             )
 
-        print(f"[CAD Modifier] STL size: {len(stl_bytes)} bytes — done.")
-        return stl_bytes, warnings
+        print(f"[CAD Modifier] STL size: {len(stl_bytes)} bytes, STEP size: {len(step_bytes)} bytes — done.")
+        return stl_bytes, step_bytes, warnings
 
     except Exception as exc:
         print(f"[CAD Modifier] ERROR: {exc}")
         if fallback_stl:
             print("[CAD Modifier] Returning fallback STL (original shape).")
-            return fallback_stl, [f"Modification failed: {exc}. Showing original."]
+            return fallback_stl, file_content, [f"Modification failed: {exc}. Showing original."]
         raise
 
     finally:

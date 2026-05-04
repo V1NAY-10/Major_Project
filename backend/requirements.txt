@@ -1,10 +1,27 @@
+# ── Web Framework ─────────────────────────────────────────────────────────────
 fastapi
-uvicorn
-openai
-pydantic
-python-dotenv
-motor
-dnspython
-python-multipart
-cadquery
+uvicorn[standard]          # ASGI server (standard extras: websockets, httptools)
 
+# ── AI / LLM ──────────────────────────────────────────────────────────────────
+openai                     # OpenAI SDK used as OpenRouter client
+
+# ── Data Validation ───────────────────────────────────────────────────────────
+pydantic                   # Request/response models (BaseModel)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv              # load_dotenv() for .env files
+
+# ── Database (MongoDB) ────────────────────────────────────────────────────────
+motor                      # Async MongoDB driver (AsyncIOMotorClient, GridFSBucket)
+dnspython                  # Required by motor for MongoDB Atlas SRV DNS resolution
+pymongo                    # Provides bson.ObjectId used directly in routes and main.py
+
+# ── File Upload ───────────────────────────────────────────────────────────────
+python-multipart           # Required by FastAPI for UploadFile / Form() parsing
+
+# ── CAD Processing ────────────────────────────────────────────────────────────
+cadquery                   # Bundles pythonOCC (OCP) — used for STEP parsing,
+                           # geometry extraction, solid modification, STL/STEP export
+                           # (OCP modules: STEPControl, BRepPrimAPI, BRepMesh, StlAPI, etc.)
+gmsh                       # STEP -> STL mesh conversion on initial file upload
+                           # (used in app/cad/services/mesh_converter.py)

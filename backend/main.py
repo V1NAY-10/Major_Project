@@ -247,7 +247,10 @@ async def generate_response(request: PromptRequest):
                 "- Use 'import Part', 'import FreeCAD as App', 'import PartDesign'.\n"
                 "- Use 'doc = App.ActiveDocument'.\n"
                 "- Access existing objects by name from the 'Parsed CAD Data' provided.\n"
-                "- Always call 'doc.recompute()' at the end."
+                "- Always call 'doc.recompute()' at the end.\n"
+                "- NEVER use App.Matrix4d() — it does not exist. Use App.Matrix() instead.\n"
+                "- To scale an object placement, use: m = App.Matrix(); m.scale(sx, sy, sz); obj.Placement.Matrix = obj.Placement.Matrix.multiply(m)\n"
+                "- Do NOT use scale_matrix.multiply() — use App.Matrix.multiply() directly on the placement."
             )
             
             messages = [{"role": "system", "content": system_instruction}] + chat_history
@@ -268,13 +271,26 @@ async def generate_response(request: PromptRequest):
 
             # If there's code, or the prompt looks like a modification, run the "Intent Interpreter"
             intents_data = None
-            if generated_code or any(word in request.prompt.lower() for word in ["increase", "decrease", "change", "modify", "remove", "add"]):
+            MODIFICATION_KEYWORDS = ["increase", "decrease", "change", "modify", "remove", "add", "scale", "resize", "widen", "shorten", "lengthen", "shrink", "bigger", "smaller", "taller", "wider"]
+            is_modification = bool(generated_code) or any(word in request.prompt.lower() for word in MODIFICATION_KEYWORDS)
+            if is_modification:
                 try:
                     from app.cad_ai.routes import interpret_cad_intent, InterpretRequest
                     intent_res = await interpret_cad_intent(InterpretRequest(prompt=request.prompt, parsed_data=parsed_data or {}))
                     intents_data = intent_res
                 except Exception as e:
                     print(f"Intent interpretation failed in unified flow: {e}")
+                    # Fallback: create a minimal intent_response so the Apply button still shows
+                    intents_data = {
+                        "status": "ready_to_execute",
+                        "intents": [],
+                        "preview": [],
+                        "secondary_modifications": [],
+                        "clusters_detected": [],
+                        "confidence": 0.5,
+                        "alternative_interpretations": [],
+                        "warnings": [f"Intent parsing error: {str(e)}"]
+                    }
 
             # Save and return
             if db is not None and request.session_id:
@@ -286,6 +302,7 @@ async def generate_response(request: PromptRequest):
                     "code": generated_code,
                     "intents": intents_data.get("intents") if intents_data else None,
                     "preview": intents_data.get("preview") if intents_data else None,
+                    "intent_response": intents_data,
                     "created_at": now
                 })
 
@@ -294,6 +311,7 @@ async def generate_response(request: PromptRequest):
                 "code": generated_code,
                 "intents": intents_data.get("intents") if intents_data else None,
                 "preview": intents_data.get("preview") if intents_data else None,
+                "intent_response": intents_data,
                 "cad_context_used": True
             }
 

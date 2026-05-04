@@ -1,169 +1,263 @@
 "use client";
-import { useState } from "react";
-import { CheckCircle2, Target, Zap, Hash, FileText, Loader2 } from "lucide-react";
-
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-interface IntentData {
-  target_pattern?: string;
-  action?: string;
-  value?: number | string;
-  reason?: string;
-  [key: string]: unknown;
-}
+import React, { useState } from 'react';
+import { CheckCircle, AlertTriangle, ChevronRight, Zap, Layers, GitBranch } from 'lucide-react';
 
 interface IntentResponseProps {
-  intent: {
-    intents?: Array<any>;
-    preview?: Array<any>;
-    warnings?: Array<{ warning: string }>;
-  };
-  onApply?: () => Promise<void>;
+  response: any; // Flexible - handles both old and new formats
+  onConfirm: (selectedInterpretation?: string) => void;
+  onCancel: () => void;
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
+export default function IntentResponse({
+  response,
+  onConfirm,
+  onCancel
+}: IntentResponseProps) {
+  const [selectedAlternative, setSelectedAlternative] = useState<string | undefined>();
+  const [showJson, setShowJson] = useState(false);
 
-function actionColor(action?: string) {
-  if (!action) return "text-foreground/50";
-  if (action.includes("increase") || action.includes("add") || action.includes("create"))
-    return "text-emerald-400";
-  if (action.includes("decrease") || action.includes("remove") || action.includes("reduce"))
-    return "text-red-400";
-  if (action.includes("change") || action.includes("modify") || action.includes("update"))
-    return "text-amber-400";
-  return "text-blue-400";
-}
+  // Guard: if response is null/undefined, show nothing
+  if (!response) return null;
 
-const FIELD_META = [
-  { key: "target_label", label: "Target", icon: <Target size={14} className="text-purple-400" />, valueClass: "text-purple-300 font-semibold" },
-  { key: "action", label: "Action", icon: <Zap size={14} className="text-amber-400" /> },
-  { key: "value", label: "Value", icon: <Hash size={14} className="text-blue-400" />, valueClass: "text-blue-300 font-semibold" },
-  { key: "reason", label: "Reason", icon: <FileText size={14} className="text-foreground/40" />, valueClass: "text-foreground/60 italic" },
-];
+  const status = response.status || 'ready_to_execute';
+  const confidence = typeof response.confidence === 'number' ? response.confidence : 1.0;
+  const intents = Array.isArray(response.intents) ? response.intents : [];
+  const clusters = Array.isArray(response.clusters_detected) ? response.clusters_detected : [];
+  const secondaryMods = Array.isArray(response.secondary_modifications) ? response.secondary_modifications : [];
+  const alternatives = Array.isArray(response.alternative_interpretations) ? response.alternative_interpretations : [];
 
-export default function IntentResponse({ intent, onApply }: IntentResponseProps) {
-  const [applying, setApplying] = useState(false);
-  const intentsList = intent.intents || [];
-  const previews = intent.preview || [];
-  const warnings = intent.warnings || [];
+  const confidencePct = Math.round(confidence * 100);
+  const confidenceColor = confidencePct >= 80 ? 'text-green-400' : confidencePct >= 60 ? 'text-yellow-400' : 'text-red-400';
+  const confidenceBg = confidencePct >= 80 ? 'bg-green-500' : confidencePct >= 60 ? 'bg-yellow-500' : 'bg-red-500';
 
-  const handleApply = async () => {
-    if (!onApply) return;
-    setApplying(true);
-    try {
-        await onApply();
-    } finally {
-        setApplying(false);
-    }
-  };
+  // ── Needs Confirmation View ──────────────────────────────────────────────────
+  if (status === 'needs_confirmation' && alternatives.length > 0) {
+    return (
+      <div className="space-y-4">
+        {/* Header */}
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-xl bg-yellow-500/10 border border-yellow-500/20">
+            <AlertTriangle size={16} className="text-yellow-400" />
+          </div>
+          <div>
+            <p className="text-sm font-bold text-yellow-300">Needs Clarification</p>
+            <p className="text-xs text-foreground/40">
+              Confidence: <span className={confidenceColor}>{confidencePct}%</span> — please select an interpretation
+            </p>
+          </div>
+        </div>
 
+        {/* Confidence Bar */}
+        <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+          <div className={`h-full ${confidenceBg} rounded-full transition-all`} style={{ width: `${confidencePct}%` }} />
+        </div>
+
+        {/* Alternatives */}
+        <div className="space-y-2">
+          {alternatives.map((alt: string, idx: number) => (
+            <label key={idx} className={`flex items-center gap-3 p-3 rounded-xl border cursor-pointer transition-all ${
+              selectedAlternative === alt
+                ? 'bg-purple-500/20 border-purple-500/40'
+                : 'bg-white/5 border-white/5 hover:bg-white/10'
+            }`}>
+              <input
+                type="radio"
+                name="alternative"
+                value={alt}
+                checked={selectedAlternative === alt}
+                onChange={(e) => setSelectedAlternative(e.target.value)}
+                className="accent-purple-500"
+              />
+              <span className="text-sm text-foreground/80">{alt}</span>
+            </label>
+          ))}
+        </div>
+
+        {/* JSON Dropdown */}
+        <details
+          open={showJson}
+          onToggle={(e) => setShowJson((e.target as HTMLDetailsElement).open)}
+          className="border border-white/5 rounded-xl overflow-hidden"
+        >
+          <summary className="flex items-center justify-between px-3 py-2 cursor-pointer select-none bg-white/[0.03] hover:bg-white/[0.06] transition-colors list-none">
+            <span className="text-[9px] uppercase tracking-widest font-bold text-foreground/25">Raw JSON</span>
+            <ChevronRight
+              size={10}
+              className={`text-foreground/25 transition-transform duration-200 ${showJson ? 'rotate-90' : ''}`}
+            />
+          </summary>
+          <pre className="px-3 py-2 text-[9px] leading-relaxed font-mono text-foreground/40 overflow-x-auto max-h-40 bg-black/20">
+            {JSON.stringify(response, null, 2)}
+          </pre>
+        </details>
+
+        {/* Action Buttons */}
+        <div className="flex gap-2 pt-1">
+          <button
+            onClick={() => onConfirm(selectedAlternative)}
+            disabled={!selectedAlternative}
+            className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-bold rounded-xl transition-all shadow-lg shadow-purple-500/20"
+          >
+            <Zap size={14} />
+            Confirm &amp; Apply
+          </button>
+          <button
+            onClick={onCancel}
+            className="px-4 py-2.5 bg-white/5 hover:bg-white/10 border border-white/10 text-foreground/60 text-sm rounded-xl transition-all"
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── Ready to Execute View ────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col gap-4 animate-in fade-in slide-in-from-bottom-2 duration-300">
-      
-      {/* Status badge */}
-      <div className="flex items-center gap-2">
-        <CheckCircle2 size={16} className="text-emerald-400" />
-        <span className="text-xs font-semibold text-emerald-400 uppercase tracking-wider">
-          Intent Interpreted ({intentsList.length} action{intentsList.length !== 1 ? 's' : ''})
-        </span>
+    <div className="space-y-5">
+      {/* Header with confidence */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="p-2 rounded-xl bg-green-500/10 border border-green-500/20">
+            <CheckCircle size={16} className="text-green-400" />
+          </div>
+          <div>
+            <p className="text-sm font-bold text-green-300">Ready to Apply</p>
+            <p className="text-xs text-foreground/40">
+              Confidence: <span className={confidenceColor}>{confidencePct}%</span>
+            </p>
+          </div>
+        </div>
+        {/* Confidence bar */}
+        <div className="w-24 h-1.5 bg-white/5 rounded-full overflow-hidden">
+          <div className={`h-full ${confidenceBg} rounded-full`} style={{ width: `${confidencePct}%` }} />
+        </div>
       </div>
 
-      {/* Warnings */}
-      {warnings.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {warnings.map((w, i) => (
-            <div key={i} className="px-3 py-2 bg-amber-500/10 border border-amber-500/20 text-amber-500/90 text-xs rounded-xl">
-              ⚠️ {w.warning}
-            </div>
-          ))}
+      {/* Detected Clusters */}
+      {clusters.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <Layers size={12} className="text-foreground/30" />
+            <p className="text-[10px] uppercase tracking-widest font-bold text-foreground/30">Detected Components</p>
+          </div>
+          <div className="space-y-1.5">
+            {clusters.map((cluster: any, idx: number) => (
+              <div key={cluster.cluster_id || idx} className="bg-white/5 border border-white/5 rounded-xl p-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-1.5 h-1.5 rounded-full bg-purple-500" />
+                  <span className="text-xs font-bold text-foreground/70 capitalize">{cluster.type || 'Component'}</span>
+                  {cluster.spatial_location && (
+                    <span className="text-[9px] px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded text-purple-400">
+                      {cluster.spatial_location}
+                    </span>
+                  )}
+                </div>
+                {Array.isArray(cluster.members) && cluster.members.length > 0 && (
+                  <p className="text-[10px] text-foreground/30 font-mono mt-1 ml-3.5">
+                    {cluster.members.join(' · ')}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
-      {/* Intents */}
-      {intentsList.map((singleIntent, idx) => {
-        // Collect any extra fields not in standard set
-        const standardKeys = new Set([...FIELD_META.map(f => f.key), "target_pattern"]);
-        const extraEntries = Object.entries(singleIntent).filter(([k]) => !standardKeys.has(k));
-        const prev = previews[idx];
-
-        return (
-          <div key={idx} className="flex flex-col gap-2 p-3 bg-card border border-border rounded-xl shadow-sm">
-            
-            <div className="flex flex-col gap-2">
-              {FIELD_META.map(({ key, label, icon, valueClass }) => {
-                const val = singleIntent[key];
-                if (val === undefined || val === null) return null;
-                return (
-                  <div key={key} className="flex items-start gap-3 bg-foreground/[0.03] border border-border rounded-lg p-2.5">
-                    <div className="mt-0.5 shrink-0">{icon}</div>
-                    <div className="flex-1 min-w-0">
-                      <p className="text-[10px] uppercase tracking-widest text-foreground/40 font-bold mb-0.5">
-                        {label}
-                      </p>
-                      <p className={`text-sm font-mono break-all ${key === "action" ? actionColor(String(val)) : valueClass ?? "text-foreground"}`}>
-                        {String(val)}
-                      </p>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-
-            {/* Preview Banner */}
-            {prev && (
-              <div className="mt-2 bg-blue-500/5 border border-blue-500/10 rounded-lg p-3 flex flex-col gap-1">
-                <p className="text-[10px] uppercase tracking-widest text-blue-400/70 font-bold">Simulation Preview</p>
-                <div className="flex items-center gap-2 text-xs font-mono">
-                  <span className="text-foreground/50">{prev.before}</span>
-                  <span className="text-blue-400">→</span>
-                  <span className="text-emerald-400 font-bold">{prev.after}</span>
-                  <span className="text-foreground/40 ml-auto">x{prev.count} instances</span>
+      {/* Planned Changes */}
+      <div className="space-y-2">
+        <div className="flex items-center gap-2">
+          <Zap size={12} className="text-foreground/30" />
+          <p className="text-[10px] uppercase tracking-widest font-bold text-foreground/30">Planned Changes</p>
+        </div>
+        <div className="space-y-1.5">
+          {intents.length > 0 ? (
+            intents.map((intent: any, idx: number) => (
+              <div key={idx} className="bg-white/5 border border-white/5 rounded-xl p-3 space-y-1">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-mono font-bold text-purple-300">
+                    {intent.target_pattern || intent.target_label || `Target ${idx + 1}`}
+                  </span>
+                  <span className="text-[9px] px-1.5 py-0.5 bg-white/5 border border-white/5 rounded text-foreground/40 font-mono">
+                    {intent.action}
+                  </span>
                 </div>
+                {intent.reason && (
+                  <p className="text-[10px] text-foreground/40 leading-relaxed">{intent.reason}</p>
+                )}
+                {typeof intent.confidence === 'number' && (
+                  <p className="text-[9px] text-foreground/25">Intent confidence: {Math.round(intent.confidence * 100)}%</p>
+                )}
               </div>
-            )}
+            ))
+          ) : (
+            <div className="bg-white/5 border border-white/5 rounded-xl p-3">
+              <p className="text-xs text-foreground/50">
+                Apply the modification described in the message above to the 3D model.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
 
-            {/* Extra fields */}
-            {extraEntries.length > 0 && (
-              <div className="mt-2 bg-foreground/[0.03] border border-border rounded-lg overflow-hidden">
-                <p className="text-[10px] uppercase tracking-widest text-foreground/40 font-bold px-3 pt-3 pb-1">
-                  Additional Fields
-                </p>
-                {extraEntries.map(([k, v]) => (
-                  <div key={k} className="flex items-center justify-between px-3 py-2 border-t border-border first:border-t-0">
-                    <span className="text-xs text-foreground/50 font-mono">{k}</span>
-                    <span className="text-xs text-foreground/80 font-mono truncate max-w-[60%] text-right">
-                      {JSON.stringify(v)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-
+      {/* Secondary Modifications */}
+      {secondaryMods.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <GitBranch size={12} className="text-foreground/30" />
+            <p className="text-[10px] uppercase tracking-widest font-bold text-foreground/30">Cascading Adjustments</p>
           </div>
-        );
-      })}
-
-      {/* Apply Button */}
-      {onApply && (
-        <button
-          onClick={handleApply}
-          disabled={applying}
-          className="w-full mt-2 py-3 bg-purple-600 hover:bg-purple-500 disabled:opacity-50 text-white rounded-xl font-bold text-sm shadow-lg shadow-purple-500/20 transition-all flex items-center justify-center gap-2"
-        >
-          {applying ? <Loader2 size={18} className="animate-spin" /> : <Zap size={18} fill="white" />}
-          {applying ? "Modifying Geometry..." : "Apply Changes to 3D Model"}
-        </button>
+          <div className="space-y-1.5">
+            {secondaryMods.map((mod: any, idx: number) => (
+              <div key={idx} className="bg-white/5 border border-white/5 rounded-xl p-3">
+                <div className="flex items-center gap-2">
+                  <ChevronRight size={10} className="text-foreground/30" />
+                  <span className="text-xs font-mono text-foreground/50">
+                    {mod.target_pattern || mod.target}: {mod.action}
+                  </span>
+                </div>
+                {mod.reason && (
+                  <p className="text-[10px] text-foreground/30 mt-1 ml-4">{mod.reason}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
       )}
-
-      {/* Raw JSON toggle */}
-      <details className="group mt-2">
-        <summary className="text-[10px] uppercase tracking-wider text-foreground/30 hover:text-foreground/60 cursor-pointer select-none transition-colors">
-          View raw JSON
+      {/* JSON Dropdown */}
+      <details
+        open={showJson}
+        onToggle={(e) => setShowJson((e.target as HTMLDetailsElement).open)}
+        className="border border-white/5 rounded-xl overflow-hidden"
+      >
+        <summary className="flex items-center justify-between px-3 py-2 cursor-pointer select-none bg-white/[0.03] hover:bg-white/[0.06] transition-colors list-none">
+          <span className="text-[9px] uppercase tracking-widest font-bold text-foreground/25">Raw JSON</span>
+          <ChevronRight
+            size={10}
+            className={`text-foreground/25 transition-transform duration-200 ${showJson ? 'rotate-90' : ''}`}
+          />
         </summary>
-        <pre className="mt-2 text-[11px] font-mono bg-black/30 border border-border rounded-xl p-3 overflow-x-auto text-foreground/70 leading-relaxed">
-          {JSON.stringify(intent, null, 2)}
+        <pre className="px-3 py-2 text-[9px] leading-relaxed font-mono text-foreground/40 overflow-x-auto max-h-40 bg-black/20">
+          {JSON.stringify(response, null, 2)}
         </pre>
       </details>
+
+      {/* Action Buttons */}
+      <div className="flex gap-2 pt-1">
+        <button
+          onClick={() => onConfirm()}
+          className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-purple-600 hover:bg-purple-700 text-white text-sm font-bold rounded-xl transition-all shadow-lg shadow-purple-500/30 hover:shadow-purple-500/50 active:scale-95"
+        >
+          <Zap size={14} fill="white" />
+          Apply Changes
+        </button>
+        <button
+          onClick={onCancel}
+          className="px-4 py-3 bg-white/5 hover:bg-white/10 border border-white/10 text-foreground/50 text-sm rounded-xl transition-all"
+        >
+          Dismiss
+        </button>
+      </div>
     </div>
   );
 }

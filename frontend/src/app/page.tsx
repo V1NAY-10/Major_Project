@@ -171,7 +171,8 @@ export default function Home() {
         content: data.content, 
         code: data.code,
         intents: data.intents,
-        preview: data.preview
+        preview: data.preview,
+        intent_response: data.intent_response
       }]);
     } catch (err: any) {
       setError(err.message || "An error occurred");
@@ -257,7 +258,7 @@ export default function Home() {
                   code={msg.code}
                   onRunInFreeCAD={handleRunInFreeCAD}
                 />
-                {msg.intents && msg.intents.length > 0 && (
+                {msg.intent_response && (
                   <div className="ml-4 md:ml-12 mr-4 bg-card/50 backdrop-blur-md border border-white/5 rounded-3xl p-6 shadow-2xl animate-in fade-in slide-in-from-left-4 duration-700">
                     <div className="flex items-center gap-2 mb-4">
                         <div className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-pulse" />
@@ -266,8 +267,17 @@ export default function Home() {
                         </p>
                     </div>
                     <IntentResponse 
-                        intent={{ intents: msg.intents, preview: msg.preview || [], warnings: [] }} 
-                        onApply={() => handleApplyModifications(msg.intents!)}
+                        response={msg.intent_response} 
+                        onConfirm={(selectedInterpretation) => {
+                          if (selectedInterpretation) {
+                            // Can add logic for handling interpretation if needed, currently we just apply the intent
+                            console.log("User selected alternative:", selectedInterpretation);
+                          }
+                          handleApplyModifications(msg.intents!);
+                        }}
+                        onCancel={() => {
+                          setMessages(prev => [...prev, { role: "assistant", content: "Modification cancelled." }]);
+                        }}
                     />
                   </div>
                 )}
