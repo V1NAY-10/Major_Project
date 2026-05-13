@@ -7,6 +7,8 @@ from __future__ import annotations
 import os
 import tempfile
 from typing import Any, Dict, List, Optional
+import hashlib
+import json
 
 
 # ── Lazy OCP import helper ───────────────────────────────────────────────────
@@ -220,6 +222,18 @@ def _classify_faces(shape) -> list[dict[str, Any]]:
             entry["center"] = [round(loc.X(), 4), round(loc.Y(), 4), round(loc.Z(), 4)]
             d = tor.Axis().Direction()
             entry["axis"] = [round(d.X(), 4), round(d.Y(), 4), round(d.Z(), 4)]
+            
+        # Add stable face hash
+        key = {
+            "type": entry.get("type"),
+            "cx": round(entry.get("center", [0,0,0])[0], 1),
+            "cy": round(entry.get("center", [0,0,0])[1], 1),
+            "cz": round(entry.get("center", [0,0,0])[2], 1),
+            "ax": round((entry.get("axis") or [0,0,0])[0], 2),
+            "ay": round((entry.get("axis") or [0,0,0])[1], 2),
+            "az": round((entry.get("axis") or [0,0,0])[2], 2),
+        }
+        entry["face_hash"] = hashlib.md5(json.dumps(key, sort_keys=True).encode()).hexdigest()[:10]
 
         faces_data.append(entry)
         face_idx += 1
@@ -228,12 +242,45 @@ def _classify_faces(shape) -> list[dict[str, Any]]:
     return faces_data
 
 
+def _faces_touch(fa: dict, fb: dict, tol: float = 0.1) -> bool:
+    """Check if two faces touch by seeing if their bounding boxes overlap or touch."""
+    ba = fa.get("bbox", {})
+    bb = fb.get("bbox", {})
+    if not ba or not bb:
+        return False
+    
+    # Check overlap with tolerance
+    overlap_x = (ba.get("xmax", 0) + tol >= bb.get("xmin", 0)) and (ba.get("xmin", 0) - tol <= bb.get("xmax", 0))
+    overlap_y = (ba.get("ymax", 0) + tol >= bb.get("ymin", 0)) and (ba.get("ymin", 0) - tol <= bb.get("ymax", 0))
+    overlap_z = (ba.get("zmax", 0) + tol >= bb.get("zmin", 0)) and (ba.get("zmin", 0) - tol <= bb.get("zmax", 0))
+    
+    return overlap_x and overlap_y and overlap_z
+
+def _build_adjacency(faces: list[dict]) -> dict[str, list[int]]:
+    """
+    Two faces are adjacent if their bounding boxes overlap significantly
+    or their centers are within 1 radius/height of each other.
+    Returns {face_idx: [adjacent_face_idx, ...]}
+    """
+    adj = {str(i): [] for i in range(len(faces))}
+    for i, fa in enumerate(faces):
+        for j, fb in enumerate(faces):
+            if i >= j:
+                continue
+            if _faces_touch(fa, fb):
+                adj[str(i)].append(j)
+                adj[str(j)].append(i)
+    return adj
+
 def _extract_geometry(shape) -> dict[str, Any]:
+    faces = _classify_faces(shape)
+    adjacency = _build_adjacency(faces)
     return {
         "topology": _count_topology(shape),
         "bounding_box": _bounding_box(shape),
         "volume": _compute_volume(shape),
-        "faces": _classify_faces(shape),
+        "faces": faces,
+        "adjacency": adjacency,
     }
 
 

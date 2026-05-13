@@ -144,6 +144,46 @@ def _assign_role(pattern: dict[str, Any], all_patterns: list[dict[str, Any]]) ->
     return "support"
 
 
+# ── Body Segmentation & Face Labeling (Phase 1) ──────────────────────────────
+
+def _segment_bodies(faces: list[dict], adjacency: dict[str, list[int]]) -> list[list[int]]:
+    """Find connected components = separate solid bodies."""
+    visited = set()
+    bodies = []
+    for start in range(len(faces)):
+        if start in visited:
+            continue
+        component = []
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            stack.extend(adjacency.get(str(node), []))
+        bodies.append(component)
+    return bodies
+
+def _label_face(face: dict, body_role: str, position_in_body: str, adj_face_types: list[str]) -> str:
+    """
+    position_in_body: 'top_cap' | 'bottom_cap' | 'side_wall' | 'inner_wall'
+    adj_face_types: what geometric types this face touches
+    """
+    ftype = face.get("type", "other")
+    if ftype == "plane":
+        end = "top_cap" if position_in_body == "top" else "bottom_cap"
+        return f"{end}_of_{body_role}"
+    elif ftype == "cylinder":
+        inner = "inner" if face.get("orientation") == "internal" else "outer"
+        return f"{inner}_wall_of_{body_role}"
+    elif ftype == "cone":
+        return f"transition_cone_of_{body_role}"
+    return f"{ftype}_of_{body_role}"
+
+
+
+
 # ── Relationship Inference ────────────────────────────────────────────────────
 
 def _infer_relationships(components: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -259,6 +299,7 @@ def _map_single_face(face: dict[str, Any], counter: dict[str, int], global_bbox:
     labels = _compute_semantic_labels(mapped, global_bbox)
     mapped["semantic_label"] = labels
     mapped["spatial_context"] = _build_spatial_context(mapped, global_bbox, labels)
+    mapped["face_hash"] = face.get("face_hash")
     return mapped
 
 
@@ -270,15 +311,33 @@ def map_geometry_to_context(geometry: dict[str, Any]) -> dict[str, Any]:
     features: list[dict[str, Any]] = []
     global_bbox = geometry.get("bounding_box", {})
 
+    raw_faces = geometry.get("faces", [])
+    adjacency = geometry.get("adjacency", {})
+    
+    # Segment faces into connected solid bodies
+    bodies = _segment_bodies(raw_faces, adjacency)
+    face_to_body = {}
+    for body_idx, component in enumerate(bodies):
+        for face_idx in component:
+            face_to_body[face_idx] = f"body_{body_idx}"
+
     # 1. Map raw faces to semantic features
-    for face in geometry.get("faces", []):
+    for face in raw_faces:
         mapped = _map_single_face(face, counter, global_bbox)
         if mapped:
+            mapped["body_id"] = face_to_body.get(face.get("face_id", -1), "body_unknown")
             features.append(mapped)
 
     # 2. Assign roles to each feature
     for feat in features:
         feat["role"] = _assign_role(feat, features)
+        
+    # 3. Apply semantic assembly labels (Phase 1D)
+    for i, feat in enumerate(features):
+        pos_labels = feat.get("semantic_label", [])
+        position_in_body = "top" if "top" in pos_labels else ("bottom" if "bottom" in pos_labels else "side_wall")
+        # In the future we can look at adjacent face types using adjacency graph
+        feat["assembly_label"] = _label_face(feat, feat.get("role", "component"), position_in_body, [])
 
     # 3. Infer relationships
     relationships = _infer_relationships(features)
@@ -296,4 +355,5 @@ def map_geometry_to_context(geometry: dict[str, Any]) -> dict[str, Any]:
         "summary": summary,
         "components": features,
         "relationships": relationships,
+        "adjacency": adjacency,
     }

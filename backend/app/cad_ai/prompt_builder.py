@@ -13,12 +13,51 @@ from typing import Dict, Any
 MAX_CONTEXT_CHARS = 14_000  # ~3 500 tokens
 
 
-def _truncate_context(data: dict) -> str:
-    """Serialize CAD data to JSON string, truncating if it exceeds budget."""
-    raw = json.dumps(data, indent=2, default=str)
+def _format_cad_context(data: dict) -> str:
+    """Condense CAD data into a token-efficient human-readable scene representation."""
+    if data.get("format") == "FCStd":
+        raw = json.dumps(data, indent=2, default=str)
+        return raw[:MAX_CONTEXT_CHARS] + "\n... [truncated]" if len(raw) > MAX_CONTEXT_CHARS else raw
+        
+    components = data.get("components", [])
+    if not components:
+        raw = json.dumps(data, indent=2, default=str)
+        return raw[:MAX_CONTEXT_CHARS] + "\n... [truncated]" if len(raw) > MAX_CONTEXT_CHARS else raw
+        
+    lines = []
+    lines.append(f"SCENE: {data.get('summary', {}).get('component_count', 0)} components")
+    lines.append("ASSEMBLY TREE:")
+    
+    # Group by body_id
+    bodies = {}
+    for c in components:
+        b_id = c.get("body_id", "unknown_body")
+        bodies.setdefault(b_id, []).append(c)
+        
+    for b_id, parts in bodies.items():
+        lines.append(f"  BODY [{b_id}]:")
+        for p in parts:
+            face_id = p.get('face_id', '?')
+            ftype = p.get('type', '?')
+            role = p.get('role', '?')
+            label = p.get('assembly_label', '?')
+            cx, cy, cz = p.get('center', [0,0,0]) if p.get('center') else [0,0,0]
+            dim_info = []
+            if 'diameter' in p: dim_info.append(f"Ø={p['diameter']}")
+            if 'height' in p: dim_info.append(f"H={p['height']}")
+            if 'semi_angle_deg' in p: dim_info.append(f"∠={p['semi_angle_deg']}°")
+            dims = " ".join(dim_info)
+            
+            lines.append(f"    - face_{face_id} ({label}): TYPE={ftype} ROLE={role} {dims} POS=({cx},{cy},{cz})")
+            
+    raw = "\n".join(lines)
     if len(raw) > MAX_CONTEXT_CHARS:
         raw = raw[:MAX_CONTEXT_CHARS] + "\n... [truncated — context too large]"
     return raw
+
+def _truncate_context(data: dict) -> str:
+    """Serialize CAD data to condensed string, truncating if it exceeds budget."""
+    return _format_cad_context(data)
 
 
 # ── 1. Explain CAD ──────────────────────────────────────────────────────────

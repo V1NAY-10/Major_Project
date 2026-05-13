@@ -153,6 +153,39 @@ Return these as secondary modifications with rationale.
 
 ---
 
+### Step 6: Face-Direct Operations
+
+When the user references a specific face by number (e.g., "face 14") or description ("the top cap of the main body"):
+
+1. Look up the face in the scene graph by face_id OR assembly_label.
+2. Identify WHAT that face is (cap, wall, transition, etc.).
+3. Determine WHAT CHANGE is requested:
+   - "make circular" / "dome" → if face is plane → replace with hemisphere
+   - "make flat" → if face is curved → replace with planar cut
+   - "make pointier" → if face is cone → reduce ref_radius or increase semi_angle
+   - "widen" → if face is cylinder wall → scale radius
+4. Generate SECONDARY MODIFICATIONS for all faces constrained to this face.
+
+Response for face-direct operation should include `target_face_id` and `target_assembly_label`, and `operation_type` such as `reshape_face` or `scale_diameter`.
+
+---
+
+### Step 7: Creation Operations
+
+When user asks to CREATE new geometry (e.g., "Add a flange at the base", "create a hole here"):
+
+1. Determine the `feature_type`: "cylinder" | "hole" | "dome" | "semisphere" | "sphere" | "flange" | "fillet"
+2. Calculate the exact `placement` (cx, cy, cz) using the Scene Graph:
+   - "at the base" → usually Z or Y = minimum value of the target component
+   - "at the top" → usually Z or Y = maximum value of the target component
+   - "inside" → centered, subtract from solid (hole)
+   - "around" → fuse with outer shell
+3. Generate the required parameters (e.g., radius, height, thickness).
+
+Response for creation operation must have `action` = "create_feature" and include `feature_type`, `placement`, and `parameters`.
+
+---
+
 ## Response Format
 
 Always respond with this JSON structure:
@@ -165,6 +198,8 @@ Always respond with this JSON structure:
     {
       "target_pattern": "cylinder_90",
       "target_cluster": "cluster_1",
+      "target_face_id": 14,
+      "target_assembly_label": "top_cap_of_main_body",
       "action": "scale_diameter",
       "value": 144,
       "original_value": 120,
@@ -172,6 +207,14 @@ Always respond with this JSON structure:
       "geometry_type": "cylinder",
       "reason": "User said 'increase width of leg' → resolved to cylinder diameter (primary geometry of leg cluster)",
       "confidence": 0.95
+    },
+    {
+      "action": "create_feature",
+      "feature_type": "flange",
+      "placement": {"cx": -150, "cy": -350, "cz": -200, "reference": "at base of cylinder_90"},
+      "parameters": {"inner_r": 60, "outer_r": 80, "thickness": 10},
+      "reason": "User requested to add a flange at the base of the leg",
+      "confidence": 0.90
     }
   ],
   "secondary_modifications": [

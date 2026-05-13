@@ -252,19 +252,30 @@ def interpret_cad_intent_sync(body: InterpretRequest):
     from .services.llm_interpreter import LLM_SYSTEM_PROMPT
     import json
     
+    from .services.face_resolver import FaceResolver
+    from app.cad_ai.prompt_builder import _format_cad_context
+    
     components = body.parsed_data.get("components", [])
     
     # Step 1: Structure analysis
     analyzer = CompositeStructureAnalyzer(distance_threshold=150.0)
     clusters = analyzer.analyze(components)
     
-    # Step 2: Use LLM to decode the structured intent
+    # Step 2: Face resolution hints
+    resolver = FaceResolver()
+    face_matches = resolver.resolve(body.prompt, components)
+    face_hints = ""
+    if face_matches:
+        face_hints = "\n\nFace Reference Hints (High Confidence):\n" + json.dumps(face_matches[:3], indent=2)
+    
+    # Step 3: Use LLM to decode the structured intent
     clusters_context = json.dumps([{"cluster_id": c.cluster_id, "component_type": c.component_type, "member_ids": c.member_ids, "primary_geometry": c.primary_geometry, "secondary_geometries": c.secondary_geometries, "confidence": c.confidence, "editing_hints": c.editing_hints, "spatial_location": getattr(c, "spatial_location", "unknown")} for c in clusters], indent=2)
     
-    # Since the guide uses llm to decode structured intent first, let's call the LLM:
+    condensed_features = _format_cad_context(body.parsed_data)
+    
     messages = [
         {"role": "system", "content": LLM_SYSTEM_PROMPT},
-        {"role": "user", "content": f"User prompt: {body.prompt}\n\nAvailable composite clusters:\n{clusters_context}\n\nAvailable parsed features:\n{json.dumps(components, indent=2)}\n\nRespond with JSON following the format specified in your system prompt."}
+        {"role": "user", "content": f"User prompt: {body.prompt}\n\nAvailable composite clusters:\n{clusters_context}{face_hints}\n\nAvailable parsed features (Scene Graph):\n{condensed_features}\n\nRespond with JSON following the format specified in your system prompt."}
     ]
     
     response = llm_client.chat.completions.create(
@@ -437,6 +448,24 @@ async def modify_cad_model(body: ModifyModelRequest):
                 "warnings": ["No modification intents were parsed. The model is unchanged."]
             }
 
+        # --- CONSTRAINT PROPAGATION (Phase 4B) ---
+        from app.cad.services.constraint_graph import ConstraintGraph
+        parsed_data = context.get("parsed_data", {})
+        components = parsed_data.get("components", [])
+        adjacency = parsed_data.get("adjacency", {})
+        
+        if components and adjacency:
+            cg = ConstraintGraph(components, adjacency)
+            all_intents = list(intents)
+            for intent in intents:
+                node_id = intent.get("target_pattern")
+                prop = intent.get("property")
+                val = _extract_number(intent.get("value"))
+                if node_id and prop and val is not None:
+                    secondary = cg.propagate(node_id, prop, val)
+                    all_intents.extend(secondary)
+            intents = all_intents
+
         print(f"[CAD Modifier] Applying {len(intents)} intent(s): {[i.get('action') for i in intents]}")
 
         # --- NATIVE FREECAD (FCStd) PARAMETRIC BRANCH ---
@@ -538,10 +567,11 @@ async def modify_cad_model(body: ModifyModelRequest):
             parsed_bbox = context.get("parsed_data", {}).get("summary", {}).get("bounding_box", {})
 
             # ── Classify intents ────────────────────────────────────────────
-            hole_intents  = [i for i in intents if "radius" in (i.get("action") or "").lower()
+            hole_intents  = [i for i in intents if ("radius" in (i.get("action") or "").lower()
                              or "diameter" in (i.get("action") or "").lower()
-                             or (i.get("pattern_data") or {}).get("type") in ("hole", "cylinder")]
-            scale_intents = [i for i in intents if i not in hole_intents]
+                             or (i.get("pattern_data") or {}).get("type") in ("hole", "cylinder")) and i.get("action") != "create_feature"]
+            create_intents = [i for i in intents if i.get("action") == "create_feature"]
+            scale_intents = [i for i in intents if i not in hole_intents and i not in create_intents]
 
             script_parts = ["import Part, FreeCAD as App, Mesh",
                             "try: import FreeCADGui as Gui\nexcept: Gui = None",
@@ -565,19 +595,33 @@ async def modify_cad_model(body: ModifyModelRequest):
                 cz_min = (pd.get("bbox") or {}).get("zmin", 0)
                 cz_max = (pd.get("bbox") or {}).get("zmax", 20)
                 height = cz_max - cz_min
+                bbox_max_dim = max((pd.get("bbox") or {}).get("xmax", 20) - (pd.get("bbox") or {}).get("xmin", 0), 
+                                   (pd.get("bbox") or {}).get("ymax", 20) - (pd.get("bbox") or {}).get("ymin", 0),
+                                   new_r * 2.5)
 
                 script_parts += [
-                    f"        # Resize hole: r={new_r:.4f} at center ({cx[0]:.4f},{cx[1]:.4f})",
+                    f"        # Fill existing hole area to remove oval distortions",
+                    f"        _plug = Part.makeBox({bbox_max_dim:.4f}, {bbox_max_dim:.4f}, {height:.4f})",
+                    f"        _plug.Placement.Base = App.Vector({cx[0]:.4f} - {bbox_max_dim:.4f}/2, {cx[1]:.4f} - {bbox_max_dim:.4f}/2, {cz_min:.4f})",
+                    f"        _cut_shape = shape_obj.Shape",
+                    f"        # Try to find exactly the hole faces to remove via defeaturing if supported",
+                    f"        try:",
+                    f"            _remove_faces = []",
+                    f"            for _f in _cut_shape.Faces:",
+                    f"                if _f.Surface.TypeId == 'Part::GeomCylinder':",
+                    f"                    if _f.CenterOfMass.distanceToPoint(App.Vector({cx[0]:.4f}, {cx[1]:.4f}, {cz_min:.4f} + {height:.4f}/2)) < {bbox_max_dim}:",
+                    f"                        _remove_faces.append(_f)",
+                    f"            if hasattr(_cut_shape, 'removeSplitter'):",
+                    f"                # Simple defeaturing fallback",
+                    f"                _cut_shape = _cut_shape.fuse(_plug)",
+                    f"        except: pass",
+                    f"        ",
+                    f"        # Fallback fuse plug if defeaturing not available or complex",
+                    f"        _cut_shape = _cut_shape.fuse(_plug)",
+                    f"        ",
+                    f"        # Cut new perfect cylinder hole",
                     f"        _new_cyl = Part.makeCylinder({new_r:.4f}, {height:.4f})",
                     f"        _new_cyl.Placement.Base = App.Vector({cx[0]:.4f}, {cx[1]:.4f}, {cz_min:.4f})",
-                    f"        # Remove any existing cylinders near this center first",
-                    f"        _cut_shape = shape_obj.Shape",
-                    f"        for _f in _cut_shape.Faces:",
-                    f"            try:",
-                    f"                if _f.Surface.TypeId == 'Part::GeomCylinder':",
-                    f"                    pass  # just remove original hole region via bbox",
-                    f"            except: pass",
-                    f"        # Cut new cylinder hole",
                     f"        shape_obj.Shape = _cut_shape.cut(_new_cyl)",
                 ]
 
@@ -616,6 +660,13 @@ async def modify_cad_model(body: ModifyModelRequest):
                     f"        _m.A33 = {sz:.6f}",
                     f"        shape_obj.Shape = shape_obj.Shape.transformGeometry(_m)",
                 ]
+
+            # ── Creation Operations ─────────────────────────────────────────
+            from app.cad_ai.services.creation_handler import CreationHandler
+            for intent in create_intents:
+                creation_script = CreationHandler.generate_creation_script(intent)
+                if creation_script:
+                    script_parts.append(creation_script)
 
             # ── Finalize: recompute + export STL and STEP ──────────────────
             script_parts += [
@@ -673,12 +724,23 @@ async def modify_cad_model(body: ModifyModelRequest):
 
 
         
+        # ── Re-parse geometry to get updated component XYZ parameters ──────────
+        updated_parsed_data = context.get("parsed_data", {})
+        try:
+            if new_stl and new_stl != fallback_stl and format_type != "FCStd":
+                # Re-parse the STEP raw data to get fresh component data
+                fresh = parse_cad_file(new_step, context.get("cad_filename", "model.step"))
+                if fresh and fresh.get("components"):
+                    updated_parsed_data = fresh
+        except Exception as re_parse_err:
+            print(f"[CAD Modifier] Re-parse warning: {re_parse_err}")
+
         # Save the new STL into the cache so /model/{file_id} returns it
         session_id = context["session_id"]
         store_cad_context(
             session_id, 
             body.file_id, 
-            context["parsed_data"], 
+            updated_parsed_data, 
             new_stl, 
             new_step
         )
@@ -690,7 +752,8 @@ async def modify_cad_model(body: ModifyModelRequest):
                 from bson import ObjectId
                 
                 update_data = {
-                    "updated_at": datetime.datetime.now(datetime.timezone.utc)
+                    "updated_at": datetime.datetime.now(datetime.timezone.utc),
+                    "cad_parsed_data": updated_parsed_data
                 }
                 
                 # Update STL
@@ -717,25 +780,6 @@ async def modify_cad_model(body: ModifyModelRequest):
                 )
             except Exception as e:
                 print(f"MongoDB CAD modify update error: {e}")
-        
-        # ── Re-parse geometry to get updated component XYZ parameters ──────────
-        updated_parsed_data = context.get("parsed_data", {})
-        try:
-            if new_stl and new_stl != fallback_stl and format_type != "FCStd":
-                # Re-parse the STEP raw data to get fresh component data
-                fresh = parse_cad_file(new_step, context.get("cad_filename", "model.step"))
-                if fresh and fresh.get("components"):
-                    updated_parsed_data = fresh
-                    # Store the updated parsed data back into context
-                    store_cad_context(
-                        session_id,
-                        body.file_id,
-                        updated_parsed_data,
-                        new_stl,
-                        new_step
-                    )
-        except Exception as re_parse_err:
-            print(f"[CAD Modifier] Re-parse warning: {re_parse_err}")
 
         import uuid
         # Return a cache-busting URL so the frontend viewer reloads
