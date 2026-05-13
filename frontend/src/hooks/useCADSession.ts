@@ -79,12 +79,40 @@ export function useCADSession() {
     }));
   }, []);
 
+  /**
+   * Update parsedData in state — called after a successful modification so the
+   * Feature Map panel reflects the latest component parameters (including XYZ).
+   */
+  const updateParsedData = useCallback((newParsedData: ParsedData) => {
+    setCadState(prev => ({ ...prev, parsedData: newParsedData }));
+  }, []);
+
+  /**
+   * Fetch the latest parsed component data from the backend for a given fileId
+   * and push it into state. Used after modify-model to refresh the Feature Map.
+   */
+  const refreshParsedData = useCallback(async (fileId: string) => {
+    try {
+      const res = await fetch(`${API_URL}/cad/parsed-data/${fileId}`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.parsed_data) {
+          setCadState(prev => ({ ...prev, parsedData: data.parsed_data as ParsedData }));
+        }
+      }
+    } catch (err) {
+      console.error("Failed to refresh parsed data", err);
+    }
+  }, []);
+
   return {
     ...cadState,
     setCadState,
     resetCadState,
     fetchSessionDetails,
     handleUpload,
-    updateModelUrl
+    updateModelUrl,
+    updateParsedData,
+    refreshParsedData,
   };
 }

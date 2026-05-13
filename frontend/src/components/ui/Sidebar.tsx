@@ -3,7 +3,7 @@ import { Plus, MessageSquare, Menu, X, Edit2, Check, Sun, Moon, Settings, LogOut
 import { UserButton, useUser, useClerk } from "@clerk/nextjs";
 import { useState, useEffect, useRef } from "react";
 import { useTheme } from "next-themes";
-import { API_URL } from "@/lib/api";
+import { getApiUrl } from "@/lib/api";
 
 interface Session {
     id: string;
@@ -34,10 +34,11 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
     }, []);
 
     useEffect(() => {
-        if (user?.id) {
+        // Only fetch once the component has mounted (client-side) and we have a userId
+        if (mounted && user?.id) {
             fetchSessions(user.id);
         }
-    }, [currentSessionId, user?.id]);
+    }, [currentSessionId, user?.id, mounted]);
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
@@ -51,13 +52,17 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
 
     const fetchSessions = async (userId: string) => {
         if (!userId || userId === "null" || userId === "undefined") return;
+        const apiUrl = getApiUrl();
         try {
-            const response = await fetch(`${API_URL}/sessions?user_id=${userId}`);
-            if (!response.ok) throw new Error("Failed to fetch sessions");
+            const response = await fetch(`${apiUrl}/sessions?user_id=${userId}`);
+            if (!response.ok) throw new Error(`Server responded ${response.status}`);
             const sessionsData = await response.json();
             setSessions(Array.isArray(sessionsData) ? sessionsData : []);
         } catch (err) {
-            console.error("Failed to fetch sessions", err);
+            // Only log real errors (not AbortError from component unmount)
+            if ((err as Error)?.name !== "AbortError") {
+                console.error("Failed to fetch sessions:", err);
+            }
         }
     };
 
@@ -75,7 +80,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         }
 
         try {
-            const response = await fetch(`${API_URL}/sessions/${editingId}`, {
+            const response = await fetch(`${getApiUrl()}/sessions/${editingId}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ title: editValue.trim() }),
@@ -95,7 +100,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
 
         // Trigger sync before switching
         try {
-            await fetch(`${API_URL}/sessions/${id}/sync`, {
+            await fetch(`${getApiUrl()}/sessions/${id}/sync`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ previous_session_id: currentSessionId, user_id: user?.id }),
@@ -110,7 +115,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
     const handleNewChatClick = async () => {
         // Trigger sync to "new" state before resetting
         try {
-            await fetch(`${API_URL}/sessions/new/sync`, {
+            await fetch(`${getApiUrl()}/sessions/new/sync`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ previous_session_id: currentSessionId, user_id: user?.id }),

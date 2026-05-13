@@ -57,15 +57,37 @@ if mongodb_uri:
 else:
     print("Warning: MONGODB_URI not found in environment variables")
 
+# Fields that store raw binary blobs — never include in JSON API responses
+_BINARY_FIELDS = frozenset({
+    "cad_raw_data",
+    "cad_stl_data",
+})
+
 def format_doc(doc):
-    """Helper to convert MongoDB _id (ObjectId) to id (str)."""
-    if doc is None: return None
+    """Convert MongoDB document to a JSON-serializable dict.
+
+    - Converts ObjectId → str
+    - Strips raw binary blob fields (cad_raw_data, cad_stl_data) that would
+      cause UnicodeDecodeError when FastAPI tries to JSON-encode them
+    - Converts any remaining bytes values to a '<binary N bytes>' placeholder
+    """
+    if doc is None:
+        return None
     doc["id"] = str(doc["_id"])
     del doc["_id"]
-    for key, value in list(doc.items()):
+    for key in list(doc.keys()):
+        value = doc[key]
+        # Always drop heavy binary blobs — frontend fetches via /cad/model/
+        if key in _BINARY_FIELDS:
+            del doc[key]
+            continue
         if isinstance(value, ObjectId):
             doc[key] = str(value)
+        elif isinstance(value, bytes):
+            # Safety net for any other byte fields
+            doc[key] = f"<binary {len(value)} bytes>"
     return doc
+
 
 class PromptRequest(BaseModel):
     prompt: str
@@ -283,6 +305,11 @@ async def generate_response(request: PromptRequest):
                     "    m.A22 = NEW_Y / bbox.YLength   # Y scale factor\n"
                     "    m.A33 = 1.0                     # Z unchanged\n"
                     "    shape_obj.Shape = shape.transformGeometry(m)\n"
+                    "\n"
+                    "    # Example 2: Adding a new shape (e.g. cylinder) at [X, Y, Z]\n"
+                    "    # new_shape = Part.makeCylinder(radius, height)\n"
+                    "    # new_shape.Placement.Base = App.Vector(X, Y, Z)\n"
+                    "    # shape_obj.Shape = shape.fuse(new_shape)\n"
                     "    doc.recompute()\n"
                     "```\n"
                     "FORBIDDEN API CALLS (crash FreeCAD):\n"
@@ -296,7 +323,7 @@ async def generate_response(request: PromptRequest):
                 "You are an expert CAD AI assistant and FreeCAD Python developer.\n\n"
                 "COORDINATE SYSTEM:\n"
                 "- X=LEFT/RIGHT  Y=FRONT/BACK  Z=BOTTOM/TOP\n"
-                "- Each feature has spatial_context.position_absolute {x,y,z} and alignment_plane.\n\n"
+                "- Each component has a 'center' [X, Y, Z] coordinate in mm.\n\n"
                 f"{format_rules}\n"
                 "PARSED CAD CONTEXT (for understanding the model):\n"
                 f"{json.dumps(parsed_data, indent=2) if parsed_data else 'No CAD data.'}\n\n"
@@ -304,7 +331,7 @@ async def generate_response(request: PromptRequest):
                 "1. Questions: answer with XYZ references.\n"
                 "2. Modifications: write FreeCAD Python following the FILE TYPE rules above exactly.\n"
                 "3. Always wrap code in ```python ... ``` blocks.\n"
-            "4. After code, state what changed and where (XYZ).\n"
+                "4. After code, state what changed and where (XYZ).\n"
             )
 
 
@@ -388,20 +415,31 @@ async def generate_response(request: PromptRequest):
                 "Otherwise, answer the user's question normally."
             )
             messages = [{"role": "system", "content": system_instruction}] + chat_history
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=messages,
-            )
-            
+
+            try:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                )
+            except Exception as llm_err:
+                err_str = str(llm_err).lower()
+                print(f"[/generate non-CAD] LLM error type={type(llm_err).__name__} repr={repr(llm_err)}")
+                if "rate_limit" in err_str or "rate limit" in err_str or "429" in err_str:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Groq rate limit reached. You are on the free tier — wait 1 minute and try again."
+                    )
+                raise HTTPException(status_code=500, detail=f"LLM error: {repr(llm_err)}")
+
             if not response or not getattr(response, "choices", None):
-                 raise HTTPException(status_code=500, detail="LLM provider returned an empty response. Please retry.")
-                 
-            full_response = response.choices[0].message.content
+                raise HTTPException(status_code=500, detail="LLM provider returned an empty response. Please retry.")
+
+            full_response = response.choices[0].message.content or ""
             generated_code = ""
             if "```" in full_response:
                 match = re.search(r"```(?:python)?\s*\n?(.*?)\n?```", full_response, re.DOTALL)
                 if match: generated_code = match.group(1).strip()
-            
+
             # Save to DB even for non-CAD
             if db is not None and request.session_id:
                  now = datetime.datetime.now(datetime.timezone.utc)
@@ -418,9 +456,14 @@ async def generate_response(request: PromptRequest):
                 "code": generated_code,
                 "cad_context_used": False
             }
+    except HTTPException:
+        raise  # re-raise already-formatted HTTP errors unchanged
     except Exception as e:
-        print(f"Generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        print(f"Generation error type={type(e).__name__} repr={repr(e)}")
+        traceback.print_exc()
+        detail = repr(e) if not str(e) else str(e)
+        raise HTTPException(status_code=500, detail=detail)
 
 @app.post("/run-in-freecad")
 async def run_in_freecad(request: PromptRequest):

@@ -1,5 +1,5 @@
 "use client";
-import { Layers, Circle, Box, Minus, Triangle } from "lucide-react";
+import { Layers, Circle, Box, Minus, Triangle, MapPin } from "lucide-react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -31,8 +31,6 @@ function humanLabel(type?: string): string {
   return map[type] ?? type.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
-
-
 function TypeIcon({ type = "" }: { type?: string }) {
   const cls = "shrink-0 opacity-60";
   if (type.includes("hole") || type.includes("cylinder") || type.includes("sphere"))
@@ -44,6 +42,34 @@ function TypeIcon({ type = "" }: { type?: string }) {
   if (type.includes("cone"))
     return <Triangle size={14} className={cls} />;
   return <Layers size={14} className={cls} />;
+}
+
+function fmt(v: number | null | undefined, decimals = 2): string {
+  if (v == null) return "—";
+  return v.toFixed(decimals);
+}
+
+function CoordBadges({ center }: { center?: [number, number, number] | null }) {
+  if (!center || center.length < 3) return null;
+  const [x, y, z] = center;
+  return (
+    <div className="flex items-center gap-1.5 mt-1.5 flex-wrap">
+      <MapPin size={9} className="text-foreground/30 shrink-0" />
+      {[
+        { axis: "X", val: x, color: "text-red-400 bg-red-500/10 border-red-500/20" },
+        { axis: "Y", val: y, color: "text-green-400 bg-green-500/10 border-green-500/20" },
+        { axis: "Z", val: z, color: "text-blue-400 bg-blue-500/10 border-blue-500/20" },
+      ].map(({ axis, val, color }) => (
+        <span
+          key={axis}
+          className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded-md border text-[9px] font-mono font-bold ${color}`}
+        >
+          <span className="opacity-60">{axis}</span>
+          {fmt(val)} <span className="opacity-50 font-normal">mm</span>
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function DimensionChips({ comp }: { comp: Component }) {
@@ -100,7 +126,7 @@ export default function PatternSummary({ data }: PatternSummaryProps) {
           {[
             { label: "Components", value: summary.component_count ?? components.length },
             { label: "Instances", value: summary.total_feature_instances ?? "—" },
-            { label: "Compression", value: summary.compression_ratio ? `${summary.compression_ratio}×` : "—" },
+            { label: "Compression", value: (summary as any).compression_ratio ? `${(summary as any).compression_ratio}×` : "—" },
           ].map(({ label, value }) => (
             <div
               key={label}
@@ -110,6 +136,26 @@ export default function PatternSummary({ data }: PatternSummaryProps) {
               <p className="text-[10px] uppercase tracking-wider text-foreground/40 mt-0.5">{label}</p>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Bounding box XYZ — live coordinates of the model */}
+      {summary?.bounding_box && (
+        <div className="bg-foreground/[0.03] border border-border rounded-xl p-3">
+          <p className="text-[9px] uppercase tracking-widest font-bold text-foreground/30 mb-2">Model Bounds (mm)</p>
+          <div className="grid grid-cols-3 gap-1.5">
+            {[
+              { axis: "X", min: summary.bounding_box.xmin, max: summary.bounding_box.xmax, size: summary.bounding_box.length, color: "text-red-400 border-red-500/20 bg-red-500/5" },
+              { axis: "Y", min: summary.bounding_box.ymin, max: summary.bounding_box.ymax, size: summary.bounding_box.width,  color: "text-green-400 border-green-500/20 bg-green-500/5" },
+              { axis: "Z", min: summary.bounding_box.zmin, max: summary.bounding_box.zmax, size: summary.bounding_box.height, color: "text-blue-400 border-blue-500/20 bg-blue-500/5" },
+            ].map(({ axis, min, max, size, color }) => (
+              <div key={axis} className={`border rounded-lg p-2 text-center ${color}`}>
+                <p className="text-xs font-black">{axis}</p>
+                <p className="text-[9px] font-mono text-foreground/60 mt-0.5">{fmt(min)} → {fmt(max)}</p>
+                <p className="text-[9px] font-bold mt-0.5">{fmt(size)} mm</p>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
@@ -148,6 +194,11 @@ export default function PatternSummary({ data }: PatternSummaryProps) {
                   <span className="text-sm font-semibold text-foreground truncate">
                     {humanLabel(comp.type)}
                   </span>
+                  {comp.count > 1 && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-purple-500/10 border border-purple-500/20 text-purple-400 font-bold">
+                      ×{comp.count}
+                    </span>
+                  )}
                 </div>
                 <div className="flex items-center gap-1.5 shrink-0">
                   {comp.semantic_label?.map((label) => (
@@ -160,7 +211,10 @@ export default function PatternSummary({ data }: PatternSummaryProps) {
                   ))}
                 </div>
               </div>
+              {/* Dimension parameters */}
               <DimensionChips comp={comp} />
+              {/* XYZ centroid position */}
+              <CoordBadges center={comp.center} />
             </div>
           ))}
         </div>

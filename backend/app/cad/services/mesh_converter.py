@@ -5,7 +5,7 @@ def convert_step_to_stl(file_content: bytes) -> bytes:
     """
     Converts raw STEP file bytes to STL bytes using gmsh.
     """
-    import gmsh
+    import gmsh  # type: ignore
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".step")
     tmp_stl_fd, tmp_stl_path = tempfile.mkstemp(suffix=".stl")

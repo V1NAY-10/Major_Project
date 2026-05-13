@@ -380,6 +380,38 @@ class ModifyModelRequest(BaseModel):
     file_id: str
     intents: list
 
+
+def _extract_number(val) -> Optional[float]:
+    """Safely coerce an intent value to float.
+
+    The LLM sometimes returns the value as:
+      - a plain number: 100 / 10.5
+      - a string: "100"
+      - a dict:  {"new_value": 100} or {"value": 100} or {"scale": 1.2}
+    This helper handles all cases and returns None when no number can be found.
+    """
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            return None
+    if isinstance(val, dict):
+        # Try common keys the LLM might use
+        for key in ("new_value", "value", "scale", "factor", "amount"):
+            if key in val:
+                return _extract_number(val[key])
+        # Fall back to the first numeric value found
+        for v in val.values():
+            result = _extract_number(v)
+            if result is not None:
+                return result
+    return None
+
+
 @router.post("/modify-model")
 async def modify_cad_model(body: ModifyModelRequest):
     """
@@ -499,6 +531,10 @@ async def modify_cad_model(body: ModifyModelRequest):
             os.close(tmp_fd)
             tmp_stl_path = tmp_stl_path.replace('\\', '/')
 
+            tmp_fd2, tmp_step_path = tempfile.mkstemp(suffix=".step")
+            os.close(tmp_fd2)
+            tmp_step_path = tmp_step_path.replace('\\', '/')
+
             parsed_bbox = context.get("parsed_data", {}).get("summary", {}).get("bounding_box", {})
 
             # ── Classify intents ────────────────────────────────────────────
@@ -508,6 +544,7 @@ async def modify_cad_model(body: ModifyModelRequest):
             scale_intents = [i for i in intents if i not in hole_intents]
 
             script_parts = ["import Part, FreeCAD as App, Mesh",
+                            "try: import FreeCADGui as Gui\nexcept: Gui = None",
                             "doc = App.ActiveDocument",
                             "try:",
                             "    shape_obj = next((o for o in doc.Objects if hasattr(o,'Shape') and o.Shape.Solids), None)",
@@ -517,7 +554,7 @@ async def modify_cad_model(body: ModifyModelRequest):
             for intent in hole_intents:
                 pd     = intent.get("pattern_data") or {}
                 action = (intent.get("action") or "").lower()
-                new_r  = float(intent.get("value") or pd.get("radius") or 0)
+                new_r  = _extract_number(intent.get("value")) or _extract_number(pd.get("radius")) or 0.0
                 if new_r <= 0:
                     continue
                 # If action says "diameter", halve it
@@ -553,7 +590,7 @@ async def modify_cad_model(body: ModifyModelRequest):
             has_scale = False
             for intent in scale_intents:
                 action = (intent.get("action") or "").lower()
-                val    = float(intent.get("value") or 0) or None
+                val    = _extract_number(intent.get("value")) or None
                 if val is None:
                     continue
                 has_scale = True
@@ -580,11 +617,16 @@ async def modify_cad_model(body: ModifyModelRequest):
                     f"        shape_obj.Shape = shape_obj.Shape.transformGeometry(_m)",
                 ]
 
-            # ── Finalize: recompute + export STL ─────────────────────────────
+            # ── Finalize: recompute + export STL and STEP ──────────────────
             script_parts += [
                 f"        doc.recompute()",
+                f"        if Gui and Gui.ActiveDocument and Gui.ActiveDocument.ActiveView:",
+                f"            Gui.updateGui()",
+                f"            Gui.SendMsgToActiveView('ViewFit')",
                 f"        _objs = [o for o in doc.Objects if hasattr(o,'Shape') and o.Shape.Solids]",
                 f"        Mesh.export(_objs, r'{tmp_stl_path}')",
+                f"        import Import",
+                f"        Import.export(_objs, r'{tmp_step_path}')",
                 f"        print('[Modifier] Done')",
                 f"    else:",
                 f"        print('[Modifier] No solid found')",
@@ -616,7 +658,16 @@ async def modify_cad_model(body: ModifyModelRequest):
             try: os.remove(tmp_stl_path)
             except: pass
 
-            new_step  = raw_data
+            new_step = raw_data
+            for _ in range(40):
+                if os.path.exists(tmp_step_path) and os.path.getsize(tmp_step_path) > 0:
+                    with open(tmp_step_path, "rb") as f:
+                        new_step = f.read()
+                    break
+                time.sleep(0.1)
+            try: os.remove(tmp_step_path)
+            except: pass
+
             warnings  = [f"Applied {len(hole_intents)} hole + {len(scale_intents)} scale intent(s)."]
 
 
@@ -667,49 +718,30 @@ async def modify_cad_model(body: ModifyModelRequest):
             except Exception as e:
                 print(f"MongoDB CAD modify update error: {e}")
         
-        import uuid
-        
-        # Also sync modifications with FreeCAD if running
+        # ── Re-parse geometry to get updated component XYZ parameters ──────────
+        updated_parsed_data = context.get("parsed_data", {})
         try:
-            import socket, tempfile, os
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".step")
-            tmp_path = tmp_path.replace('\\', '/')
-            with os.fdopen(tmp_fd, "wb") as f:
-                f.write(new_step)
-            
-            fc_script = f"""import FreeCAD as App
-import ImportGui
-import FreeCADGui as Gui
-doc = App.ActiveDocument
-if not doc:
-    doc = App.newDocument('CAD_Session')
-try:
-    # Clear existing objects safely (collect names first to avoid iterator invalidation)
-    obj_names = [o.Name for o in doc.Objects]
-    for name in obj_names:
-        try:
-            doc.removeObject(name)
-        except Exception:
-            pass
-    doc.recompute()
-    ImportGui.insert(r'{tmp_path}', doc.Name)
-    doc.recompute()
-    if Gui.ActiveDocument and Gui.ActiveDocument.ActiveView:
-        Gui.SendMsgToActiveView("ViewFit")
-except Exception as e:
-    print(e)
-"""
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                s.connect(("127.0.0.1", 6666))
-                s.sendall(fc_script.encode('utf-8'))
-                s.recv(1024)
-        except Exception as e:
-            print(f"Failed to sync modification with FreeCAD: {e}")
+            if new_stl and new_stl != fallback_stl and format_type != "FCStd":
+                # Re-parse the STEP raw data to get fresh component data
+                fresh = parse_cad_file(new_step, context.get("cad_filename", "model.step"))
+                if fresh and fresh.get("components"):
+                    updated_parsed_data = fresh
+                    # Store the updated parsed data back into context
+                    store_cad_context(
+                        session_id,
+                        body.file_id,
+                        updated_parsed_data,
+                        new_stl,
+                        new_step
+                    )
+        except Exception as re_parse_err:
+            print(f"[CAD Modifier] Re-parse warning: {re_parse_err}")
 
+        import uuid
         # Return a cache-busting URL so the frontend viewer reloads
         return {
             "mesh_url": f"/cad/model/{body.file_id}?t={uuid.uuid4().hex[:8]}",
+            "updated_parsed_data": updated_parsed_data,
             "warnings": warnings
         }
     except Exception as e:
@@ -747,13 +779,62 @@ async def download_cad_mesh(file_id: str):
 @router.get("/model/{file_id}")
 async def get_cad_mesh(file_id: str):
     """
-    Return the STL or OBJ file converted from the uploaded CAD file.
+    Return the STL mesh for the uploaded CAD file.
+
+    Falls back to on-demand conversion from raw STEP bytes if the STL
+    was not generated (or was lost) at upload time.
     """
     context = await get_cad_context_by_file(file_id)
-    if not context or "stl_data" not in context or not context["stl_data"]:
-        raise HTTPException(status_code=404, detail="Mesh data not found for this file.")
-    
-    return Response(content=context["stl_data"], media_type="application/octet-stream")
+    if not context:
+        raise HTTPException(status_code=404, detail="CAD file not found. Please re-upload.")
+
+    stl_data = context.get("stl_data")
+
+    # ── On-demand fallback: re-convert STEP → STL ────────────────────────────
+    if not stl_data:
+        raw = context.get("raw_cad_data")
+        filename = context.get("cad_filename", "")
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        if raw and ext in ("step", "stp"):
+            try:
+                from app.cad.services.mesh_converter import convert_step_to_stl
+                stl_data = convert_step_to_stl(raw)
+                # Cache the result so subsequent requests are fast
+                store_cad_context(
+                    context.get("session_id"),
+                    file_id,
+                    context.get("parsed_data", {}),
+                    stl_data,
+                    raw,
+                )
+                print(f"[Model] On-demand STL generated for {file_id}")
+            except Exception as e:
+                print(f"[Model] On-demand STL conversion failed: {e}")
+
+    if not stl_data:
+        raise HTTPException(
+            status_code=404,
+            detail="Mesh data not available. STL conversion may have failed during upload.",
+        )
+
+    return Response(content=stl_data, media_type="application/octet-stream")
+
+
+@router.get("/parsed-data/{file_id}")
+async def get_parsed_data(file_id: str):
+    """
+    Return the current parsed CAD component data (including XYZ coordinates)
+    for the given file_id. Used by the frontend to refresh the Feature Map
+    panel after geometry modifications.
+    """
+    context = await get_cad_context_by_file(file_id)
+    if not context:
+        raise HTTPException(status_code=404, detail="CAD context not found. Please re-upload the file.")
+    return {
+        "file_id": file_id,
+        "parsed_data": context.get("parsed_data", {}),
+    }
+
 
 class GenerateScriptRequest(BaseModel):
     intents: list

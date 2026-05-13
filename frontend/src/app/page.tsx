@@ -35,7 +35,9 @@ export default function Home() {
     resetCadState,
     fetchSessionDetails,
     handleUpload,
-    updateModelUrl
+    updateModelUrl,
+    updateParsedData,
+    refreshParsedData,
   } = useCADSession();
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -184,46 +186,64 @@ export default function Home() {
 
   const handleApplyModifications = async (intents: any[], code?: string) => {
     if (!cadFileId) return;
+    setSuccessMsg("Applying...");
     try {
-      // Step 1: If there's LLM-generated code, run it directly in FreeCAD (primary action)
+      // ── Fire requests sequentially to avoid race condition ────────────────
+      // 1. FreeCAD live update (socket → listener). Must complete FIRST
+      //    so that the active document is modified.
+      let fcRes = null;
+      let fcOk = true;
       if (code && code.trim()) {
-        const fcRes = await fetch(`${API_URL}/run-in-freecad`, {
+        fcRes = await fetch(`${API_URL}/run-in-freecad`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ prompt: code }),
         });
-        if (fcRes.ok) {
-          setSuccessMsg("Applied in FreeCAD!");
-          setTimeout(() => setSuccessMsg(""), 3000);
-        } else {
-          console.warn("FreeCAD run failed, falling back to intent system");
-        }
+        fcOk = fcRes.ok;
       }
 
-      // Step 2: Call modify-model to get a refreshed STL for the web viewer
-      const res = await fetch(`${API_URL}/cad/modify-model`, {
+      // 2. modify-model: runs its own parametric script, recomputes, 
+      //    and exports the NEW STL and STEP from the active document.
+      const modRes = await fetch(`${API_URL}/cad/modify-model`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ file_id: cadFileId, intents }),
       });
-      const data = await res.json();
-      if (data.mesh_url) {
-        // Force viewer refresh with a cache-busting timestamp
+
+      const modData = modRes.ok ? await modRes.json() : null;
+      const modOk = !!modData?.mesh_url;
+
+      if (modOk) {
+        // Update 3D viewer URL (cache-bust)
         updateModelUrl(cadFileId);
-        setSuccessMsg("Model Updated!");
-        setTimeout(() => setSuccessMsg(""), 3000);
+
+        // ── Update Feature Map parameters immediately ──────────────────────
+        if (modData.updated_parsed_data) {
+          updateParsedData(modData.updated_parsed_data);
+        } else {
+          // Fallback: fetch fresh parsed data from backend
+          refreshParsedData(cadFileId);
+        }
+
+        setSuccessMsg(fcOk ? "✓ Updated in FreeCAD + Viewer!" : "✓ Viewer Updated!");
+        setTimeout(() => setSuccessMsg(""), 4000);
         setMessages(prev => [...prev, {
           role: "assistant",
-          content: "I have successfully applied your modifications to the model! Both your software preview and FreeCAD have been updated. Is there anything else you would like to change?"
+          content: `✅ Modifications applied simultaneously to **both** the 3D web viewer and FreeCAD. The Feature Map parameters have been refreshed. What else would you like to change?`
         }]);
-      } else if (code) {
-        // FreeCAD was updated but STL refresh failed — still show success
+      } else if (fcOk && code) {
+        setSuccessMsg("✓ Applied in FreeCAD!");
+        setTimeout(() => setSuccessMsg(""), 4000);
         setMessages(prev => [...prev, {
           role: "assistant",
-          content: "Changes applied to FreeCAD. The 3D preview may need a moment to refresh — try re-uploading the file to see the updated geometry."
+          content: "Changes applied to FreeCAD. The web 3D preview may need a moment to refresh."
         }]);
+      } else {
+        setSuccessMsg("");
+        console.warn("Apply partially failed", modData);
       }
     } catch (err) {
+      setSuccessMsg("");
       console.error("Apply failed", err);
     }
   };

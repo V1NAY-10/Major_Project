@@ -1,15 +1,15 @@
 import socket
 import threading
-import FreeCAD as App
-import FreeCADGui as Gui
+import FreeCAD as App  # type: ignore
+import FreeCADGui as Gui  # type: ignore
 import time
 
 # Try to import PySide for thread-safe execution via QTimer
 try:
-    from PySide6 import QtCore
+    from PySide6 import QtCore  # type: ignore
 except ImportError:
     try:
-        from PySide2 import QtCore
+        from PySide2 import QtCore  # type: ignore
     except ImportError:
         QtCore = None
 
@@ -23,22 +23,22 @@ _EXEC_GLOBALS = {
     "FreeCADGui": Gui,
 }
 try:
-    import Part
+    import Part  # type: ignore
     _EXEC_GLOBALS["Part"] = Part
 except Exception:
     pass
 try:
-    import PartDesign
+    import PartDesign  # type: ignore
     _EXEC_GLOBALS["PartDesign"] = PartDesign
 except Exception:
     pass
 try:
-    import ImportGui
+    import ImportGui  # type: ignore
     _EXEC_GLOBALS["ImportGui"] = ImportGui
 except Exception:
     pass
 try:
-    import Mesh
+    import Mesh  # type: ignore
     _EXEC_GLOBALS["Mesh"] = Mesh
 except Exception:
     pass
@@ -69,7 +69,7 @@ class ExecutionManager:
                         # Export active document to the requested path
                         path = cmd_data.get("path", "")
                         try:
-                            import Mesh as _Mesh
+                            import Mesh as _Mesh  # type: ignore
                             doc = App.ActiveDocument
                             if doc:
                                 objs = [o for o in doc.Objects
