@@ -33,14 +33,14 @@ app.add_middleware(
 app.include_router(cad_router)
 
 
-api_key = os.getenv("OPENROUTER_API_KEY")
+api_key = os.getenv("GROQ_API_KEY")
 
 if not api_key:
-    print("Warning: OPENROUTER_API_KEY not found")
+    print("Warning: GROQ_API_KEY not found")
 
 client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=api_key,
+    base_url="https://api.groq.com/openai/v1",
+    api_key=api_key or "missing_key",
 )
 
 # MongoDB Config
@@ -200,8 +200,8 @@ async def sync_session(session_id: str, request: SyncRequest):
 
 @app.post("/generate")
 async def generate_response(request: PromptRequest):
-    if not api_key or api_key == "your_openrouter_api_key_here":
-        raise HTTPException(status_code=500, detail="OpenRouter API key not configured")
+    if not api_key or api_key == "your_groq_api_key_here":
+        raise HTTPException(status_code=500, detail="Groq API key not configured")
 
     try:
         # Save user message to DB
@@ -234,34 +234,99 @@ async def generate_response(request: PromptRequest):
         if has_cad:
             parsed_data = cad_ctx.get("parsed_data")
 
-            # First, get a conversational response (text + code)
+            parsed_format = parsed_data.get("format", "STEP") if parsed_data else "STEP"
+            is_fcstd = parsed_format == "FCStd"
+
+            # Get bounding box info for STEP files to inject into prompt
+            bbox = {}
+            if parsed_data:
+                bbox = parsed_data.get("summary", {}).get("bounding_box", {})
+
+            if is_fcstd:
+                feature_names = [f.get("name","?") for f in (parsed_data or {}).get("features",[])[:30]]
+                format_rules = (
+                    "FILE TYPE: Native FreeCAD (.FCStd) -- PARAMETRIC\n"
+                    f"Available named objects: {', '.join(feature_names)}\n"
+                    "HOW TO MODIFY:\n"
+                    "  obj = doc.getObject('ExactObjectName')  # exact names above only\n"
+                    "  obj.Length = 50.0\n"
+                    "  obj.Radius = 10.0\n"
+                    "  doc.recompute()\n"
+                    "  doc.save()\n"
+                )
+            else:
+                bbox_info = (
+                    f"X: {bbox.get('xmin',0):.2f} to {bbox.get('xmax',0):.2f} (length={bbox.get('length',0):.2f})\n"
+                    f"Y: {bbox.get('ymin',0):.2f} to {bbox.get('ymax',0):.2f} (width={bbox.get('width',0):.2f})\n"
+                    f"Z: {bbox.get('zmin',0):.2f} to {bbox.get('zmax',0):.2f} (height={bbox.get('height',0):.2f})"
+                ) if bbox else "Bounding box not available"
+
+                format_rules = (
+                    "FILE TYPE: STEP / Non-parametric B-rep\n"
+                    "CRITICAL RULES FOR STEP FILES:\n"
+                    "1. 'plane_1', 'plane_2', 'hole_1' etc. are our parser labels ONLY -- "
+                    "they are NOT FreeCAD object names. doc.getObject('plane_1') = None.\n"
+                    "2. STEP-imported objects live in doc.Objects as Part::Feature shapes.\n"
+                    "3. To resize/modify, use Shape.transformGeometry(matrix).\n\n"
+                    "CORRECT TEMPLATE FOR STEP MODIFICATIONS:\n"
+                    "```python\n"
+                    "import Part, FreeCAD as App\n"
+                    "doc = App.ActiveDocument\n"
+                    "# Get the main solid (STEP import creates one or more Part::Feature objects)\n"
+                    "shape_obj = next((o for o in doc.Objects if hasattr(o,'Shape') and o.Shape.Solids), None)\n"
+                    "if shape_obj:\n"
+                    "    shape = shape_obj.Shape\n"
+                    "    bbox = shape.BoundBox\n"
+                    "    # Scale: set A11=sx, A22=sy, A33=sz (identity = 1.0)\n"
+                    "    m = App.Matrix()\n"
+                    "    m.A11 = NEW_X / bbox.XLength   # X scale factor\n"
+                    "    m.A22 = NEW_Y / bbox.YLength   # Y scale factor\n"
+                    "    m.A33 = 1.0                     # Z unchanged\n"
+                    "    shape_obj.Shape = shape.transformGeometry(m)\n"
+                    "    doc.recompute()\n"
+                    "```\n"
+                    "FORBIDDEN API CALLS (crash FreeCAD):\n"
+                    "  x App.Matrix().translate()  -- no such method. Use m.A14=dx; m.A24=dy; m.A34=dz\n"
+                    "  x doc.getObject('plane_N')  -- always None for STEP\n"
+                    "  x obj.Placement.Matrix = .. -- use transformGeometry instead\n\n"
+                    f"ACTUAL MODEL DIMENSIONS:\n{bbox_info}\n"
+                )
+
             system_instruction = (
-                "You are an expert CAD AI assistant. You can both answer engineering questions and modify 3D models.\n\n"
-                "CONTEXT:\n"
-                f"Parsed CAD Data: {json.dumps(parsed_data, indent=2) if parsed_data else 'No active CAD data found.'}\n\n"
-                "USER CAPABILITIES:\n"
-                "1. If the user asks a question about the model, answer concisely in text.\n"
-                "2. If the user asks to MODIFY the model, generate a FreeCAD Python script.\n"
-                "3. ALWAYS wrap Python code in ```python ... ``` blocks.\n\n"
-                "FREECAD SCRIPT RULES:\n"
-                "- Use 'import Part', 'import FreeCAD as App', 'import PartDesign'.\n"
-                "- Use 'doc = App.ActiveDocument'.\n"
-                "- Access existing objects by name from the 'Parsed CAD Data' provided.\n"
-                "- Always call 'doc.recompute()' at the end.\n"
-                "- NEVER use App.Matrix4d() — it does not exist. Use App.Matrix() instead.\n"
-                "- To scale an object placement, use: m = App.Matrix(); m.scale(sx, sy, sz); obj.Placement.Matrix = obj.Placement.Matrix.multiply(m)\n"
-                "- Do NOT use scale_matrix.multiply() — use App.Matrix.multiply() directly on the placement."
+                "You are an expert CAD AI assistant and FreeCAD Python developer.\n\n"
+                "COORDINATE SYSTEM:\n"
+                "- X=LEFT/RIGHT  Y=FRONT/BACK  Z=BOTTOM/TOP\n"
+                "- Each feature has spatial_context.position_absolute {x,y,z} and alignment_plane.\n\n"
+                f"{format_rules}\n"
+                "PARSED CAD CONTEXT (for understanding the model):\n"
+                f"{json.dumps(parsed_data, indent=2) if parsed_data else 'No CAD data.'}\n\n"
+                "RESPONSE RULES:\n"
+                "1. Questions: answer with XYZ references.\n"
+                "2. Modifications: write FreeCAD Python following the FILE TYPE rules above exactly.\n"
+                "3. Always wrap code in ```python ... ``` blocks.\n"
+            "4. After code, state what changed and where (XYZ).\n"
             )
+
+
             
-            messages = [{"role": "system", "content": system_instruction}] + chat_history
+            # Cap history to last 10 exchanges to avoid token overflow
+            messages = [{"role": "system", "content": system_instruction}] + chat_history[-10:]
 
-            response = client.chat.completions.create(
-                model="google/gemini-2.0-flash-001",
-                messages=messages,
-            )
+            try:
+                response = client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                )
+            except Exception as llm_err:
+                err_str = str(llm_err).lower()
+                if "rate_limit" in err_str or "rate limit" in err_str:
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Groq rate limit reached. You are on the free tier — wait 1 minute and try again, or check https://console.groq.com/settings/billing to upgrade."
+                    )
+                raise HTTPException(status_code=500, detail=f"LLM error: {llm_err}")
 
-            if not response or not getattr(response, "choices", None):
-                raise HTTPException(status_code=500, detail="LLM provider returned an empty response. Please retry.")
+
 
             full_response = response.choices[0].message.content
             generated_code = ""
@@ -324,7 +389,7 @@ async def generate_response(request: PromptRequest):
             )
             messages = [{"role": "system", "content": system_instruction}] + chat_history
             response = client.chat.completions.create(
-                model="google/gemini-2.0-flash-001",
+                model="llama-3.3-70b-versatile",
                 messages=messages,
             )
             
@@ -364,18 +429,21 @@ async def run_in_freecad(request: PromptRequest):
     print(f"--- Attempting to send code to FreeCAD ({len(code)} bytes) ---")
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2) # 2 second timeout
+            s.settimeout(20)  # Wait for FreeCAD to recompute + save
             s.connect(("127.0.0.1", 6666))
             s.sendall(code.encode('utf-8'))
             data = s.recv(1024)
             if data == b"OK":
-                return {"status": "success", "message": "Code sent to FreeCAD successfully"}
+                return {"status": "success", "message": "Code executed in FreeCAD successfully"}
+            elif data == b"ERR":
+                return {"status": "error", "message": "FreeCAD reported an execution error. Check FreeCAD console for details."}
             else:
-                return {"status": "error", "message": "Unexpected response from FreeCAD"}
+                return {"status": "partial", "message": f"Unexpected response: {data}"}
     except ConnectionRefusedError:
         raise HTTPException(status_code=503, detail="Could not connect to FreeCAD. Ensure the listener macro is running.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
 
 
 if __name__ == "__main__":

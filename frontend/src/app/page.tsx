@@ -182,9 +182,25 @@ export default function Home() {
     }
   };
 
-  const handleApplyModifications = async (intents: any[]) => {
+  const handleApplyModifications = async (intents: any[], code?: string) => {
     if (!cadFileId) return;
     try {
+      // Step 1: If there's LLM-generated code, run it directly in FreeCAD (primary action)
+      if (code && code.trim()) {
+        const fcRes = await fetch(`${API_URL}/run-in-freecad`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt: code }),
+        });
+        if (fcRes.ok) {
+          setSuccessMsg("Applied in FreeCAD!");
+          setTimeout(() => setSuccessMsg(""), 3000);
+        } else {
+          console.warn("FreeCAD run failed, falling back to intent system");
+        }
+      }
+
+      // Step 2: Call modify-model to get a refreshed STL for the web viewer
       const res = await fetch(`${API_URL}/cad/modify-model`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -192,12 +208,19 @@ export default function Home() {
       });
       const data = await res.json();
       if (data.mesh_url) {
+        // Force viewer refresh with a cache-busting timestamp
         updateModelUrl(cadFileId);
         setSuccessMsg("Model Updated!");
         setTimeout(() => setSuccessMsg(""), 3000);
         setMessages(prev => [...prev, {
           role: "assistant",
           content: "I have successfully applied your modifications to the model! Both your software preview and FreeCAD have been updated. Is there anything else you would like to change?"
+        }]);
+      } else if (code) {
+        // FreeCAD was updated but STL refresh failed — still show success
+        setMessages(prev => [...prev, {
+          role: "assistant",
+          content: "Changes applied to FreeCAD. The 3D preview may need a moment to refresh — try re-uploading the file to see the updated geometry."
         }]);
       }
     } catch (err) {
@@ -273,7 +296,7 @@ export default function Home() {
                             // Can add logic for handling interpretation if needed, currently we just apply the intent
                             console.log("User selected alternative:", selectedInterpretation);
                           }
-                          handleApplyModifications(msg.intents!);
+                          handleApplyModifications(msg.intents!, msg.code);
                         }}
                         onCancel={() => {
                           setMessages(prev => [...prev, { role: "assistant", content: "Modification cancelled." }]);

@@ -64,6 +64,34 @@ def _compute_semantic_labels(feature: dict[str, Any], global_bbox: dict[str, Any
     return labels
 
 
+def _build_spatial_context(
+    feature: dict[str, Any],
+    global_bbox: dict[str, Any],
+    semantic_labels: list[str],
+) -> dict[str, Any]:
+    """
+    Build an explicit XYZ spatial context block for LLM consumption.
+    Converts raw center/bbox arrays to labelled dicts and infers
+    the primary reference plane from the feature's axis or alignment_plane.
+    """
+    center = feature.get("center")
+    pos_abs = {"x": center[0], "y": center[1], "z": center[2]} if center else None
+
+    bbox = feature.get("bbox", {})
+    bbox_named = {
+        "x": {"min": bbox.get("xmin"), "max": bbox.get("xmax")},
+        "y": {"min": bbox.get("ymin"), "max": bbox.get("ymax")},
+        "z": {"min": bbox.get("zmin"), "max": bbox.get("zmax")},
+    } if bbox else None
+
+    return {
+        "position_absolute": pos_abs,
+        "bounding_box_xyz": bbox_named,
+        "alignment_plane": feature.get("alignment_plane", "unknown"),
+        "position_relative": "-".join(semantic_labels) if semantic_labels else "center",
+    }
+
+
 # ── Role Heuristics ──────────────────────────────────────────────────────────
 
 def _assign_role(pattern: dict[str, Any], all_patterns: list[dict[str, Any]]) -> str:
@@ -171,9 +199,21 @@ def _map_single_face(face: dict[str, Any], counter: dict[str, int], global_bbox:
             "height": face.get("height", 0),
             "center": face.get("center"),
             "axis": face.get("axis"),
+            "alignment_plane": face.get("alignment_plane", "unknown"),
             "bbox": face.get("bbox"),
             "face_id": face["face_id"],
             "editable": True,
+        }
+    elif ftype == "plane":
+        mapped = {
+            "id": _make_id("plane", counter),
+            "type": "plane",
+            "center": face.get("center"),
+            "axis": face.get("axis"),
+            "alignment_plane": face.get("alignment_plane", "unknown"),
+            "bbox": face.get("bbox"),
+            "face_id": face["face_id"],
+            "editable": False,
         }
     elif ftype == "cone":
         mapped = {
@@ -183,6 +223,7 @@ def _map_single_face(face: dict[str, Any], counter: dict[str, int], global_bbox:
             "ref_radius": face.get("ref_radius", 0),
             "center": face.get("center"),
             "axis": face.get("axis"),
+            "alignment_plane": face.get("alignment_plane", "unknown"),
             "bbox": face.get("bbox"),
             "face_id": face["face_id"],
             "editable": True,
@@ -194,6 +235,7 @@ def _map_single_face(face: dict[str, Any], counter: dict[str, int], global_bbox:
             "radius": face.get("radius", 0),
             "diameter": round(face.get("radius", 0) * 2, 6),
             "center": face.get("center"),
+            "alignment_plane": "N/A",
             "bbox": face.get("bbox"),
             "face_id": face["face_id"],
             "editable": True,
@@ -206,6 +248,7 @@ def _map_single_face(face: dict[str, Any], counter: dict[str, int], global_bbox:
             "minor_radius": face.get("minor_radius", 0),
             "center": face.get("center"),
             "axis": face.get("axis"),
+            "alignment_plane": face.get("alignment_plane", "unknown"),
             "bbox": face.get("bbox"),
             "face_id": face["face_id"],
             "editable": True,
@@ -213,7 +256,9 @@ def _map_single_face(face: dict[str, Any], counter: dict[str, int], global_bbox:
     else:
         return None
 
-    mapped["semantic_label"] = _compute_semantic_labels(mapped, global_bbox)
+    labels = _compute_semantic_labels(mapped, global_bbox)
+    mapped["semantic_label"] = labels
+    mapped["spatial_context"] = _build_spatial_context(mapped, global_bbox, labels)
     return mapped
 
 

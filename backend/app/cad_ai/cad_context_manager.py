@@ -54,7 +54,32 @@ def _parse_fcstd_metadata(file_content: bytes, filename: str) -> dict:
                     for obj in root.iter("Object"):
                         name = obj.attrib.get("name", "unknown")
                         obj_type = obj.attrib.get("type", "unknown")
-                        features.append({"name": name, "type": obj_type})
+                        
+                        # Extract parametric properties for LLM context
+                        props = {}
+                        properties_elem = obj.find("Properties")
+                        if properties_elem is not None:
+                            for prop in properties_elem.iter("Property"):
+                                p_name = prop.attrib.get("name")
+                                # Try to extract standard FreeCAD value types
+                                val = None
+                                for child in prop:
+                                    if child.tag in ("Float", "Integer", "String", "Bool"):
+                                        val = child.attrib.get("value")
+                                        break
+                                if p_name and val is not None:
+                                    # Convert to float if it looks like a number
+                                    try:
+                                        val = float(val) if '.' in val else int(val)
+                                    except ValueError:
+                                        pass
+                                    props[p_name] = val
+
+                        features.append({
+                            "name": name, 
+                            "type": obj_type,
+                            "properties": props
+                        })
 
             # Try GuiDocument.xml for view properties
             if "GuiDocument.xml" in zf.namelist():
@@ -66,7 +91,7 @@ def _parse_fcstd_metadata(file_content: bytes, filename: str) -> dict:
     return {
         "filename": filename,
         "format": "FCStd",
-        "features": features[:50],
+        "features": features,
         "parameters": parameters,
         "dimensions": {},
     }

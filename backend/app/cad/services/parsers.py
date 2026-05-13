@@ -147,7 +147,23 @@ def _classify_faces(shape) -> list[dict[str, Any]]:
             "bbox": f_bbox
         }
 
-        if stype == ocp["GeomAbs_Cylinder"]:
+        if stype == ocp["GeomAbs_Plane"]:
+            plane = adaptor.Plane()
+            loc = plane.Location()
+            entry["center"] = [round(loc.X(), 4), round(loc.Y(), 4), round(loc.Z(), 4)]
+            d = plane.Axis().Direction()
+            dx, dy, dz = round(d.X(), 4), round(d.Y(), 4), round(d.Z(), 4)
+            entry["axis"] = [dx, dy, dz]
+            if abs(dz) > 0.99:
+                entry["alignment_plane"] = "XY"
+            elif abs(dy) > 0.99:
+                entry["alignment_plane"] = "XZ"
+            elif abs(dx) > 0.99:
+                entry["alignment_plane"] = "YZ"
+            else:
+                entry["alignment_plane"] = "custom"
+
+        elif stype == ocp["GeomAbs_Cylinder"]:
             cyl = adaptor.Cylinder()
             entry["radius"] = round(cyl.Radius(), 6)
             entry["orientation"] = "internal" if face.Orientation() == ocp["TopAbs_REVERSED"] else "external"
@@ -156,6 +172,15 @@ def _classify_faces(shape) -> list[dict[str, Any]]:
             d = cyl.Axis().Direction()
             dx, dy, dz = d.X(), d.Y(), d.Z()
             entry["axis"] = [round(dx, 4), round(dy, 4), round(dz, 4)]
+            
+            if abs(dz) > 0.99:
+                entry["alignment_plane"] = "XY"
+            elif abs(dy) > 0.99:
+                entry["alignment_plane"] = "XZ"
+            elif abs(dx) > 0.99:
+                entry["alignment_plane"] = "YZ"
+            else:
+                entry["alignment_plane"] = "custom"
             
             corners = [(xmin, ymin, zmin), (xmax, ymin, zmin), (xmin, ymax, zmin), (xmax, ymax, zmin),
                        (xmin, ymin, zmax), (xmax, ymin, zmax), (xmin, ymax, zmax), (xmax, ymax, zmax)]
@@ -169,7 +194,17 @@ def _classify_faces(shape) -> list[dict[str, Any]]:
             loc = cone.Location()
             entry["center"] = [round(loc.X(), 4), round(loc.Y(), 4), round(loc.Z(), 4)]
             d = cone.Axis().Direction()
-            entry["axis"] = [round(d.X(), 4), round(d.Y(), 4), round(d.Z(), 4)]
+            dx, dy, dz = round(d.X(), 4), round(d.Y(), 4), round(d.Z(), 4)
+            entry["axis"] = [dx, dy, dz]
+            
+            if abs(dz) > 0.99:
+                entry["alignment_plane"] = "XY"
+            elif abs(dy) > 0.99:
+                entry["alignment_plane"] = "XZ"
+            elif abs(dx) > 0.99:
+                entry["alignment_plane"] = "YZ"
+            else:
+                entry["alignment_plane"] = "custom"
 
         elif stype == ocp["GeomAbs_Sphere"]:
             sph = adaptor.Sphere()

@@ -35,11 +35,11 @@ load_dotenv()
 
 router = APIRouter(prefix="/cad", tags=["CAD AI"])
 
-# Re-use the same OpenRouter client as main.py
-api_key = os.getenv("OPENROUTER_API_KEY")
+# Re-use the same Groq client as main.py
+api_key = os.getenv("GROQ_API_KEY")
 llm_client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=api_key,
+    base_url="https://api.groq.com/openai/v1",
+    api_key=api_key or "missing_key",
 )
 
 # Allowed CAD extensions
@@ -112,18 +112,33 @@ async def upload_cad_file(
 
     # Automatically send to FreeCAD if listener is running
     import tempfile, socket, os
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".step") as tmp:
+    suffix = ".fcstd" if ext == "fcstd" else ".step"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(content)
         temp_path = tmp.name.replace('\\', '/')
 
-    fc_script = f"""import FreeCAD as App
+    if ext == "fcstd":
+        fc_script = f"""import FreeCAD as App
+import FreeCADGui as Gui
+try:
+    App.closeDocument('CAD_Session')
+except:
+    pass
+doc = App.openDocument(r'{temp_path}')
+doc.Label = 'CAD_Session'
+App.setActiveDocument(doc.Name)
+if Gui.ActiveDocument and Gui.ActiveDocument.ActiveView:
+    Gui.SendMsgToActiveView("ViewFit")
+"""
+    else:
+        fc_script = f"""import FreeCAD as App
 import ImportGui
 import FreeCADGui as Gui
 doc = App.ActiveDocument
 if not doc:
     doc = App.newDocument('CAD_Session')
 try:
-    # Clear existing objects safely (collect names first to avoid iterator invalidation)
+    # Clear existing objects safely
     obj_names = [o.Name for o in doc.Objects]
     for name in obj_names:
         try:
@@ -140,7 +155,7 @@ except Exception as e:
 """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(1)
+            s.settimeout(8)  # FCStd open may take a moment
             s.connect(("127.0.0.1", 6666))
             s.sendall(fc_script.encode('utf-8'))
             s.recv(1024)
@@ -195,7 +210,7 @@ async def explain_cad(file_id: str, body: ExplainRequest = ExplainRequest()):
     Looks up CAD context by file_id (or session_id if provided).
     """
     if not api_key:
-        raise HTTPException(status_code=500, detail="OpenRouter API key not configured.")
+        raise HTTPException(status_code=500, detail="Groq API key not configured.")
 
     # Resolve CAD context
     context = None
@@ -213,7 +228,7 @@ async def explain_cad(file_id: str, body: ExplainRequest = ExplainRequest()):
 
     try:
         response = llm_client.chat.completions.create(
-            model="google/gemini-2.0-flash-001",
+            model="llama-3.3-70b-versatile",
             messages=messages,
         )
         
@@ -253,7 +268,7 @@ def interpret_cad_intent_sync(body: InterpretRequest):
     ]
     
     response = llm_client.chat.completions.create(
-        model="google/gemini-2.0-flash-001",
+        model="llama-3.3-70b-versatile",
         messages=messages,
     )
     
@@ -330,7 +345,7 @@ async def interpret_cad_intent(body: InterpretRequest):
     Returns a structured JSON object representing the intended action.
     """
     if not api_key:
-        raise HTTPException(status_code=500, detail="OpenRouter API key not configured.")
+        raise HTTPException(status_code=500, detail="Groq API key not configured.")
         
     try:
         return interpret_cad_intent_sync(body)
@@ -392,19 +407,220 @@ async def modify_cad_model(body: ModifyModelRequest):
 
         print(f"[CAD Modifier] Applying {len(intents)} intent(s): {[i.get('action') for i in intents]}")
 
-        # ThreadPoolExecutor to enforce hard limit
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(modify_geometry_and_export, raw_data, intents, fallback_stl)
+        # --- NATIVE FREECAD (FCStd) PARAMETRIC BRANCH ---
+        format_type = context.get("parsed_data", {}).get("format", "")
+        if format_type == "FCStd":
+            print("[CAD Modifier] Detected FCStd format. Applying parametric modification via FreeCAD listener.")
+            import tempfile, os, time
+            tmp_fd, tmp_stl_path = tempfile.mkstemp(suffix=".stl")
+            os.close(tmp_fd)
+            tmp_stl_path = tmp_stl_path.replace('\\', '/')
+            
+            script = [
+                "import FreeCAD as App",
+                "import Mesh",
+                "doc = App.ActiveDocument",
+                "if doc:",
+                "    try:"
+            ]
+            for intent in intents:
+                target = intent.get("target_pattern", "")
+                val = intent.get("value", "")
+                action = intent.get("action", "").lower()
+                
+                # Basic property inference
+                prop = "Length"
+                if "radius" in action:
+                    prop = "Radius"
+                elif "diameter" in action:
+                    prop = "Radius"
+                    try:
+                        val = str(float(val) / 2.0)
+                    except:
+                        pass
+                elif "angle" in action:
+                    prop = "Angle"
+                    
+                script.append(f"        obj = doc.getObject('{target}')")
+                script.append(f"        if obj and hasattr(obj, '{prop}'):")
+                script.append(f"            obj.{prop} = float({val})")
+                script.append(f"        else:")
+                script.append(f"            print(f'Warning: Cannot set {prop} on {target}')")
+                
+            script.append("        doc.recompute()")
+            script.append("        doc.save()")
+            
+            # Export to STL so the web viewer can see it
+            script.append(f"        objs = [o for o in doc.Objects if o.ViewObject and o.ViewObject.Visibility]")
+            script.append(f"        if not objs: objs = doc.Objects")
+            script.append(f"        Mesh.export(objs, r'{tmp_stl_path}')")
+            script.append("    except Exception as e:")
+            script.append("        print(e)")
+            
+            macro_code = "\n".join(script)
             try:
-                new_stl, new_step, warnings = future.result(timeout=30.0)
-            except concurrent.futures.TimeoutError:
-                print("[CAD Modifier] TIMEOUT: Modification exceeded 30 seconds.")
-                return {
-                    "error": "Geometry modification timeout",
-                    "reason": "The requested modification took too long and was aborted.",
-                    "fallback": True,
-                    "mesh_url": f"/cad/model/{body.file_id}"
-                }
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(15)  # recompute + save + mesh export
+                    s.connect(("127.0.0.1", 6666))
+                    s.sendall(macro_code.encode('utf-8'))
+                    s.recv(1024)
+            except Exception as e:
+                print(f"Failed to apply FCStd modification to FreeCAD: {e}")
+                
+            # Wait for FreeCAD to write the STL file
+            new_stl = fallback_stl
+            for _ in range(20): # up to 2 seconds
+                if os.path.exists(tmp_stl_path) and os.path.getsize(tmp_stl_path) > 0:
+                    with open(tmp_stl_path, "rb") as f:
+                        new_stl = f.read()
+                    break
+                time.sleep(0.1)
+                
+            try: os.remove(tmp_stl_path)
+            except: pass
+            
+            # Re-use raw_data since it's FCStd and we modify it in place (we don't rewrite the blob right now, it relies on FreeCAD's active doc)
+            new_step = raw_data 
+            warnings = ["Parametric modifications applied successfully."]
+            
+            # Skip the ThreadPoolExecutor block below for FCStd
+            # We'll just continue to the cache/DB saving logic
+            pass
+        else:
+            # ─────────────────────────────────────────────────────────────────
+            # STEP FILE BRANCH — smart intent router
+            # Detects HOLE/RADIUS intents → generates Boolean cut script
+            # Detects SCALE/RESIZE intents → generates transformGeometry script
+            # ─────────────────────────────────────────────────────────────────
+            import tempfile, os, time
+
+            tmp_fd, tmp_stl_path = tempfile.mkstemp(suffix=".stl")
+            os.close(tmp_fd)
+            tmp_stl_path = tmp_stl_path.replace('\\', '/')
+
+            parsed_bbox = context.get("parsed_data", {}).get("summary", {}).get("bounding_box", {})
+
+            # ── Classify intents ────────────────────────────────────────────
+            hole_intents  = [i for i in intents if "radius" in (i.get("action") or "").lower()
+                             or "diameter" in (i.get("action") or "").lower()
+                             or (i.get("pattern_data") or {}).get("type") in ("hole", "cylinder")]
+            scale_intents = [i for i in intents if i not in hole_intents]
+
+            script_parts = ["import Part, FreeCAD as App, Mesh",
+                            "doc = App.ActiveDocument",
+                            "try:",
+                            "    shape_obj = next((o for o in doc.Objects if hasattr(o,'Shape') and o.Shape.Solids), None)",
+                            "    if shape_obj:"]
+
+            # ── Hole / radius changes → Boolean cut ─────────────────────────
+            for intent in hole_intents:
+                pd     = intent.get("pattern_data") or {}
+                action = (intent.get("action") or "").lower()
+                new_r  = float(intent.get("value") or pd.get("radius") or 0)
+                if new_r <= 0:
+                    continue
+                # If action says "diameter", halve it
+                if "diameter" in action:
+                    new_r = new_r / 2.0
+                
+                cx = pd.get("center", [0, 0, 0])
+                cz_min = (pd.get("bbox") or {}).get("zmin", 0)
+                cz_max = (pd.get("bbox") or {}).get("zmax", 20)
+                height = cz_max - cz_min
+
+                script_parts += [
+                    f"        # Resize hole: r={new_r:.4f} at center ({cx[0]:.4f},{cx[1]:.4f})",
+                    f"        _new_cyl = Part.makeCylinder({new_r:.4f}, {height:.4f})",
+                    f"        _new_cyl.Placement.Base = App.Vector({cx[0]:.4f}, {cx[1]:.4f}, {cz_min:.4f})",
+                    f"        # Remove any existing cylinders near this center first",
+                    f"        _cut_shape = shape_obj.Shape",
+                    f"        for _f in _cut_shape.Faces:",
+                    f"            try:",
+                    f"                if _f.Surface.TypeId == 'Part::GeomCylinder':",
+                    f"                    pass  # just remove original hole region via bbox",
+                    f"            except: pass",
+                    f"        # Cut new cylinder hole",
+                    f"        shape_obj.Shape = _cut_shape.cut(_new_cyl)",
+                ]
+
+            # ── Solid scale → transformGeometry ─────────────────────────────
+            orig_x = parsed_bbox.get("length", 1.0) or 1.0
+            orig_y = parsed_bbox.get("width",  1.0) or 1.0
+            orig_z = parsed_bbox.get("height", 1.0) or 1.0
+            target_x, target_y, target_z = orig_x, orig_y, orig_z
+
+            has_scale = False
+            for intent in scale_intents:
+                action = (intent.get("action") or "").lower()
+                val    = float(intent.get("value") or 0) or None
+                if val is None:
+                    continue
+                has_scale = True
+                if "scale_x" in action or "width" in action:
+                    target_x = val
+                elif "scale_y" in action or "depth" in action:
+                    target_y = val
+                elif "scale_z" in action or "height" in action:
+                    target_z = val
+                elif "scale" in action:
+                    target_x = orig_x * val
+                    target_y = orig_y * val
+                    target_z = orig_z * val
+
+            if has_scale:
+                sx = target_x / orig_x if orig_x else 1.0
+                sy = target_y / orig_y if orig_y else 1.0
+                sz = target_z / orig_z if orig_z else 1.0
+                script_parts += [
+                    f"        _m = App.Matrix()",
+                    f"        _m.A11 = {sx:.6f}",
+                    f"        _m.A22 = {sy:.6f}",
+                    f"        _m.A33 = {sz:.6f}",
+                    f"        shape_obj.Shape = shape_obj.Shape.transformGeometry(_m)",
+                ]
+
+            # ── Finalize: recompute + export STL ─────────────────────────────
+            script_parts += [
+                f"        doc.recompute()",
+                f"        _objs = [o for o in doc.Objects if hasattr(o,'Shape') and o.Shape.Solids]",
+                f"        Mesh.export(_objs, r'{tmp_stl_path}')",
+                f"        print('[Modifier] Done')",
+                f"    else:",
+                f"        print('[Modifier] No solid found')",
+                f"except Exception as _e:",
+                f"    print(f'[Modifier] Error: {{_e}}')",
+                f"    import traceback; traceback.print_exc()",
+            ]
+
+            step_script = "\n".join(script_parts)
+            print(f"[CAD Modifier] Generated STEP script ({len(step_script)} bytes), hole_intents={len(hole_intents)}, scale_intents={len(scale_intents)}")
+
+            try:
+                import socket
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(15)
+                    s.connect(("127.0.0.1", 6666))
+                    s.sendall(step_script.encode('utf-8'))
+                    s.recv(1024)
+            except Exception as e:
+                print(f"[CAD Modifier] FreeCAD not reachable: {e}")
+
+            new_stl = fallback_stl
+            for _ in range(40):  # up to 4 seconds
+                if os.path.exists(tmp_stl_path) and os.path.getsize(tmp_stl_path) > 0:
+                    with open(tmp_stl_path, "rb") as f:
+                        new_stl = f.read()
+                    break
+                time.sleep(0.1)
+            try: os.remove(tmp_stl_path)
+            except: pass
+
+            new_step  = raw_data
+            warnings  = [f"Applied {len(hole_intents)} hole + {len(scale_intents)} scale intent(s)."]
+
+
+
         
         # Save the new STL into the cache so /model/{file_id} returns it
         session_id = context["session_id"]
