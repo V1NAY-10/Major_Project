@@ -3,7 +3,7 @@ import { Plus, MessageSquare, Menu, X, Edit2, Check, Sun, Moon, Settings, LogOut
 import { UserButton, useUser, useClerk } from "@clerk/nextjs";
 import { useState, useEffect, useRef } from "react";
 import { useTheme } from "next-themes";
-import { getApiUrl } from "@/lib/api";
+import { apiFetch } from "@/lib/api";
 
 interface Session {
     id: string;
@@ -36,7 +36,7 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
     useEffect(() => {
         // Only fetch once the component has mounted (client-side) and we have a userId
         if (mounted && user?.id) {
-            fetchSessions(user.id);
+            fetchSessions();
         }
     }, [currentSessionId, user?.id, mounted]);
 
@@ -50,13 +50,9 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         return () => document.removeEventListener("mousedown", handleClickOutside);
     }, []);
 
-    const fetchSessions = async (userId: string) => {
-        if (!userId || userId === "null" || userId === "undefined") return;
-        const apiUrl = getApiUrl();
+    const fetchSessions = async () => {
         try {
-            const response = await fetch(`${apiUrl}/sessions?user_id=${userId}`);
-            if (!response.ok) throw new Error(`Server responded ${response.status}`);
-            const sessionsData = await response.json();
+            const sessionsData = await apiFetch<Session[]>("/sessions");
             setSessions(Array.isArray(sessionsData) ? sessionsData : []);
         } catch (err) {
             // Only log real errors (not AbortError from component unmount)
@@ -80,14 +76,12 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         }
 
         try {
-            const response = await fetch(`${getApiUrl()}/sessions/${editingId}`, {
+            await apiFetch(`/sessions/${editingId}`, {
                 method: "PATCH",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ title: editValue.trim() }),
             });
-            if (response.ok) {
-                setSessions(prev => prev.map(s => s.id === editingId ? { ...s, title: editValue.trim() } : s));
-            }
+            setSessions(prev => prev.map(s => s.id === editingId ? { ...s, title: editValue.trim() } : s));
         } catch (err) {
             console.error("Failed to rename session", err);
         } finally {
@@ -95,36 +89,13 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         }
     };
 
-    const handleSelectSession = async (id: string) => {
+    // Switching chats brings that session's document to front via /cad/activate (see useCADSession).
+    const handleSelectSession = (id: string) => {
         if (id === currentSessionId) return;
-
-        // Trigger sync before switching
-        try {
-            await fetch(`${getApiUrl()}/sessions/${id}/sync`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ previous_session_id: currentSessionId, user_id: user?.id }),
-            });
-        } catch (err) {
-            console.error("Failed to sync session with FreeCAD", err);
-        }
-
         onSelectSession(id);
     };
 
-    const handleNewChatClick = async () => {
-        // Trigger sync to "new" state before resetting
-        try {
-            await fetch(`${getApiUrl()}/sessions/new/sync`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ previous_session_id: currentSessionId, user_id: user?.id }),
-            });
-        } catch (err) {
-            console.error("Failed to sync new chat with FreeCAD", err);
-        }
-        onNewChat();
-    };
+    const handleNewChatClick = () => onNewChat();
 
     return (
         <>

@@ -46,3 +46,8 @@ __pycache__/
 .venv
 .venv-3.11/
 venv/
+
+# AetherCAD session data (uploaded models, versions, exports)
+backend/data/
+backend/exports/
+!backend/.env.example

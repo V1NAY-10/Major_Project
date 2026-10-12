@@ -1,118 +1,100 @@
-import { useState, useCallback } from "react";
-import { API_URL } from "@/lib/api";
-import { CADState, ParsedData } from "@/types/cad";
+import { useState, useCallback, useEffect } from "react";
+import { ApiError, apiBlob, apiFetch, postJson } from "@/lib/api";
+import { CadState, FreeCADStatus } from "@/types/cad";
 
+/** CAD state for the active chat session. The backend + FreeCAD own the truth; this mirrors it. */
 export function useCADSession() {
-  const [cadState, setCadState] = useState<CADState>({
-    fileId: null,
-    parsedData: null,
-    modelUrl: null,
-    fileName: null,
-    isUploading: false,
-  });
+  const [cad, setCad] = useState<CadState | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [busy, setBusy] = useState(false);
 
-  const resetCadState = useCallback(() => {
-    setCadState({
-      fileId: null,
-      parsedData: null,
-      modelUrl: null,
-      fileName: null,
-      isUploading: false,
-    });
-  }, []);
+  const resetCadState = useCallback(() => setCad(null), []);
 
-  const fetchSessionDetails = useCallback(async (sessionId: string, userId: string) => {
+  /** Load the session's CAD state (404 = no model yet) and bring its document to front in FreeCAD. */
+  const loadSessionCad = useCallback(async (sessionId: string) => {
     try {
-      const res = await fetch(`${API_URL}/sessions/${sessionId}?user_id=${userId}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.cad_file_id) {
-          setCadState({
-            fileId: data.cad_file_id,
-            fileName: data.cad_filename,
-            parsedData: data.cad_parsed_data,
-            modelUrl: `${API_URL}/cad/model/${data.cad_file_id}`,
-            isUploading: false,
-          });
-        } else {
-          resetCadState();
-        }
-      }
+      const state = await apiFetch<CadState>(`/cad/state/${sessionId}`);
+      setCad(state);
+      postJson<CadState>(`/cad/activate/${sessionId}`).then(setCad).catch(() => {});
     } catch (err) {
-      console.error("Failed to fetch session details", err);
-    }
-  }, [resetCadState]);
-
-  const handleUpload = useCallback(async (file: File, sessionId: string | null, userId: string) => {
-    setCadState(prev => ({ ...prev, isUploading: true }));
-
-    const formData = new FormData();
-    formData.append("file", file);
-    if (sessionId) formData.append("session_id", sessionId);
-
-    try {
-      const res = await fetch(`${API_URL}/cad/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!res.ok) throw new Error("Upload failed");
-      
-      const data = await res.json();
-      setCadState({
-        fileId: data.file_id,
-        fileName: data.filename,
-        parsedData: data.parsed_data,
-        modelUrl: `${API_URL}/cad/model/${data.file_id}`,
-        isUploading: false,
-      });
-      return data;
-    } catch (err) {
-      setCadState(prev => ({ ...prev, isUploading: false }));
-      throw err;
+      if (err instanceof ApiError && err.status === 404) setCad(null);
+      else console.error("Failed to load CAD state", err);
     }
   }, []);
 
-  const updateModelUrl = useCallback((fileId: string) => {
-    setCadState(prev => ({
-      ...prev,
-      modelUrl: `${API_URL}/cad/model/${fileId}?t=${Date.now()}`
-    }));
-  }, []);
-
-  /**
-   * Update parsedData in state — called after a successful modification so the
-   * Feature Map panel reflects the latest component parameters (including XYZ).
-   */
-  const updateParsedData = useCallback((newParsedData: ParsedData) => {
-    setCadState(prev => ({ ...prev, parsedData: newParsedData }));
-  }, []);
-
-  /**
-   * Fetch the latest parsed component data from the backend for a given fileId
-   * and push it into state. Used after modify-model to refresh the Feature Map.
-   */
-  const refreshParsedData = useCallback(async (fileId: string) => {
+  const upload = useCallback(async (file: File, sessionId: string) => {
+    setIsUploading(true);
     try {
-      const res = await fetch(`${API_URL}/cad/parsed-data/${fileId}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.parsed_data) {
-          setCadState(prev => ({ ...prev, parsedData: data.parsed_data as ParsedData }));
-        }
-      }
-    } catch (err) {
-      console.error("Failed to refresh parsed data", err);
+      const form = new FormData();
+      form.append("file", file);
+      form.append("session_id", sessionId);
+      const state = await apiFetch<CadState>("/cad/upload", { method: "POST", body: form });
+      setCad(state);
+      return state;
+    } finally {
+      setIsUploading(false);
     }
   }, []);
+
+  const step = useCallback(async (sessionId: string, dir: "undo" | "redo") => {
+    setBusy(true);
+    try {
+      const state = await postJson<CadState>(`/cad/${dir}/${sessionId}`);
+      setCad(state);
+      return state;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  /** Exports need the auth header, so they are fetched as a blob and saved via a temporary link. */
+  const download = useCallback(
+    async (format: string) => {
+      if (!cad) return;
+      const { blob, filename } = await apiBlob(`/cad/download/${cad.session_id}?format=${format}`);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename ?? `${cad.filename.replace(/\.[^.]+$/, "")}_v${cad.version}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    },
+    [cad]
+  );
 
   return {
-    ...cadState,
-    setCadState,
+    cad,
+    setCad,
+    isUploading,
+    busy,
     resetCadState,
-    fetchSessionDetails,
-    handleUpload,
-    updateModelUrl,
-    updateParsedData,
-    refreshParsedData,
+    loadSessionCad,
+    upload,
+    undo: (sessionId: string) => step(sessionId, "undo"),
+    redo: (sessionId: string) => step(sessionId, "redo"),
+    /** Backend path of the current version's STL (fetched with auth by the viewer). */
+    modelPath: cad ? cad.mesh_url : null,
+    download,
   };
+}
+
+/** Polls the FreeCAD bridge so the header can show whether edits will reach FreeCAD. */
+export function useFreeCADStatus(intervalMs = 10000) {
+  const [status, setStatus] = useState<FreeCADStatus | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const poll = () =>
+      apiFetch<FreeCADStatus>("/freecad/status")
+        .then((s) => alive && setStatus(s))
+        .catch((e) => alive && setStatus({ connected: false, error: String(e.message ?? e) }));
+    poll();
+    const id = setInterval(poll, intervalMs);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [intervalMs]);
+  return status;
 }

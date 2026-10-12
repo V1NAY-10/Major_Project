@@ -30,3 +30,58 @@ export const getApiUrl = (): string => {
  * Do NOT use this in Server Components or at the top level of shared modules.
  */
 export const API_URL = getApiUrl();
+
+export class ApiError extends Error {
+  constructor(message: string, public status: number) {
+    super(message);
+  }
+}
+
+type TokenGetter = () => Promise<string | null>;
+let tokenGetter: TokenGetter | null = null;
+
+/** Registered once by the signed-in app (Clerk's getToken) so every request carries the session token. */
+export function setAuthTokenGetter(getter: TokenGetter | null) {
+  tokenGetter = getter;
+}
+
+/** fetch against the backend with the Clerk session token attached. */
+export async function authFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  const token = tokenGetter ? await tokenGetter() : null;
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  try {
+    return await fetch(`${API_URL}${path}`, { ...init, headers });
+  } catch {
+    throw new ApiError("Cannot reach the backend. Is it running on port 8000?", 0);
+  }
+}
+
+async function errorFrom(res: Response): Promise<ApiError> {
+  const data = await res.json().catch(() => ({}));
+  const detail = typeof data?.detail === "string" ? data.detail : `Request failed (${res.status})`;
+  return new ApiError(detail, res.status);
+}
+
+/** Authenticated fetch + JSON with the backend's `{detail}` error shape turned into an ApiError. */
+export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await authFetch(path, init);
+  if (!res.ok) throw await errorFrom(res);
+  return (await res.json().catch(() => ({}))) as T;
+}
+
+/** Authenticated binary download (meshes, exports). */
+export async function apiBlob(path: string): Promise<{ blob: Blob; filename: string | null }> {
+  const res = await authFetch(path);
+  if (!res.ok) throw await errorFrom(res);
+  const disposition = res.headers.get("Content-Disposition") ?? "";
+  const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+  return { blob: await res.blob(), filename: match ? decodeURIComponent(match[1]) : null };
+}
+
+export const postJson = <T>(path: string, body?: unknown) =>
+  apiFetch<T>(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
