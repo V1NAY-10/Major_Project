@@ -63,6 +63,14 @@ TOOLS = [
             "object": {"type": "string", "description": "Only features of this object name"},
             "limit": {"type": "integer"},
         }),
+    _fn("list_dimensions", "List the model's driving dimensions (overall sizes, thicknesses, gaps/slot widths, "
+        "hole-to-edge distances) and hole patterns. Each dimension has an ID like 'P1-P2' or 'H3-P5' usable with "
+        "set_dimension.", {
+            "object": {"type": "string", "description": "Only dimensions of this object (name or label)"},
+            "feature": {"type": "string", "description": "Only dimensions involving this feature ID, e.g. H3"},
+            "type": {"type": "string", "enum": ["extent", "thickness", "gap", "edge_distance"]},
+            "limit": {"type": "integer"},
+        }),
     _fn("measure", "Measure between two references (feature IDs, object names or [x,y,z] points). Returns "
         "minimum distance, and for parallel holes/planes the axis-to-axis / plane-to-plane distance.", {
             "a": {"description": "Feature ID, object name or [x,y,z]"},
@@ -78,8 +86,10 @@ TOOLS = [
         "to": {**VEC3, "description": "Absolute point the hole axis should pass through"}}, ["hole"]),
     _fn("add_holes", "Drill one or more holes into a planar face, perpendicular to it.", {
         "face": FEATURE_ID, "diameter": {"type": "number"},
-        "positions": {"type": "array", "items": VEC3,
-                      "description": "Absolute [x,y,z] points on the face; omit for the face centre"},
+        "positions": {"type": "array",
+                      "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 3},
+                      "description": "Absolute [x,y,z] points on the face (copy all three numbers the user "
+                                     "gives); omit for the face centre"},
         "depth": {"type": "number", "description": "Blind depth in mm; omit for a through hole"}},
         ["face", "diameter"]),
     _fn("remove_features", "Remove features (fill holes, delete bosses, remove fillets/rounds) by defeaturing.", {
@@ -90,6 +100,25 @@ TOOLS = [
         "'distance' (e.g. set overall length/width/thickness). 'face' moves; the reference stays.", {
             "face": FEATURE_ID, "reference_face": FEATURE_ID, "distance": {"type": "number"}},
         ["face", "reference_face", "distance"]),
+    _fn("set_dimension", "PREFERRED way to change a size, thickness, gap or hole position. Sets the dimension "
+        "between two features to an exact value. 'dimension' is a dimension ID from the model data (e.g. 'P5-P6' "
+        "overall X size, 'P1-P2' thickness, 'H3-P5' hole axis to a face) or any two parallel face IDs, a hole + a "
+        "face parallel to its axis, or two parallel holes. Faces move along their normals; holes move (with their "
+        "counterbore). anchor: 'start' = first ID stays fixed (default), 'end' = second ID stays fixed, "
+        "'symmetric' = both move half (keeps the part centred).", {
+            "dimension": {"type": "string", "description": "e.g. 'P5-P6' or 'H3-P5'"},
+            "value": {"type": "number", "description": "New absolute value in mm"},
+            "anchor": {"type": "string", "enum": ["start", "end", "symmetric"]}},
+        ["dimension", "value"]),
+    _fn("edit_hole_pattern", "Change a hole pattern (PAT# from model data): circular → pcd (bolt-circle "
+        "diameter), count, start_angle (deg); linear → spacing, count; grid → spacing_u, spacing_v. Holes keep "
+        "their size, depth, countersinks and counterbores. anchor: 'center' (default, pattern stays centred) or "
+        "'first' (first hole stays, linear only).", {
+            "pattern": {"type": "string", "description": "Pattern ID, e.g. PAT1"},
+            "pcd": {"type": "number"}, "count": {"type": "integer"}, "start_angle": {"type": "number"},
+            "spacing": {"type": "number"}, "spacing_u": {"type": "number"}, "spacing_v": {"type": "number"},
+            "anchor": {"type": "string", "enum": ["center", "first"]}},
+        ["pattern"]),
     _fn("fillet_edges", "Round edges with a radius.", {
         "radius": {"type": "number"}, "edges": {"type": "array", "items": EDGE_SELECTOR}, "object": OBJECT},
         ["radius", "edges"]),
@@ -140,7 +169,7 @@ TOOLS = [
 
 EDIT_TOOLS = {
     "resize_hole", "move_hole", "add_holes", "remove_features", "push_pull_face", "set_face_distance",
-    "fillet_edges", "chamfer_edges", "add_primitive", "transform_object", "scale_object", "set_property",
+    "set_dimension", "edit_hole_pattern", "fillet_edges", "chamfer_edges", "add_primitive", "transform_object", "scale_object", "set_property",
     "set_sketch_constraint", "set_spreadsheet_cell", "delete_object", "run_freecad_python",
 }
 OP_NAME = {"run_freecad_python": "run_python"}
@@ -177,6 +206,9 @@ async def execute(meta, name, args):
             return {"ok": True, **res}, None
         if name == "list_objects":
             res = await cad.query(meta, "list_objects", **args)
+            return {"ok": True, **res}, None
+        if name == "list_dimensions":
+            res = await cad.query(meta, "dimensions", **args)
             return {"ok": True, **res}, None
         if name == "run_freecad_python" and not ALLOW_PYTHON:
             return {"ok": False, "error": "run_freecad_python is disabled on this server (AGENT_ALLOW_PYTHON=0)."}, None

@@ -1,9 +1,10 @@
 "use client";
-import { Plus, MessageSquare, Menu, X, Edit2, Check, Sun, Moon, Settings, LogOut } from "lucide-react";
-import { UserButton, useUser, useClerk } from "@clerk/nextjs";
-import { useState, useEffect, useRef } from "react";
+import { Plus, MessageSquare, Menu, X, Edit2, Check, Sun, Moon, Settings } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, useSyncExternalStore } from "react";
 import { useTheme } from "next-themes";
 import { apiFetch } from "@/lib/api";
+
+const subscribeNoop = () => () => {};
 
 interface Session {
     id: string;
@@ -22,23 +23,29 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
     const [editingId, setEditingId] = useState<string | null>(null);
     const [editValue, setEditValue] = useState("");
     const [showProfileMenu, setShowProfileMenu] = useState(false);
-    const { theme, setTheme, resolvedTheme } = useTheme();
-    const { user } = useUser();
-    const { signOut } = useClerk();
-    const [mounted, setMounted] = useState(false);
+    const { setTheme, resolvedTheme } = useTheme();
+    // false during SSR/hydration, true afterwards (the theme is only known on the client)
+    const mounted = useSyncExternalStore(subscribeNoop, () => true, () => false);
 
     const profileMenuRef = useRef<HTMLDivElement>(null);
 
-    useEffect(() => {
-        setMounted(true);
+    const fetchSessions = useCallback(async () => {
+        try {
+            const sessionsData = await apiFetch<Session[]>("/sessions");
+            setSessions(Array.isArray(sessionsData) ? sessionsData : []);
+        } catch (err) {
+            // Only log real errors (not AbortError from component unmount)
+            if ((err as Error)?.name !== "AbortError") {
+                console.error("Failed to fetch sessions:", err);
+            }
+        }
     }, []);
 
     useEffect(() => {
-        // Only fetch once the component has mounted (client-side) and we have a userId
-        if (mounted && user?.id) {
-            fetchSessions();
-        }
-    }, [currentSessionId, user?.id, mounted]);
+        // Refetch when the current chat changes (e.g. a new session was created)
+        // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch; state is set after the request resolves
+        fetchSessions();
+    }, [currentSessionId, fetchSessions]);
 
     useEffect(() => {
         const handleClickOutside = (event: MouseEvent) => {
@@ -50,17 +57,6 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
         return () => document.removeEventListener("mousedown", handleClickOutside);
     }, []);
 
-    const fetchSessions = async () => {
-        try {
-            const sessionsData = await apiFetch<Session[]>("/sessions");
-            setSessions(Array.isArray(sessionsData) ? sessionsData : []);
-        } catch (err) {
-            // Only log real errors (not AbortError from component unmount)
-            if ((err as Error)?.name !== "AbortError") {
-                console.error("Failed to fetch sessions:", err);
-            }
-        }
-    };
 
     const handleStartRename = (e: React.MouseEvent, session: Session) => {
         e.stopPropagation();
@@ -177,14 +173,6 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
                                     <Settings size={14} />
                                     Settings
                                 </button>
-                                <div className="h-px bg-border my-1" />
-                                <button 
-                                    onClick={() => signOut({ redirectUrl: "/sign-in" })}
-                                    className="flex items-center gap-3 w-full p-3 hover:bg-red-500/10 rounded-xl text-xs text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 transition-all font-medium"
-                                >
-                                    <LogOut size={14} />
-                                    Log out
-                                </button>
                             </div>
                         )}
 
@@ -192,15 +180,9 @@ export default function Sidebar({ currentSessionId, onSelectSession, onNewChat }
                             className="flex items-center justify-between w-full p-2 hover:bg-foreground/5 rounded-2xl transition-all"
                         >
                             <div className="flex items-center gap-3">
-                                <UserButton appearance={{
-                                    elements: {
-                                        userButtonAvatarBox: 'w-8 h-8 rounded-full shadow-lg border border-border',
-                                    }
-                                }} />
+                                <div className="w-8 h-8 rounded-full bg-purple-600 text-white text-xs font-bold flex items-center justify-center">A</div>
                                 <div className="flex flex-col text-left">
-                                    <span className="text-xs font-semibold text-foreground truncate max-w-[120px]">
-                                        {user?.fullName || user?.primaryEmailAddress?.emailAddress || "User"}
-                                    </span>
+                                    <span className="text-xs font-semibold text-foreground truncate max-w-[120px]">AetherCAD</span>
                                     <span className="text-[10px] text-foreground/50 font-medium uppercase tracking-wider">Major Project</span>
                                 </div>
                             </div>

@@ -1,31 +1,28 @@
 "use client";
-import { useState, useEffect, useRef, useCallback } from "react";
-import { Zap, FileBox, X, ChevronRight, ChevronLeft, Download, Undo2, Redo2, Loader2 } from "lucide-react";
-import { useAuth, useUser } from "@clerk/nextjs";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { Zap, FileBox, X, ChevronRight, ChevronLeft, Download, Undo2, Redo2, Loader2, MonitorUp } from "lucide-react";
 
 import Sidebar from "@/components/ui/Sidebar";
 import ChatMessage from "@/components/chat/ChatMessage";
 import ChatInput, { CAD_ACCEPT } from "@/components/chat/ChatInput";
 import CADViewer from "@/components/cad/CADViewer";
 import ModelPanel from "@/components/cad/ModelPanel";
+import SelectionInspector, { entityIndex, summary } from "@/components/cad/SelectionInspector";
 
-import { apiFetch, postJson, setAuthTokenGetter } from "@/lib/api";
+import { apiFetch, postJson } from "@/lib/api";
 import { useCADSession, useFreeCADStatus } from "@/hooks/useCADSession";
-import { Message } from "@/types/chat";
-import { CadState } from "@/types/cad";
+import { ChatResponse, Message } from "@/types/chat";
+import { SelectMode } from "@/types/cad";
 
 const SUGGESTIONS = [
-  "Summarise this part: size, holes and main faces",
-  "List all holes with diameters and positions",
-  "Make the overall length 10 mm longer",
+  "Summarise this part: size, holes, patterns and key dimensions",
+  "Make the part 120 mm long",
+  "Change the bolt circle to PCD 80",
+  "Move the hole 5 mm further from the left edge",
   "Add a 1 mm chamfer to all hole entries",
 ];
 
 export default function Home() {
-  const { user } = useUser();
-  const { getToken } = useAuth();
-  // Every backend request carries the Clerk session token; the backend derives the user from it.
-  setAuthTokenGetter(getToken);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -33,9 +30,29 @@ export default function Home() {
   const [error, setError] = useState("");
   const [showCadPanel, setShowCadPanel] = useState(true);
   const [dragging, setDragging] = useState(false);
+  // Components selected in the viewer / panel; the next message applies to them.
+  const [selection, setSelection] = useState<string[]>([]);
+  const [selectMode, setSelectMode] = useState<SelectMode>("feature");
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const { cad, setCad, isUploading, busy, resetCadState, loadSessionCad, upload, undo, redo, modelPath, download } =
-    useCADSession();
+  const {
+    cad,
+    setCad,
+    isUploading,
+    busy,
+    resetCadState,
+    loadSessionCad,
+    upload,
+    undo,
+    redo,
+    modelPath,
+    download,
+    highlights,
+    highlight,
+    showInFreeCAD,
+    pick,
+    freecadSelection,
+  } = useCADSession();
   const freecad = useFreeCADStatus();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // Session created by this page during upload/send: its data is already in local state, don't refetch.
@@ -55,18 +72,16 @@ export default function Home() {
 
   useEffect(() => {
     if (currentSessionId && currentSessionId === createdHere.current) return;
-    if (currentSessionId && user?.id) {
+    // (clearing for "no session" happens in handleNewChat)
+    if (currentSessionId) {
       loadSessionCad(currentSessionId);
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- async fetch; state is set after the request resolves
       fetchMessages(currentSessionId);
-    } else if (!currentSessionId) {
-      setMessages([]);
-      resetCadState();
     }
-  }, [currentSessionId, user?.id, loadSessionCad, fetchMessages, resetCadState]);
+  }, [currentSessionId, loadSessionCad, fetchMessages]);
 
   const ensureSession = async (title: string) => {
     if (currentSessionId) return currentSessionId;
-    if (!user?.id) throw new Error("Please sign in first");
     const s = await postJson<{ id: string }>("/sessions", { title: title.slice(0, 40) });
     createdHere.current = s.id;
     setCurrentSessionId(s.id);
@@ -76,6 +91,7 @@ export default function Home() {
   const selectSession = (id: string) => {
     createdHere.current = null;
     setError("");
+    setSelection([]);
     setCurrentSessionId(id);
   };
 
@@ -85,6 +101,7 @@ export default function Home() {
     setMessages([]);
     setPrompt("");
     setError("");
+    setSelection([]);
     resetCadState();
   };
 
@@ -93,10 +110,11 @@ export default function Home() {
     try {
       const sessionId = await ensureSession(`CAD: ${file.name}`);
       await upload(file, sessionId);
+      setSelection([]);
       await fetchMessages(sessionId);
       setShowCadPanel(true);
-    } catch (err: any) {
-      setError(err.message || "Failed to upload CAD file");
+    } catch (err) {
+      setError((err as Error).message || "Failed to upload CAD file");
     }
   };
 
@@ -107,18 +125,23 @@ export default function Home() {
     setError("");
     setLoading(true);
     setPrompt("");
-    setMessages((prev) => [...prev, { role: "user", content: text }]);
+    const target = cad ? selection : [];
+    setMessages((prev) => [...prev, { role: "user", content: text, selection: target }]);
     let sessionId: string | null = currentSessionId;
     try {
       sessionId = await ensureSession(text);
-      const res = await postJson<{ message: Message; state: CadState | null }>("/chat", {
+      const res = await postJson<ChatResponse>("/chat", {
         session_id: sessionId,
         message: text,
+        selection: target,
       });
       setMessages((prev) => [...prev, res.message]);
       if (res.state) setCad(res.state);
-    } catch (err: any) {
-      setError(err.message || "Something went wrong");
+      // Keep showing the selection (IDs are stable across edits); otherwise show what the reply touched.
+      if (target.length) highlight(target);
+      else if (res.highlight?.length) highlight(res.highlight);
+    } catch (err) {
+      setError((err as Error).message || "Something went wrong");
       setPrompt(text);
       // The backend stores the user message and the error; resync so the transcript matches it.
       if (sessionId) await fetchMessages(sessionId);
@@ -133,13 +156,65 @@ export default function Home() {
     setError("");
     try {
       await (dir === "undo" ? undo : redo)(currentSessionId);
+      if (selection.length) highlight(selection);
       await fetchMessages(currentSessionId);
-    } catch (err: any) {
-      setError(err.message);
+    } catch (err) {
+      setError((err as Error).message);
     }
   };
 
-  const insertRef = (ref: string) => setPrompt((p) => (p && !p.endsWith(" ") ? `${p} ${ref} ` : `${p}${ref} `));
+  const insertRef = (ref: string) => {
+    const r = ref.trimEnd();
+    setPrompt((p) => (p && !p.endsWith(" ") ? `${p} ${r} ` : `${p}${r} `));
+  };
+
+  const focusInput = () => setTimeout(() => textareaRef.current?.focus(), 0);
+
+  /** Select components (replace, or toggle with Shift/Ctrl) and highlight them in the viewer and FreeCAD. */
+  const select = (ids: string[], additive = false) => {
+    let next = ids;
+    if (additive) {
+      next = [...selection];
+      for (const id of ids) next = next.includes(id) ? next.filter((x) => x !== id) : [...next, id];
+    }
+    setSelection(next);
+    highlight(next);
+  };
+
+  const onViewerPick = async (point: [number, number, number], additive: boolean) => {
+    try {
+      const res = await pick(point, selectMode);
+      if (res?.id) select([res.id], additive);
+      else if (!additive) select([]);
+    } catch (err) {
+      setError((err as Error).message || "Could not pick that point");
+    }
+  };
+
+  const fromFreeCAD = async () => {
+    try {
+      const ids = await freecadSelection();
+      if (ids.length) select(ids);
+      else setError("Nothing is selected in the FreeCAD window. Click a face or part there first.");
+    } catch (err) {
+      setError((err as Error).message || "FreeCAD is not reachable");
+    }
+  };
+
+  /** Dimension click: select it and start the message "P1-P2 = " so the user just types the value. */
+  const onDimension = (id: string) => {
+    select([id]);
+    setPrompt(`${id} = `);
+    focusInput();
+  };
+
+  const onAction = (text: string) => {
+    setPrompt(text);
+    focusInput();
+  };
+
+  const index = useMemo(() => (cad ? entityIndex(cad.info) : new Map()), [cad]);
+  const selectionChips = selection.map((id) => ({ id, text: summary(index.get(id)) }));
 
   return (
     <div className="flex h-screen bg-background text-foreground overflow-hidden font-sans">
@@ -263,6 +338,9 @@ export default function Home() {
             onSubmit={handleSend}
             hasCad={!!cad}
             suggestions={messages.length <= 1 ? SUGGESTIONS : []}
+            selection={selectionChips}
+            onRemoveSelection={(id) => select([id], true)}
+            textareaRef={textareaRef}
           />
         </div>
 
@@ -279,6 +357,14 @@ export default function Home() {
                 <h2 className="text-[10px] font-black uppercase tracking-[0.4em] text-foreground/50">3D Workspace</h2>
               </div>
               <div className="flex items-center gap-1">
+                <button
+                  onClick={() => showInFreeCAD().catch((err) => setError(err.message || "FreeCAD is not reachable"))}
+                  disabled={!freecad?.connected}
+                  className="p-2 hover:bg-foreground/10 rounded-xl text-foreground/50 hover:text-foreground disabled:opacity-25"
+                  title="Show this model in FreeCAD"
+                >
+                  <MonitorUp size={16} />
+                </button>
                 <div className="relative group/dl">
                   <button className="p-2 hover:bg-foreground/10 rounded-xl text-foreground/50 hover:text-foreground" title="Download">
                     <Download size={16} />
@@ -311,9 +397,55 @@ export default function Home() {
 
             <div className="flex-1 overflow-y-auto p-5 space-y-5 custom-scrollbar">
               <div className="relative h-[340px] bg-black/5 dark:bg-black/40 rounded-[1.5rem] overflow-hidden border border-border">
-                <CADViewer modelPath={modelPath} fitKey={`${cad.session_id}:${cad.filename}`} />
+                <CADViewer
+                  modelPath={modelPath}
+                  fitKey={`${cad.session_id}:${cad.filename}`}
+                  highlights={highlights}
+                  onPick={onViewerPick}
+                  toolbar={
+                    <>
+                      <div className="flex rounded-lg bg-background/80 backdrop-blur border border-border p-0.5 text-[10px] font-semibold">
+                        {(["feature", "part"] as const).map((m) => (
+                          <button
+                            key={m}
+                            onClick={() => setSelectMode(m)}
+                            title={m === "feature" ? "Clicks select a feature (hole, face, fillet…)" : "Clicks select a whole part"}
+                            className={`px-2 py-0.5 rounded-md ${
+                              selectMode === m ? "bg-purple-600 text-white" : "text-foreground/60 hover:text-foreground"
+                            }`}
+                          >
+                            {m === "feature" ? "Feature" : "Part"}
+                          </button>
+                        ))}
+                      </div>
+                      <button
+                        onClick={fromFreeCAD}
+                        disabled={!freecad?.gui}
+                        title="Select here what is selected in the FreeCAD window"
+                        className="rounded-lg bg-background/80 backdrop-blur border border-border px-2 py-1 text-[10px] font-semibold text-foreground/60 hover:text-foreground disabled:opacity-30"
+                      >
+                        From FreeCAD
+                      </button>
+                    </>
+                  }
+                />
               </div>
-              <ModelPanel cad={cad} onPick={insertRef} />
+              <SelectionInspector
+                cad={cad}
+                selection={selection}
+                onSelect={(id, additive) => select([id], additive)}
+                onRemove={(id) => select([id], true)}
+                onClear={() => select([])}
+                onAction={onAction}
+                onDimension={onDimension}
+              />
+              <ModelPanel
+                cad={cad}
+                selection={selection}
+                onSelect={(id, additive) => select([id], additive)}
+                onDimension={onDimension}
+                onInsert={insertRef}
+              />
             </div>
           </div>
         )}

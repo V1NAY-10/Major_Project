@@ -14,9 +14,6 @@ motor
 dnspython
 pymongo
 
-# ── Auth (verifies Clerk session tokens) ─────────────────────────────────────
-pyjwt[crypto]
-
 # ── File Upload ───────────────────────────────────────────────────────────────
 python-multipart
 

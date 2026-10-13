@@ -24,6 +24,8 @@ import traceback
 import FreeCAD as App  # type: ignore
 import Part  # type: ignore
 
+from freecad_bridge import analysis
+
 GUI = bool(getattr(App, "GuiUp", 0))
 if GUI:
     import FreeCADGui as Gui  # type: ignore
@@ -99,6 +101,8 @@ def _norm_path(p):
 def _save(doc):
     """Save and drop the timestamped *.FCBak backups FreeCAD writes next to the file."""
     doc.save()
+    if GUI:
+        _remember(doc)  # baseline for detecting manual edits made in the FreeCAD window
     try:
         folder, base = os.path.split(doc.FileName)
         stem = os.path.splitext(base)[0]
@@ -164,6 +168,8 @@ def _get_doc(session_id, work_path):
         if not work_path or not os.path.exists(work_path):
             raise EngineError("The session's FreeCAD document is not open and no saved copy exists. Re-upload the model.")
         doc = App.openDocument(work_path)
+        if GUI:
+            _remember(doc)
     _DOCS[session_id] = doc.Name
     try:
         doc.UndoMode = 1
@@ -247,6 +253,8 @@ def _gshape(obj):
 def _get_obj(doc, ref, need_solid=False):
     if ref:
         o = doc.getObject(ref)
+        if o is None and str(ref).strip().upper() in _PARTS.get(doc.Name, {}):
+            o = doc.getObject(_PARTS[doc.Name][str(ref).strip().upper()])
         if o is None:
             matches = [x for x in doc.Objects if x.Label.lower() == str(ref).lower()]
             o = matches[0] if matches else None
@@ -266,7 +274,9 @@ def _get_obj(doc, ref, need_solid=False):
 # Feature analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
-KIND_PREFIX = {"hole": "H", "boss": "C", "round": "R", "plane": "P", "cone": "K", "sphere": "S"}
+# "face" = a free-form face no rule recognises; it still gets an ID so every face of a part is addressable.
+KIND_PREFIX = {"hole": "H", "boss": "C", "round": "R", "plane": "P", "cone": "K", "sphere": "S", "face": "F"}
+PART_PREFIX = "B"  # whole solid objects (bodies / parts): B1, B2…
 
 
 def _tolerances(shape):
@@ -318,6 +328,10 @@ def _plane_label(n, c, bb, tol):
     return "inclined face"
 
 
+def _point_normal(face, u, v):
+    return face.valueAt(u, v), face.normalAt(u, v)
+
+
 def _features_of_shape(objname, shape):
     """Detect features on one object's global shape. Returns a list of feature dicts.
 
@@ -330,20 +344,21 @@ def _features_of_shape(objname, shape):
     cyl_groups = []   # [{concave, a, base, r, faces:[(i, t0, t1, span)]}]
     planes, cones = [], []
 
+    unknown = 0
     for i, f in enumerate(shape.Faces):
-        s = f.Surface
         try:
             u0, u1, v0, v1 = f.ParameterRange
             um, vm = (u0 + u1) / 2.0, (v0 + v1) / 2.0
         except Exception:
             continue
+        si = analysis.surface_info(f, tol)
+        kind = si["type"]
 
-        if isinstance(s, Part.Cylinder):
-            a = _canon_axis(s.Axis)
-            c = V(s.Center)
-            r = float(s.Radius)
-            p = f.valueAt(um, vm)
-            n = f.normalAt(um, vm)
+        if kind == "cylinder":
+            a = _canon_axis(si["axis"])
+            c = si["center"]
+            r = si["radius"]
+            p, n = _point_normal(f, um, vm)
             w = p - c
             radial = w - a * w.dot(a)
             concave = n.dot(radial) < 0
@@ -351,39 +366,48 @@ def _features_of_shape(objname, shape):
                 V(x, y, z).dot(a) for x in (f.BoundBox.XMin, f.BoundBox.XMax)
                 for y in (f.BoundBox.YMin, f.BoundBox.YMax) for z in (f.BoundBox.ZMin, f.BoundBox.ZMax)]
             base = _perp_base(c, a)
-            entry = (i, min(ts), max(ts), abs(u1 - u0))
+            entry = (i, min(ts), max(ts), analysis.angular_span(f, a, c, si))
             for g in cyl_groups:
-                if (g["concave"] == concave and abs(g["r"] - r) < tol and abs(g["a"].dot(a)) > 1 - 1e-7
-                        and (g["base"] - base).Length < tol):
+                if (g["concave"] == concave and abs(g["r"] - r) < tol * (10 if si.get("fitted") else 1)
+                        and abs(g["a"].dot(a)) > 1 - 1e-7
+                        and (g["base"] - base).Length < tol * (10 if si.get("fitted") else 1)):
                     g["faces"].append(entry)
                     break
             else:
                 cyl_groups.append({"concave": concave, "a": a, "base": base, "r": r, "faces": [entry]})
 
-        elif isinstance(s, Part.Plane):
-            n = f.normalAt(um, vm)
+        elif kind == "plane":
+            _, n = _point_normal(f, um, vm)
             c = f.CenterOfMass
             planes.append({"i": i, "n": n, "c": c, "area": f.Area, "d": n.dot(c), "bb": f.BoundBox})
 
-        elif isinstance(s, Part.Cone):
-            a = _canon_axis(s.Axis)
+        elif kind == "cone":
+            a = _canon_axis(si["axis"])
+            apex = si["apex"]
             ts = [vx.Point.dot(a) for vx in f.Vertexes]
-            cbase = _perp_base(V(s.Apex), a)
+            cbase = _perp_base(apex, a)
             radii = [(vx.Point - a * vx.Point.dot(a) - cbase).Length for vx in f.Vertexes]
-            cones.append({"i": i, "a": a, "base": cbase, "apex": V(s.Apex),
-                          "semi": abs(float(s.SemiAngle)), "t0": min(ts) if ts else 0.0,
+            cones.append({"i": i, "a": a, "base": cbase, "apex": apex,
+                          "semi": si["semi"], "t0": min(ts) if ts else 0.0,
                           "t1": max(ts) if ts else 0.0, "area": f.Area, "rmax": max(radii) if radii else 0.0})
 
-        elif isinstance(s, Part.Sphere):
-            feats.append({"kind": "sphere", "_obj": objname, "_faces": [i], "radius": _r(s.Radius),
-                          "center": _vl(V(s.Center)), "_c": V(s.Center)})
+        elif kind == "sphere":
+            feats.append({"kind": "sphere", "_obj": objname, "_faces": [i], "radius": _r(si["radius"]),
+                          "center": _vl(si["center"]), "_c": si["center"]})
 
-        elif isinstance(s, Part.Toroid):
-            a = _canon_axis(s.Axis)
-            feats.append({"kind": "round", "_obj": objname, "_faces": [i], "radius": _r(s.MinorRadius),
-                          "torus_major_radius": _r(s.MajorRadius), "axis": _vl(a), "center": _vl(V(s.Center)),
-                          "_a": a, "_base": _perp_base(V(s.Center), a), "_t": (V(s.Center).dot(a),) * 2,
-                          "_r": float(s.MinorRadius)})
+        elif kind == "torus":
+            a = _canon_axis(si["axis"])
+            c = si["center"]
+            feats.append({"kind": "round", "_obj": objname, "_faces": [i], "radius": _r(si["minor"]),
+                          "torus_major_radius": _r(si["major"]), "axis": _vl(a), "center": _vl(c),
+                          "_a": a, "_base": _perp_base(c, a), "_t": (c.dot(a),) * 2,
+                          "_r": float(si["minor"])})
+        else:
+            unknown += 1
+            c = f.CenterOfMass
+            feats.append({"kind": "face", "_obj": objname, "_faces": [i], "_c": c, "center": _vl(c),
+                          "area": _r(f.Area, 3), "surface": si["type"] or type(f.Surface).__name__,
+                          "position": _semantic_position(c, bb)})
 
     used_cones, used_planes = set(), set()
 
@@ -417,6 +441,7 @@ def _features_of_shape(objname, shape):
                 return cn
         return None
 
+    holes_here = []
     for g in cyl_groups:
         segs = sorted(g["faces"], key=lambda e: e[1])
         clusters = []
@@ -471,11 +496,18 @@ def _features_of_shape(objname, shape):
                         hole.setdefault("_cs", []).append(
                             {"i": cs["i"], "R": cs["rmax"], "semi": cs["semi"], "outer_t": outer_t,
                              "inward": -1.0 if outer_t >= t1 - tol else 1.0})
+                        # The hole starts at the top of its countersink, not where the cylinder wall begins.
+                        if abs(entry_t - t_end) < tol * 10:
+                            hole["entry"] = _vl(base + a * outer_t)
+                if hole.get("_cs"):
+                    ends = [t0, t1] + [cs["outer_t"] for cs in hole["_cs"]]
+                    hole["depth"] = _r(max(ends) - min(ends))
+                holes_here.append(hole)
                 feats.append(hole)
             else:
+                # A boss's end faces stay ordinary visible planes (unlike hole bottoms): its top face is a
+                # real face users refer to, and for a plain cylinder body they are the part's own faces.
                 caps = [idx for kind, idx in caps0 + caps1 if kind == "plane"]
-                for idx in caps:
-                    used_planes.add(idx)
                 # The free end has air beyond it on the axis; the base end runs into the body.
                 eps = max(tol * 20, 0.01)
                 free1 = not _inside_any(shape, base + a * (t1 + eps), tol)
@@ -487,6 +519,8 @@ def _features_of_shape(objname, shape):
                     "center": _vl(mid), "free_end": _vl(base + a * free_t), "base_end": _vl(base + a * base_t),
                     "both_ends_free": free0 and free1,
                     "position": _semantic_position(mid, bb), "_caps": caps, "_free_t": free_t, **common})
+
+    analysis.link_counterbores(holes_here, tol)
 
     for cn in cones:
         if cn["i"] in used_cones:
@@ -504,7 +538,7 @@ def _features_of_shape(objname, shape):
                       "label": _plane_label(n, c, bb, tol), "is_cap": pl["i"] in used_planes,
                       "bbox": {"min": _vl(V(pl["bb"].XMin, pl["bb"].YMin, pl["bb"].ZMin), 3),
                                "max": _vl(V(pl["bb"].XMax, pl["bb"].YMax, pl["bb"].ZMax), 3)}})
-    return feats
+    return feats, unknown
 
 
 def _descriptor(f):
@@ -513,6 +547,8 @@ def _descriptor(f):
         return {"k": k, "n": _vl(f["_n"], 7), "d": f["_d"], "c": _vl(f["_c"], 5)}
     if k == "sphere":
         return {"k": k, "c": _vl(f["_c"], 5), "r": f["radius"]}
+    if k == "face":
+        return {"k": k, "c": _vl(f["_c"], 5), "area": f["area"]}
     return {"k": k, "a": _vl(f["_a"], 8), "b": _vl(f["_base"], 5), "t": list(f["_t"]), "r": f["_r"]}
 
 
@@ -528,6 +564,11 @@ def _match_score(desc, f, tol):
     if k == "sphere":
         dist = (_v(desc["c"]) - f["_c"]).Length
         return dist if dist < tol * 10 else None
+    if k == "face":
+        dist = (_v(desc["c"]) - f["_c"]).Length
+        if dist > tol * 10 or abs(desc["area"] - f["area"]) > max(desc["area"] * 1e-3, tol):
+            return None
+        return dist
     a = _v(desc["a"])
     if abs(a.dot(f["_a"])) < 1 - 1e-6 or (_v(desc["b"]) - f["_base"]).Length > tol * 10:
         return None
@@ -568,23 +609,83 @@ def _assign_ids(feats, registry, tol):
     return {"items": new_items, "next": nxt}
 
 
+class _Analysis:
+    """Result of analysing a document. Unpacks as (objs, feats, fmap, registry)."""
+
+    def __init__(self, objs, feats, fmap, reg, shapes, tol, unknown):
+        self.objs, self.feats, self.fmap, self.reg = objs, feats, fmap, reg
+        self.shapes, self.tol, self.unknown = shapes, tol, unknown
+        self.patterns = analysis.hole_patterns(feats, tol)
+        self.parts = {}  # object name -> part ID
+        self._dims = None
+
+    def __iter__(self):
+        return iter((self.objs, self.feats, self.fmap, self.reg))
+
+    @property
+    def dims(self):
+        if self._dims is None:
+            self._dims = analysis.dimensions(self.shapes, self.feats, self.tol)
+        return self._dims
+
+    def pattern(self, pid):
+        for p in self.patterns:
+            if p["id"].upper() == str(pid).strip().upper():
+                return p
+        raise EngineError(f"Unknown pattern '{pid}'. Patterns: {', '.join(p['id'] for p in self.patterns) or 'none'}")
+
+
+def _assign_part_ids(objs, registry, reg):
+    """Stable part IDs (B1, B2…) keyed by the FreeCAD object name, which never changes inside a document.
+    IDs of deleted objects are not reused."""
+    old = dict((registry or {}).get("parts", {}))
+    nxt = int(reg["next"].get(PART_PREFIX, 1))
+    used = set(old.values())
+    parts = {}
+    for o in objs:
+        pid = old.get(o.Name)
+        if pid is None:
+            while f"{PART_PREFIX}{nxt}" in used:
+                nxt += 1
+            pid = f"{PART_PREFIX}{nxt}"
+            used.add(pid)
+        parts[o.Name] = pid
+    reg["parts"] = {**old, **parts}
+    reg["next"][PART_PREFIX] = nxt
+    return parts
+
+
+# doc.Name -> {part ID: object name}, from the last analysis (lets ops accept "B2" as an object reference)
+_PARTS = {}
+
+
 def _analyze(doc, registry):
     objs = _solid_objects(doc)
-    feats = []
+    feats, shapes, unknown = [], {}, {}
     tol = 1e-3
     for o in objs:
         shape = _gshape(o)
+        shapes[o.Name] = shape
         _, t = _tolerances(shape)
         tol = max(tol, t)
-        feats.extend(_features_of_shape(o.Name, shape))
+        found, unknown[o.Name] = _features_of_shape(o.Name, shape)
+        feats.extend(found)
     reg = _assign_ids(feats, registry, tol)
+    parts = _assign_part_ids(objs, registry, reg)
+    _PARTS[doc.Name] = {pid: name for name, pid in parts.items()}
+    for f in feats:
+        f["_part"] = parts[f["_obj"]]
+    analysis.finish_links(feats)
     fmap = {f["id"]: f for f in feats}
-    return objs, feats, fmap, reg
+    an = _Analysis(objs, feats, fmap, reg, shapes, tol, unknown)
+    an.parts = parts
+    return an
 
 
 def _public(f):
     out = {k: v for k, v in f.items() if not k.startswith("_")}
     out["object"] = f["_obj"]
+    out["part"] = f["_part"]
     return out
 
 
@@ -662,22 +763,27 @@ def _bbox_dict(bb):
             "size": [_r(bb.XLength, 3), _r(bb.YLength, 3), _r(bb.ZLength, 3)]}
 
 
-def _model_info(doc, objs, feats):
+def _model_info(doc, an, with_features=True):
+    objs = an.objs
+    feats = an.feats if with_features else []
     gbb = None
     objects = []
     for o in objs:
-        s = _gshape(o)
+        s = an.shapes.get(o.Name) or _gshape(o)
         bb = s.BoundBox
         gbb = bb if gbb is None else gbb.united(bb)
         try:
             parent = o.getParentGeoFeatureGroup()
         except Exception:
             parent = None
-        objects.append({"name": o.Name, "label": o.Label, "type": o.TypeId, "volume": _r(s.Volume, 3),
+        objects.append({"id": an.parts.get(o.Name), "name": o.Name, "label": o.Label, "type": o.TypeId, "volume": _r(s.Volume, 3),
                         **({"parent": parent.Label} if parent is not None else {}),
                         "area": _r(s.Area, 3), "solids": len(s.Solids), "faces": len(s.Faces),
                         "edges": len(s.Edges), "bbox": _bbox_dict(bb),
-                        "center_of_mass": _vl(s.Solids[0].CenterOfMass if len(s.Solids) == 1 else bb.Center, 3)})
+                        "center_of_mass": _vl(s.Solids[0].CenterOfMass if len(s.Solids) == 1 else bb.Center, 3),
+                        **({"unrecognized_faces": an.unknown[o.Name]} if an.unknown.get(o.Name) else {})})
+    if not with_features:
+        return {"objects": objects, "bbox": _bbox_dict(gbb) if gbb else None}
     params, sketches, sheets = _parametric_info(doc)
     by_kind = {}
     for f in feats:
@@ -691,6 +797,8 @@ def _model_info(doc, objs, feats):
         "bbox": _bbox_dict(gbb) if gbb else None,
         "features": by_kind,
         "counts": {k: len(v) for k, v in by_kind.items()},
+        "patterns": an.patterns,
+        "dimensions": an.dims,
         "parametric": params,
         "sketches": sketches,
         "spreadsheets": sheets,
@@ -822,6 +930,284 @@ def _fill_hole(shape, hole):
     return filled
 
 
+def _fill_holes(shape, holes):
+    """Fill several holes at once (defeaturing; falls back to exact plugs)."""
+    if len(holes) == 1:
+        return _fill_hole(shape, holes[0])
+    face_ids, expected = set(), 0.0
+    for h in holes:
+        face_ids.update(h["_faces"] + h.get("_caps", []) + [cs["i"] for cs in h.get("_cs", [])])
+        expected += math.pi * h["_r"] ** 2 * (h["_t"][1] - h["_t"][0])
+    try:
+        filled = shape.defeaturing([shape.Faces[i] for i in sorted(face_ids)])
+        if filled.isValid() and filled.Volume > shape.Volume + 0.5 * expected:
+            return filled
+    except Exception:
+        pass
+    filled = shape
+    for h in sorted(holes, key=lambda h: -h["_r"]):  # counterbores before the holes inside them
+        plug = _hole_tool(h["_a"], h["_base"], h["_t"][0], h["_t"][1], h["_r"], False, False, 0.0, _tip_semi(shape, h))
+        for cs in h.get("_cs", []):
+            hh = (cs["R"] - h["_r"]) / math.tan(cs["semi"])
+            plug = plug.fuse(Part.makeCone(cs["R"], h["_r"], hh, h["_base"] + h["_a"] * cs["outer_t"], h["_a"] * cs["inward"]))
+        filled = filled.fuse(plug)
+    if not filled.isValid():
+        raise EngineError("Could not fill " + ", ".join(h["id"] for h in holes) + " before re-cutting them")
+    return filled
+
+
+def _hole_cutter(shape, h, base, r, diag):
+    """Cutting solid that recreates hole h (tip, countersinks) with axis through `base` and radius r."""
+    open0, open1 = h["_open"]
+    tool = _hole_tool(h["_a"], base, h["_t"][0], h["_t"][1], r, open0, open1, diag, _tip_semi(shape, h))
+    for cone in _countersink_tools(h, base, r, max(diag * 0.02, 1.0)):
+        tool = tool.fuse(cone)
+    return tool
+
+
+def _with_partner(h):
+    """A hole plus its counterbore (or the hole a counterbore belongs to): they move together."""
+    partner = h.get("_cb") or h.get("_cb_inner")
+    return [h, partner] if partner else [h]
+
+
+def _recut_holes(ctx, specs, note):
+    """Fill holes and cut them again at new positions / sizes in one edit.
+
+    specs: [(hole, delta_vector_or_None, new_radius_or_None)]. Moving a hole moves its counterbore too.
+    """
+    items, seen = [], set()
+    for h, delta, new_r in specs:
+        group = _with_partner(h) if delta is not None else [h]
+        for g in group:
+            if g["id"] not in seen:
+                seen.add(g["id"])
+                items.append((g, delta, new_r if g is h else None))
+    by_obj = {}
+    for it in items:
+        by_obj.setdefault(it[0]["_obj"], []).append(it)
+    for objname, its in by_obj.items():
+        obj = ctx.doc.getObject(objname)
+        shape = _gshape(obj)
+        diag, _ = _tolerances(shape)
+        result = _fill_holes(shape, [g for g, _, _ in its])
+        for g, delta, new_r in sorted(its, key=lambda it: -(it[2] or it[0]["_r"])):
+            base = g["_base"] + (delta if delta is not None else V())
+            result = result.cut(_hole_cutter(shape, g, base, new_r or g["_r"], diag))
+        _set_shape(ctx.doc, obj, result, note)
+    for g, delta, new_r in items:
+        patch = {}
+        if delta is not None:
+            patch["b"] = _vl(g["_base"] + delta, 5)
+        if new_r is not None:
+            patch["r"] = new_r
+        if patch:
+            ctx.registry_updates[g["id"]] = patch
+    return [g["id"] for g, _, _ in items]
+
+
+def _push_profile(shape, face, n, d):
+    """Profile to extrude when moving planar `face` (outward normal n) by d.
+
+    Pushing out (d > 0) uses the face itself. Pulling in (d < 0) must also remove material inside
+    the face's inner outlines that are air on the outside (e.g. the rim between a countersink and
+    its hole), so it uses the outer boundary minus only those inner outlines that have material
+    on the outside of the face (bosses standing on it), which must be kept.
+    """
+    if d > 0 or len(face.Wires) < 2:
+        return face
+    _, tol = _tolerances(shape)
+    eps = max(tol * 20, 0.01)
+    try:
+        profile = Part.Face(face.OuterWire)
+        keep = []
+        for w in face.Wires:
+            if w.isSame(face.OuterWire):
+                continue
+            wf = Part.Face(w)
+            if _inside_any(shape, wf.CenterOfMass + n * eps, tol):
+                keep.append(wf)
+        if keep:
+            profile = profile.cut(Part.makeCompound(keep))
+            profile = profile.Faces[0] if len(profile.Faces) == 1 else profile
+        return profile
+    except Exception:
+        return face
+
+
+def _opening_centers(face):
+    out = []
+    for w in face.Wires:
+        if w.isSame(face.OuterWire):
+            continue
+        try:
+            out.append(Part.Face(w).CenterOfMass)
+        except Exception:
+            pass
+    return out
+
+
+def _holes_opening_on(ctx, shape, moves, tol):
+    """Holes that open on the moved faces, with the axial shift of each end: {hole id: (hole, [s0, s1])}.
+
+    A blind hole (or counterbore, or a hole inside a counterbore that moves) keeps its depth below
+    the face, so both of its ends shift; a through hole only stretches at the moved face.
+    """
+    holes = [f for f in ctx.an.feats if f["kind"] == "hole" and f["_obj"] == moves[0][0]["_obj"]]
+    shifts = {}
+
+    def add(h, end, s):
+        entry = shifts.setdefault(h["id"], (h, [0.0, 0.0]))
+        ends = (0, 1) if not h["through"] else (end,)
+        for e in ends:
+            entry[1][e] = s if abs(s) > abs(entry[1][e]) else entry[1][e]
+
+    for p, d in moves:
+        n = p["_n"]
+        centers = _opening_centers(shape.Faces[p["_faces"][0]])
+        for h in holes:
+            a = h["_a"]
+            if abs(a.dot(n)) < 1 - 1e-6:
+                continue
+            on_axis = any((c - h["_base"] - a * (c - h["_base"]).dot(a)).Length < tol * 10 for c in centers)
+            if not on_axis:
+                continue
+            for end, t in enumerate(h["_t"]):
+                t_open = t
+                for cs in h.get("_cs", []):
+                    if abs(cs["outer_t"] - t) <= abs(cs["outer_t"] - h["_t"][1 - end]):
+                        t_open = cs["outer_t"]
+                if abs((h["_base"] + a * t_open - p["_c"]).dot(n)) < tol * 10 and h["_open"][end]:
+                    add(h, end, d * n.dot(a))
+    # A hole inside a counterbore that moves: its end at the counterbore floor moves with it.
+    for hid, (h, s) in list(shifts.items()):
+        inner = h.get("_cb_inner")
+        if inner is None:
+            continue
+        cap_end = 0 if not h["_open"][0] else 1
+        cap_t = h["_t"][cap_end]
+        end = min((0, 1), key=lambda e: abs(inner["_t"][e] - cap_t))
+        add(inner, end, s[cap_end])
+    return shifts
+
+
+def _shifted_hole(h, s):
+    """Copy of hole h with its axial ends (and countersinks at those ends) shifted by s = [s0, s1]."""
+    t0, t1 = h["_t"]
+    g = dict(h)
+    g["_t"] = (t0 + s[0], t1 + s[1])
+    cs_new = []
+    for cs in h.get("_cs", []):
+        end = 0 if abs(cs["outer_t"] - t0) < abs(cs["outer_t"] - t1) else 1
+        cs_new.append(dict(cs, outer_t=cs["outer_t"] + s[end]))
+    if cs_new:
+        g["_cs"] = cs_new
+    return g
+
+
+def _find_face_like(shape, face, n, tol):
+    """The face of `shape` on the same plane as `face` that contains an interior point of it."""
+    pts, tris = face.tessellate(max(face.BoundBox.DiagonalLength / 200.0, 0.01))
+    probes = [(pts[a] + pts[b] + pts[c]) * (1.0 / 3) for a, b, c in tris[:20]]
+    for f in shape.Faces:
+        if f.Area < 1e-9:
+            continue
+        try:
+            u0, u1, v0, v1 = f.ParameterRange
+            if f.normalAt((u0 + u1) / 2, (v0 + v1) / 2).dot(n) < 1 - 1e-6:
+                continue
+            if f.findPlane(tol) is None:
+                continue
+        except Exception:
+            continue
+        if any(f.isInside(q, tol * 10, True) for q in probes):
+            return f
+    return None
+
+
+def _push_faces(ctx, moves, note):
+    """Move planar faces along their outward normals in one edit. moves: [(plane, distance)].
+
+    Holes, countersinks and counterbores that open on a moved face move with it (they are filled
+    and re-cut relative to the face's new position), so blind depths are kept and nothing is buried.
+    """
+    moves = [(p, d) for p, d in moves if abs(d) > 1e-9]
+    if not moves:
+        return
+    objs = {p["_obj"] for p, _ in moves}
+    if len(objs) > 1:
+        raise EngineError("These faces belong to different objects; change one object at a time")
+    obj = ctx.obj_of(moves[0][0])
+    shape = _gshape(obj)
+    diag, tol = _tolerances(shape)
+    shifts = _holes_opening_on(ctx, shape, moves, tol)
+
+    base = shape
+    faces = [(shape.Faces[p["_faces"][0]], p, d) for p, d in moves]
+    if shifts:
+        base = _fill_holes(shape, [h for h, _ in shifts.values()])
+        located = []
+        for face, p, d in faces:
+            f2 = _find_face_like(base, face, p["_n"], tol)
+            if f2 is None:
+                raise EngineError(f"Could not locate face {p['id']} after closing the holes on it")
+            located.append((f2, p, d))
+        faces = located
+
+    result = base
+    prisms = [(_push_profile(base, f, p["_n"], d).extrude(p["_n"] * d), d) for f, p, d in faces]
+    for prism, d in prisms:
+        if d > 0:
+            result = result.fuse(prism)
+    for prism, d in prisms:
+        if d < 0:
+            result = result.cut(prism)
+    for h, s in sorted(shifts.values(), key=lambda it: -it[0]["_r"]):  # counterbores before their holes
+        g = _shifted_hole(h, s)
+        result = result.cut(_hole_cutter(shape, g, h["_base"], h["_r"], diag))
+    _set_shape(ctx.doc, obj, result, note)
+    for p, d in moves:
+        ctx.registry_updates[p["id"]] = {"d": p["_d"] + d, "c": _vl(p["_c"] + p["_n"] * d, 5)}
+    for hid, (h, s) in shifts.items():
+        ctx.registry_updates[hid] = {"t": [h["_t"][0] + s[0], h["_t"][1] + s[1]]}
+
+
+AXIAL_KINDS = ("hole", "boss", "round", "cone")
+
+
+def _dim_refs(dimension):
+    if isinstance(dimension, (list, tuple)):
+        refs = [str(x).strip().upper() for x in dimension]
+    else:
+        refs = [x.strip().upper() for x in re.split(r"\s*(?:-|↔|,|\s)\s*", str(dimension).strip()) if x.strip()]
+    if len(refs) != 2:
+        raise EngineError(f"A dimension is two feature IDs like 'P1-P2' or 'H3-P5', got {dimension!r}")
+    return refs
+
+
+def _dim_value(fmap, ra, rb):
+    """Current value of the dimension between two features (None if not measurable)."""
+    a, b = fmap.get(ra), fmap.get(rb)
+    if a is None or b is None:
+        return None
+    if a["kind"] == "plane" and b["kind"] == "plane":
+        if abs(a["_n"].dot(b["_n"])) < 1 - 1e-6:
+            return None
+        return abs((b["_c"] - a["_c"]).dot(a["_n"]))
+    if a["kind"] == "plane" and b["kind"] in AXIAL_KINDS:
+        a, b = b, a
+    if a["kind"] in AXIAL_KINDS and b["kind"] == "plane":
+        if abs(a["_a"].dot(b["_n"])) > 1e-6:
+            return None
+        return abs((a["_base"] - b["_c"]).dot(b["_n"]))
+    if a["kind"] in AXIAL_KINDS and b["kind"] in AXIAL_KINDS:
+        if abs(a["_a"].dot(b["_a"])) < 1 - 1e-6:
+            return None
+        w = b["_base"] - a["_base"]
+        return (w - a["_a"] * w.dot(a["_a"])).Length
+    return None
+
+
 def _faces_for_feature(shape, f):
     return [shape.Faces[i] for i in f["_faces"] + f.get("_caps", []) + [cs["i"] for cs in f.get("_cs", [])]]
 
@@ -919,10 +1305,11 @@ def _select_edges(ctx, shape, selectors):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _Ctx:
-    def __init__(self, doc, fmap, registry):
+    def __init__(self, doc, an):
         self.doc = doc
-        self.fmap = fmap
-        self.registry = registry
+        self.an = an
+        self.fmap = an.fmap
+        self.registry = an.reg
         self.registry_updates = {}  # id -> descriptor patch (expected geometry after the op)
         self.verify = []            # [(id, field)] values to measure after the op
         self.expect_new = None      # (kind, field, value): new features that should appear
@@ -944,16 +1331,10 @@ def op_resize_hole(ctx, hole, diameter):
     if d <= 0:
         raise EngineError("diameter must be > 0")
     h = ctx.feature(hole, ("hole",))
-    obj = ctx.obj_of(h)
-    shape = _gshape(obj)
-    diag, _ = _tolerances(shape)
-    filled = _fill_hole(shape, h)
-    open0, open1 = h["_open"]
-    tool = _hole_tool(h["_a"], h["_base"], h["_t"][0], h["_t"][1], d / 2, open0, open1, diag, _tip_semi(shape, h))
-    for cone in _countersink_tools(h, h["_base"], d / 2, max(diag * 0.02, 1.0)):
-        tool = tool.fuse(cone)
-    _set_shape(ctx.doc, obj, filled.cut(tool), f"resize {h['id']} to Ø{d}")
-    ctx.registry_updates[h["id"]] = {"r": d / 2}
+    if h.get("_cb") and d >= 2 * h["_cb"]["_r"]:
+        raise EngineError(f"{h['id']} sits in counterbore {h['_cb']['id']} (Ø{h['_cb']['diameter']}); "
+                          "the hole must stay smaller than its counterbore. Resize the counterbore first.")
+    _recut_holes(ctx, [(h, None, d / 2)], f"resize {h['id']} to Ø{d}")
     ctx.verify.append((h["id"], "diameter"))
     return f"{h['id']}: Ø{h['diameter']} → Ø{_r(d)} mm"
 
@@ -969,19 +1350,127 @@ def op_move_hole(ctx, hole, offset=None, to=None):
         delta = off - a * off.dot(a)
     else:
         raise EngineError("Provide 'offset' [dx,dy,dz] or 'to' [x,y,z]")
-    obj = ctx.obj_of(h)
-    shape = _gshape(obj)
-    diag, _ = _tolerances(shape)
-    filled = _fill_hole(shape, h)
-    open0, open1 = h["_open"]
-    new_base = base + delta
-    tool = _hole_tool(a, new_base, h["_t"][0], h["_t"][1], h["_r"], open0, open1, diag, _tip_semi(shape, h))
-    for cone in _countersink_tools(h, new_base, h["_r"], max(diag * 0.02, 1.0)):
-        tool = tool.fuse(cone)
-    _set_shape(ctx.doc, obj, filled.cut(tool), f"move {h['id']} by {_vl(delta)}")
-    ctx.registry_updates[h["id"]] = {"b": _vl(new_base, 5)}
+    moved = _recut_holes(ctx, [(h, delta, None)], f"move {h['id']} by {_vl(delta)}")
     ctx.verify.append((h["id"], "center"))
-    return f"{h['id']} moved by {_vl(delta, 3)} mm"
+    extra = [m for m in moved if m != h["id"]]
+    return f"{h['id']} moved by {_vl(delta, 3)} mm" + (f" (with counterbore {', '.join(extra)})" if extra else "")
+
+
+def op_set_dimension(ctx, dimension, value, anchor="start"):
+    """Set a dimension between two features to an exact value.
+
+    plane–plane : the faces move apart/together (anchor: start = first ID stays, end = second ID stays,
+                  symmetric = both move half).
+    hole–plane  : the hole moves (with its counterbore) so its axis is `value` from the face.
+    hole–hole   : the holes move along the line joining them (anchor as above).
+    """
+    target = _num(value, "value")
+    if target <= 0:
+        raise EngineError("A dimension must be > 0")
+    anchor = str(anchor or "start").lower()
+    if anchor not in ("start", "end", "symmetric"):
+        raise EngineError("anchor must be start, end or symmetric")
+    ra, rb = _dim_refs(dimension)
+    a, b = ctx.feature(ra), ctx.feature(rb)
+    current = _dim_value(ctx.fmap, a["id"], b["id"])
+    if current is None:
+        raise EngineError(f"{a['id']} and {b['id']} don't define a measurable dimension (need parallel faces, "
+                          "a hole and a face parallel to its axis, or two parallel holes)")
+    did = f"{a['id']}-{b['id']}"
+    if abs(target - current) < 1e-7:
+        ctx.verify.append((did, "dimension"))
+        return f"{did} is already {_r(target)} mm"
+    delta = target - current
+    share = {"start": (0.0, 1.0), "end": (1.0, 0.0), "symmetric": (0.5, 0.5)}[anchor]
+
+    if a["kind"] == "plane" and b["kind"] == "plane":
+        sep = (b["_c"] - a["_c"]).dot(a["_n"])
+        u = a["_n"] * (1.0 if sep >= 0 else -1.0)  # direction from a towards b
+        _push_faces(ctx, [(b, delta * share[1] * u.dot(b["_n"])), (a, -delta * share[0] * u.dot(a["_n"]))],
+                    f"set {did} = {target}")
+    elif "plane" in (a["kind"], b["kind"]):
+        h, p = (a, b) if b["kind"] == "plane" else (b, a)
+        if h["kind"] != "hole":
+            raise EngineError(f"Only holes can be moved to set a distance to a face ({h['id']} is a {h['kind']})")
+        n = p["_n"]
+        d_now = (h["_base"] - p["_c"]).dot(n)
+        want = target if d_now >= 0 else -target
+        _recut_holes(ctx, [(h, n * (want - d_now), None)], f"set {did} = {target}")
+    else:
+        if a["kind"] != "hole" or b["kind"] != "hole":
+            raise EngineError("Only holes can be moved to set an axis-to-axis distance")
+        w = b["_base"] - a["_base"]
+        w = w - a["_a"] * w.dot(a["_a"])
+        u = V(w).normalize()
+        specs = []
+        if share[1]:
+            specs.append((b, u * (delta * share[1]), None))
+        if share[0]:
+            specs.append((a, u * (-delta * share[0]), None))
+        _recut_holes(ctx, specs, f"set {did} = {target}")
+    ctx.verify.append((did, "dimension"))
+    return f"{did}: {_r(current)} → {_r(target)} mm ({anchor})"
+
+
+def op_edit_hole_pattern(ctx, pattern, pcd=None, count=None, spacing=None, spacing_u=None, spacing_v=None,
+                         start_angle=None, anchor="center"):
+    """Change a hole pattern: bolt-circle diameter / count / start angle, linear spacing / count,
+    or grid spacings. Holes keep their size, depth, countersinks and counterbores."""
+    pat = ctx.an.pattern(pattern)
+    holes = [ctx.feature(h) for h in pat["holes"]]
+    if count is not None:
+        count = int(_num(count, "count"))
+        if count < 1:
+            raise EngineError("count must be >= 1")
+        if pat["type"] == "grid":
+            raise EngineError("Changing the number of holes in a grid isn't supported; change spacing_u / spacing_v")
+    for name, val in (("pcd", pcd), ("spacing", spacing), ("spacing_u", spacing_u), ("spacing_v", spacing_v)):
+        if val is not None and _num(val, name) <= 0:
+            raise EngineError(f"{name} must be > 0")
+    pts = analysis.pattern_positions(pat, pcd=pcd, count=count, spacing=spacing, spacing_u=spacing_u,
+                                     spacing_v=spacing_v, start_angle=start_angle, anchor=anchor)
+    a = holes[0]["_a"]
+    note = f"edit {pat['id']}"
+    if len(pts) == len(holes):
+        _recut_holes(ctx, [(h, _perp_base(p, a) - h["_base"], None) for h, p in zip(holes, pts)], note)
+    else:
+        obj = ctx.obj_of(holes[0])
+        shape = _gshape(obj)
+        diag, _ = _tolerances(shape)
+        old = [g for h in holes for g in _with_partner(h)]
+        result = _fill_holes(shape, old)
+        template = sorted(_with_partner(holes[0]), key=lambda g: -g["_r"])
+        for p in pts:
+            delta = _perp_base(p, a) - holes[0]["_base"]
+            for g in template:
+                result = result.cut(_hole_cutter(shape, g, g["_base"] + delta, g["_r"], diag))
+        _set_shape(ctx.doc, obj, result, note)
+        for h, p in zip(holes, pts):
+            delta = _perp_base(p, a) - h["_base"]
+            for g in _with_partner(h):
+                ctx.registry_updates[g["id"]] = {"b": _vl(g["_base"] + delta, 5)}
+    ctx.verify.append((holes[0]["id"], "pattern"))
+    changes = ", ".join(f"{k} {v}" for k, v in (("PCD", pcd), ("count", count), ("spacing", spacing),
+                                                ("spacing_u", spacing_u), ("spacing_v", spacing_v),
+                                                ("start angle", start_angle)) if v is not None)
+    return f"{pat['id']} ({pat['type']}, {pat['count']} × Ø{pat['hole_diameter']}): {changes or 'unchanged'}"
+
+
+def _face_point(p, x):
+    """A point on planar face feature p: [x,y,z], or two numbers = the global coordinates along the face's two
+    in-plane axes (in X, Y, Z order) for a face normal to X, Y or Z; the third comes from the face."""
+    if isinstance(x, (list, tuple)) and len(x) == 2:
+        n = p["_n"]
+        axis = max(range(3), key=lambda i: abs(n[i]))
+        if abs(abs(n[axis]) - 1) > 1e-6:
+            raise EngineError(f"Face {p['id']} is not normal to X, Y or Z: give positions as full [x, y, z]")
+        u, v = (float(x[0]), float(x[1]))
+        c = [None, None, None]
+        c[axis] = p["_c"][axis]
+        rest = [i for i in range(3) if i != axis]
+        c[rest[0]], c[rest[1]] = u, v
+        return V(*c)
+    return _v(x)
 
 
 def op_add_holes(ctx, face, diameter, positions=None, depth=None):
@@ -994,7 +1483,7 @@ def op_add_holes(ctx, face, diameter, positions=None, depth=None):
     diag, tol = _tolerances(shape)
     fface = shape.Faces[p["_faces"][0]]
     n = p["_n"]
-    pts = [_v(x) for x in positions] if positions else [p["_c"]]
+    pts = [_face_point(p, x) for x in positions] if positions else [p["_c"]]
     through = depth is None or depth == "through"
     dep = diag * 2 if through else _num(depth, "depth")
     margin = max(diag * 0.02, 1.0)
@@ -1002,7 +1491,18 @@ def op_add_holes(ctx, face, diameter, positions=None, depth=None):
     for pt in pts:
         q = pt - n * (pt - p["_c"]).dot(n)
         if not fface.isInside(q, tol * 10, True):
-            raise EngineError(f"Position {_vl(q, 3)} is not on face {p['id']} (face bbox {p['bbox']})")
+            # Say why, so the user (and the LLM) can pick a valid point instead of retrying the same one.
+            inside = [h for h in ctx.an.feats if h["kind"] == "hole" and h["_obj"] == p["_obj"]
+                      and ((q - h["_base"]) - h["_a"] * (q - h["_base"]).dot(h["_a"])).Length < h["_r"] + d / 2]
+            if inside:
+                h = inside[0]
+                raise EngineError(f"Position {_vl(q, 3)} is not possible: a Ø{_r(d)} hole there would cut into hole "
+                                  f"{h['id']} (Ø{h['diameter']}, axis through {_vl(h['_base'] + h['_a'] * h['_t'][1], 3)}). "
+                                  f"Choose a point at least {_r(h['_r'] + d / 2)} mm from that axis. Do not retry "
+                                  f"the same point; tell the user.")
+            raise EngineError(f"Position {_vl(q, 3)} is not on face {p['id']}: it lies outside the face's material "
+                              f"(face bbox {p['bbox']}; the face may have openings or an irregular outline). "
+                              f"Do not retry the same point; tell the user.")
         tools.append(Part.makeCylinder(d / 2, dep + margin, q + n * margin, n.negative()))
     tool = tools[0] if len(tools) == 1 else Part.makeCompound(tools)
     _set_shape(ctx.doc, obj, shape.cut(tool), f"add {len(pts)} hole(s) Ø{d} on {p['id']}")
@@ -1041,13 +1541,7 @@ def op_push_pull_face(ctx, face, distance):
     if abs(dist) < 1e-9:
         return "No change (distance 0)"
     p = ctx.feature(face, ("plane",))
-    obj = ctx.obj_of(p)
-    shape = _gshape(obj)
-    f = shape.Faces[p["_faces"][0]]
-    prism = f.extrude(p["_n"] * dist)
-    result = shape.fuse(prism) if dist > 0 else shape.cut(prism)
-    _set_shape(ctx.doc, obj, result, f"push/pull {p['id']} {dist:+}")
-    ctx.registry_updates[p["id"]] = {"d": p["_d"] + dist, "c": _vl(p["_c"] + p["_n"] * dist, 5)}
+    _push_faces(ctx, [(p, dist)], f"push/pull {p['id']} {dist:+}")
     return f"{p['id']} moved {dist:+.4f} mm along its normal {p['normal']}"
 
 
@@ -1170,14 +1664,17 @@ def op_add_primitive(ctx, shape, dimensions, position, direction=None, operation
 
 def op_transform_object(ctx, object=None, translate=None, rotate=None):
     obj = _get_obj(ctx.doc, object)
-    pl = obj.Placement
+    # Compose in global coordinates (what the user sees), then convert back to the parent's frame.
+    parent = _parent_placement(obj)
+    gpl = parent.multiply(obj.Placement) if parent is not None else obj.Placement
     if rotate:
         axis = _axis_vec(rotate.get("axis", "Z"))
         ang = _num(rotate.get("angle", 0), "angle")
         center = _v(rotate["center"]) if rotate.get("center") is not None else _gshape(obj).BoundBox.Center
-        pl = App.Placement(V(), App.Rotation(axis, ang), center).multiply(pl)
+        gpl = App.Placement(V(), App.Rotation(axis, ang), center).multiply(gpl)
     if translate:
-        pl = App.Placement(_v(translate), App.Rotation()).multiply(pl)
+        gpl = App.Placement(_v(translate), App.Rotation()).multiply(gpl)
+    pl = parent.inverse().multiply(gpl) if parent is not None else gpl
     obj.Placement = pl
     return f"{obj.Label} placement → base {_vl(pl.Base, 3)}, rotation {_r(pl.Rotation.Angle * 180 / math.pi, 3)}° about {_vl(pl.Rotation.Axis, 3)}"
 
@@ -1297,6 +1794,8 @@ OPS = {
     "remove_features": op_remove_features,
     "push_pull_face": op_push_pull_face,
     "set_face_distance": op_set_face_distance,
+    "set_dimension": op_set_dimension,
+    "edit_hole_pattern": op_edit_hole_pattern,
     "fillet_edges": op_fillet_edges,
     "chamfer_edges": op_chamfer_edges,
     "add_primitive": op_add_primitive,
@@ -1323,7 +1822,8 @@ def _invalid_objects(doc):
     return bad
 
 
-def _measure_field(fmap, fid, field, doc=None):
+def _measure_field(an, fid, field, doc=None):
+    fmap = an.fmap
     if field == "property":
         objname, prop = fid.split(".", 1)
         val = getattr(doc.getObject(objname), prop)
@@ -1333,6 +1833,20 @@ def _measure_field(fmap, fid, field, doc=None):
         c = doc.getObject(objname).Constraints[int(idx)]
         val = math.degrees(c.Value) if c.Type == "Angle" else c.Value
         return {"id": fid, "field": field, "value": _r(val), "status": "ok"}
+    if field == "dimension":
+        ra, rb = _dim_refs(fid)
+        val = _dim_value(fmap, ra, rb)
+        if val is None:
+            return {"id": fid, "field": field, "status": "missing",
+                    "note": "one of the faces/holes was not found after the edit"}
+        return {"id": fid, "field": field, "value": _r(val), "status": "ok"}
+    if field == "pattern":
+        for p in an.patterns:
+            if fid in p["holes"]:
+                keys = ("pcd", "count", "angle_step_deg") if p["type"] == "circular" else \
+                    ("spacing", "count") if p["type"] == "linear" else ("spacing_u", "spacing_v", "count")
+                return {"id": p["id"], "field": field, "value": {k: p[k] for k in keys}, "status": "ok"}
+        return {"id": fid, "field": field, "status": "missing", "note": "no pattern found containing this hole"}
     f = fmap.get(fid)
     if f is None:
         return {"id": fid, "field": field, "status": "missing",
@@ -1365,6 +1879,127 @@ def _export_stl(doc, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     mesh.write(path)
     return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FreeCAD GUI: window layout, manual edits, selection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _arrange_window():
+    """Put the FreeCAD window beside the browser, once per FreeCAD session.
+
+    FREECAD_WINDOW = right (default) | left | max | none.
+    """
+    mode = os.environ.get("FREECAD_WINDOW", "right").strip().lower()
+    if not GUI or mode in ("", "none", "off", "0"):
+        return
+    try:
+        from PySide import QtWidgets  # type: ignore
+        mw = Gui.getMainWindow()
+        if not mw.property("aethercadArranged"):
+            mw.setProperty("aethercadArranged", True)
+            scr = mw.screen() if hasattr(mw, "screen") else QtWidgets.QApplication.primaryScreen()
+            g = scr.availableGeometry()
+            if mode == "max":
+                mw.showMaximized()
+            else:
+                mw.showNormal()
+                frame = mw.frameGeometry().size() - mw.geometry().size()
+                half = g.width() // 2
+                mw.move(g.x() + (half if mode == "right" else 0), g.y())
+                mw.resize(half - frame.width(), g.height() - frame.height())
+        if mw.isMinimized():
+            mw.showNormal()
+        mw.raise_()
+        mw.activateWindow()
+    except Exception as e:
+        print(f"[AetherCAD] window layout warning: {e}")
+
+
+_SIGS = {}  # doc.Name -> geometry signature when AetherCAD last saved / loaded it
+
+
+def _doc_signature(doc):
+    """Cheap fingerprint of the visible solid geometry (FreeCAD's GUI 'Modified' flag is set by
+    view changes and isn't cleared reliably, so it can't tell real manual edits apart)."""
+    sig = []
+    for o in _solid_objects(doc):
+        try:
+            s = _gshape(o)
+            bb = s.BoundBox
+            sig.append((o.Name, round(s.Volume, 6), round(s.Area, 6), len(s.Faces),
+                        tuple(round(x, 6) for x in (bb.XMin, bb.YMin, bb.ZMin, bb.XMax, bb.YMax, bb.ZMax))))
+        except Exception:
+            sig.append((o.Name, None))
+    return tuple(sig)
+
+
+def _remember(doc):
+    _SIGS[doc.Name] = _doc_signature(doc)
+
+
+def _gui_modified(doc):
+    """True when the geometry changed since AetherCAD last saved/loaded it, i.e. the user edited it by
+    hand in FreeCAD. Unknown (e.g. FreeCAD was restarted) counts as unchanged."""
+    if not GUI:
+        return False
+    old = _SIGS.get(doc.Name)
+    return old is not None and old != _doc_signature(doc)
+
+
+def _sel_target(obj):
+    """(root object name, subname prefix) for selecting obj's sub-elements, through App::Part containers."""
+    chain = []
+    try:
+        p = obj.getParentGeoFeatureGroup()
+        while p is not None:
+            chain.insert(0, p)
+            p = p.getParentGeoFeatureGroup()
+    except Exception:
+        chain = []
+    if not chain:
+        return obj.Name, ""
+    return chain[0].Name, ".".join(x.Name for x in chain[1:] + [obj]) + "."
+
+
+def _feature_faces(f):
+    return f["_faces"] + f.get("_caps", []) + [cs["i"] for cs in f.get("_cs", [])]
+
+
+def _part_object(an, key):
+    """Object name for a part ID (B1), or None."""
+    return next((name for name, pid in an.parts.items() if pid == key), None)
+
+
+def _resolve_refs(an, ids):
+    """Features for a list of IDs; dimension IDs (P1-P2) and pattern IDs (PAT1) expand to their members.
+    Part IDs (B1) are returned separately as object names: (features, missing, part object names)."""
+    out, missing, parts = [], [], []
+    for raw in ids or []:
+        key = str(raw).strip().upper()
+        if _part_object(an, key):
+            parts.append(_part_object(an, key))
+        elif key in an.fmap:
+            out.append(an.fmap[key])
+        elif key.startswith("PAT"):
+            try:
+                out.extend(an.fmap[h] for h in an.pattern(key)["holes"] if h in an.fmap)
+            except EngineError:
+                missing.append(raw)
+        elif "-" in key:
+            try:
+                refs = _dim_refs(key)
+                out.extend(an.fmap[r] for r in refs if r in an.fmap)
+            except EngineError:
+                missing.append(raw)
+        else:
+            missing.append(raw)
+    seen, uniq = set(), []
+    for f in out:
+        if f["id"] not in seen:
+            seen.add(f["id"])
+            uniq.append(f)
+    return uniq, missing, parts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1408,9 +2043,10 @@ def open_model(session_id, source_path, work_path, registry=None):
         doc.UndoMode = 1
     except Exception:
         pass
+    _arrange_window()
     _activate(doc, fit=True)
-    objs, feats, fmap, reg = _analyze(doc, registry)
-    return {"info": _model_info(doc, objs, feats), "registry": reg}
+    an = _analyze(doc, registry)
+    return {"info": _model_info(doc, an), "registry": an.reg}
 
 
 def reload(session_id, work_path, registry=None):
@@ -1418,14 +2054,20 @@ def reload(session_id, work_path, registry=None):
     _close_session(session_id, work_path)
     doc = _get_doc(session_id, work_path)
     _activate(doc, fit=False)
-    objs, feats, fmap, reg = _analyze(doc, registry)
-    return {"info": _model_info(doc, objs, feats), "registry": reg}
+    an = _analyze(doc, registry)
+    return {"info": _model_info(doc, an), "registry": an.reg}
 
 
 def model_info(session_id, work_path, registry=None):
+    """Re-analyse the document. `manual_edit` is true when the user edited it by hand in FreeCAD
+    (the change is saved so the backend can record it as a version)."""
     doc = _get_doc(session_id, work_path)
-    objs, feats, fmap, reg = _analyze(doc, registry)
-    return {"info": _model_info(doc, objs, feats), "registry": reg}
+    manual = _gui_modified(doc)
+    if manual:
+        doc.recompute()
+        _save(doc)
+    an = _analyze(doc, registry)
+    return {"info": _model_info(doc, an), "registry": an.reg, "manual_edit": manual}
 
 
 def apply(session_id, work_path, op, params=None, registry=None):
@@ -1433,11 +2075,11 @@ def apply(session_id, work_path, op, params=None, registry=None):
         raise EngineError(f"Unknown operation '{op}'. Available: {', '.join(OPS)}")
     params = params or {}
     doc = _get_doc(session_id, work_path)
-    objs, feats, fmap, reg = _analyze(doc, registry)
-    before = {o.Name: _r(_gshape(o).Volume, 3) for o in objs}
+    an = _analyze(doc, registry)
+    before = {o.Name: _r(an.shapes[o.Name].Volume, 3) for o in an.objs}
     names_before = {o.Name for o in doc.Objects}
     invalid_before = _invalid_objects(doc)
-    ctx = _Ctx(doc, fmap, reg)
+    ctx = _Ctx(doc, an)
 
     doc.openTransaction(f"AetherCAD: {op}")
     try:
@@ -1462,15 +2104,16 @@ def apply(session_id, work_path, op, params=None, registry=None):
     if converted:
         message += ("\nNote: " + ", ".join(o.Label for o in converted) + " replaces a parametric object with a "
                     "plain solid; that object's parameters no longer drive the shown geometry.")
+    reg = an.reg
     for fid, patch in ctx.registry_updates.items():
         if fid in reg["items"]:
             reg["items"][fid].update(patch)
-    objs2, feats2, fmap2, reg2 = _analyze(doc, reg)
-    after = {o.Name: _r(_gshape(o).Volume, 3) for o in objs2}
-    verified = [_measure_field(fmap2, fid, field, doc) for fid, field in ctx.verify]
+    an2 = _analyze(doc, reg)
+    after = {o.Name: _r(an2.shapes[o.Name].Volume, 3) for o in an2.objs}
+    verified = [_measure_field(an2, fid, field, doc) for fid, field in ctx.verify]
     if ctx.expect_new:
         kind, field, value = ctx.expect_new
-        new = [f for fid, f in fmap2.items() if fid not in fmap and f["kind"] == kind
+        new = [f for fid, f in an2.fmap.items() if fid not in an.fmap and f["kind"] == kind
                and abs(float(f.get(field, -1)) - value) < 1e-3]
         verified += [{"id": f["id"], "field": field, "value": f[field], "status": "ok"} for f in new]
         if not new:
@@ -1483,21 +2126,26 @@ def apply(session_id, work_path, op, params=None, registry=None):
         "verified": verified,
         "volume_before": before,
         "volume_after": after,
-        "info": _model_info(doc, objs2, feats2),
-        "registry": reg2,
+        "info": _model_info(doc, an2),
+        "registry": an2.reg,
     }
 
 
 def find_features(session_id, work_path, registry=None, kind=None, diameter_min=None, diameter_max=None,
                   normal=None, near=None, object=None, limit=50):
     doc = _get_doc(session_id, work_path)
-    objs, feats, fmap, reg = _analyze(doc, registry)
+    an = _analyze(doc, registry)
+    objnames = None
+    if object:
+        q = str(object).lower()
+        objnames = {o.Name for o in an.objs if o.Name.lower() == q or o.Label.lower() == q
+                    or an.parts.get(o.Name, "").lower() == q}
     out = []
     nvec = _axis_vec(normal) if normal is not None else None
-    for f in feats:
+    for f in an.feats:
         if kind and f["kind"] != kind:
             continue
-        if object and f["_obj"] != object:
+        if objnames is not None and f["_obj"] not in objnames:
             continue
         dia = f.get("diameter")
         if diameter_min is not None and (dia is None or dia < float(diameter_min) - 1e-6):
@@ -1512,26 +2160,45 @@ def find_features(session_id, work_path, registry=None, kind=None, diameter_min=
         out.sort(key=lambda f: (_v(f["center"]) - p).Length)
     else:
         out.sort(key=lambda f: (f["kind"], int(re.sub(r"\D", "", f["id"]) or 0)))
-    return {"features": [_public(f) for f in out[: int(limit or 50)]], "total": len(out), "registry": reg}
+    return {"features": [_public(f) for f in out[: int(limit or 50)]], "total": len(out), "registry": an.reg}
+
+
+def dimensions(session_id, work_path, registry=None, object=None, feature=None, type=None, limit=60):
+    """Driving dimensions, optionally filtered by object (name/label), a feature ID they involve, or type."""
+    doc = _get_doc(session_id, work_path)
+    an = _analyze(doc, registry)
+    rows = an.dims
+    if object:
+        q = str(object).lower()
+        names = {o.Name for o in an.objs if o.Name.lower() == q or o.Label.lower() == q
+                    or an.parts.get(o.Name, "").lower() == q}
+        rows = [d for d in rows if d["object"] in names]
+    if feature:
+        fid = str(feature).strip().upper()
+        rows = [d for d in rows if fid in d["refs"]]
+    if type:
+        rows = [d for d in rows if d["type"] == type]
+    return {"dimensions": rows[: int(limit or 60)], "total": len(rows), "patterns": an.patterns, "registry": an.reg}
 
 
 def measure(session_id, work_path, a, b, registry=None):
     doc = _get_doc(session_id, work_path)
-    objs, feats, fmap, reg = _analyze(doc, registry)
+    an = _analyze(doc, registry)
+    fmap = an.fmap
 
     def to_shape(ref):
         if isinstance(ref, (list, tuple)):
             return Part.Vertex(_v(ref)), None
         f = fmap.get(str(ref).upper())
         if f is not None:
-            shape = _gshape(doc.getObject(f["_obj"]))
+            shape = an.shapes[f["_obj"]]
             return Part.makeCompound([shape.Faces[i] for i in f["_faces"]]), f
         return _gshape(_get_obj(doc, ref)), None
 
     sa, fa = to_shape(a)
     sb, fb = to_shape(b)
     dist, pairs, _ = sa.distToShape(sb)
-    out = {"min_distance": _r(dist), "closest_points": [[_vl(p, 3), _vl(q, 3)] for p, q in pairs[:2]], "registry": reg}
+    out = {"min_distance": _r(dist), "closest_points": [[_vl(p, 3), _vl(q, 3)] for p, q in pairs[:2]], "registry": an.reg}
     if fa and fb:
         if fa.get("_a") is not None and fb.get("_a") is not None and abs(fa["_a"].dot(fb["_a"])) > 1 - 1e-6:
             d = fb["_base"] - fa["_base"]
@@ -1547,8 +2214,8 @@ def measure(session_id, work_path, a, b, registry=None):
 def list_objects(session_id, work_path, registry=None, name_contains=None):
     """Every solid object (largest first) with its container, size and position."""
     doc = _get_doc(session_id, work_path)
-    objs, feats, fmap, reg = _analyze(doc, registry)
-    info = _model_info(doc, objs, [])
+    an = _analyze(doc, registry)
+    info = _model_info(doc, an, with_features=False)
     rows = info["objects"]
     if name_contains:
         q = str(name_contains).lower()
@@ -1557,7 +2224,149 @@ def list_objects(session_id, work_path, registry=None, name_contains=None):
     rows.sort(key=lambda o: -o["volume"])
     out = [{"name": o["name"], "label": o["label"], **({"parent": o["parent"]} if "parent" in o else {}),
             "volume": o["volume"], "bbox": o["bbox"]} for o in rows]
-    return {"objects": out, "total": len(out), "overall_bbox": info["bbox"], "registry": reg}
+    return {"objects": out, "total": len(out), "overall_bbox": info["bbox"], "registry": an.reg}
+
+
+def highlight(session_id, work_path, ids, registry=None, select=True, zoom=False, max_triangles=60000):
+    """Triangle meshes of the given features (global mm) for the web viewer, and — in GUI mode —
+    select them in FreeCAD so both views show the same thing. IDs may be features, dimensions or patterns."""
+    doc = _get_doc(session_id, work_path)
+    an = _analyze(doc, registry)
+    feats, missing, part_objs = _resolve_refs(an, ids)
+    # (id, kind, object name, face indices); a part is all of its object's faces
+    items = [(an.parts[o], "part", o, range(len(an.shapes[o].Faces))) for o in part_objs]
+    items += [(f["id"], f["kind"], f["_obj"], _feature_faces(f)) for f in feats]
+    meshes, total = [], 0
+    for fid, kind, objname, faces in items:
+        shape = an.shapes[objname]
+        defl = max(shape.BoundBox.DiagonalLength / 600.0, 0.01)
+        pos, idx = [], []
+        for i in faces:
+            try:
+                pts, tris = shape.Faces[i].tessellate(defl)
+            except Exception:
+                continue
+            off = len(pos) // 3
+            for p in pts:
+                pos += [_r(p.x, 4), _r(p.y, 4), _r(p.z, 4)]
+            for t in tris:
+                idx += [t[0] + off, t[1] + off, t[2] + off]
+        total += len(idx) // 3
+        if total > max_triangles:
+            break
+        meshes.append({"id": fid, "kind": kind, "positions": pos, "indices": idx})
+    if GUI and select:
+        try:
+            Gui.Selection.clearSelection()
+            for o in part_objs:
+                root, prefix = _sel_target(doc.getObject(o))
+                if prefix:
+                    Gui.Selection.addSelection(doc.Name, root, prefix)
+                else:
+                    Gui.Selection.addSelection(doc.getObject(o))
+            for f in feats:
+                root, prefix = _sel_target(doc.getObject(f["_obj"]))
+                for i in _feature_faces(f):
+                    Gui.Selection.addSelection(doc.Name, root, f"{prefix}Face{i + 1}")
+            if zoom and (feats or part_objs):
+                Gui.SendMsgToActiveView("ViewSelection")
+            Gui.updateGui()
+        except Exception as e:
+            print(f"[AetherCAD] selection warning: {e}")
+    return {"meshes": meshes, "missing": missing, "registry": an.reg}
+
+
+def _face_owners(an):
+    """(object name, face index) -> the feature a user means when pointing at that face. A face can belong to
+    two features (a boss's end face is also a plane); the ordinary visible plane wins over the boss, while a
+    hole's floor (a cap plane) goes to the hole."""
+    owners = {}
+    # later wins: cap planes < other features (holes, bosses…) < ordinary planes
+    for f in sorted(an.feats, key=lambda f: (0 if f.get("is_cap") else 2) if f["kind"] == "plane" else 1):
+        for i in _feature_faces(f):
+            owners[(f["_obj"], i)] = f
+    return owners
+
+
+def pick(session_id, work_path, point, registry=None, mode="feature"):
+    """The component under a point clicked in the web viewer (a point on the STL, global mm): the feature
+    whose face is nearest, or with mode="part" the part. Returns {id, feature, part, face, distance}."""
+    doc = _get_doc(session_id, work_path)
+    an = _analyze(doc, registry)
+    p = _v(point)
+    vx = Part.Vertex(p)
+    best = None
+    for o in an.objs:
+        shape = an.shapes[o.Name]
+        # The STL is a tessellation, so the clicked point can be off the true surface by the mesh deflection.
+        margin = max(shape.BoundBox.DiagonalLength * 0.01, 0.2)
+        bb = App.BoundBox(shape.BoundBox)
+        bb.enlarge(margin)
+        if not bb.isInside(p):
+            continue
+        for i, face in enumerate(shape.Faces):
+            fb = App.BoundBox(face.BoundBox)
+            fb.enlarge(margin)
+            if not fb.isInside(p):
+                continue
+            d = face.distToShape(vx)[0]
+            if d <= margin and (best is None or d < best[0]):
+                best = (d, o.Name, i)
+    if best is None:
+        return {"id": None, "feature": None, "part": None, "registry": an.reg}
+    d, objname, i = best
+    f = _face_owners(an).get((objname, i))
+    part = an.parts[objname]
+    return {"id": part if mode == "part" or f is None else f["id"], "feature": f["id"] if f else None,
+            "part": part, "face": i + 1, "distance": _r(d), "registry": an.reg}
+
+
+def gui_selection(session_id, work_path, registry=None):
+    """IDs of what the user has selected in the FreeCAD window: faces map to their features, whole objects
+    to their part IDs."""
+    doc = _get_doc(session_id, work_path)
+    an = _analyze(doc, registry)
+    if not GUI:
+        return {"ids": [], "gui": False, "registry": an.reg}
+    owners = _face_owners(an)
+    ids = []
+
+    def solid_of(obj):
+        # A face picked on a PartDesign Body resolves to its tip feature; walk up to the analysed object.
+        while obj is not None and obj.Name not in an.parts:
+            try:
+                obj = obj.getParentGeoFeatureGroup()
+            except Exception:
+                return None
+        return obj
+
+    for sel in Gui.Selection.getSelectionEx(doc.Name):
+        obj = solid_of(sel.Object)
+        if obj is None:
+            continue
+        faces = [n.split(".")[-1] for n in sel.SubElementNames if n.split(".")[-1].startswith("Face")]
+        found = [owners.get((obj.Name, int(n[4:]) - 1)) for n in faces]
+        for fid in [f["id"] for f in found if f] or [an.parts[obj.Name]]:
+            if fid not in ids:
+                ids.append(fid)
+    return {"ids": ids, "gui": True, "registry": an.reg}
+
+
+def show_window(session_id=None, work_path=None):
+    """Bring FreeCAD (and the session's document) to the front."""
+    if session_id:
+        doc = _get_doc(session_id, work_path)
+        _activate(doc, fit=False)
+    if GUI:
+        try:
+            mw = Gui.getMainWindow()
+            if mw.isMinimized():
+                mw.showNormal()
+            mw.raise_()
+            mw.activateWindow()
+        except Exception as e:
+            print(f"[AetherCAD] show window warning: {e}")
+    return {"shown": GUI}
 
 
 def snapshot(session_id, work_path, fcstd_path, stl_path):
@@ -1601,8 +2410,13 @@ METHODS = {
     "model_info": model_info,
     "apply": apply,
     "find_features": find_features,
+    "dimensions": dimensions,
     "measure": measure,
     "list_objects": list_objects,
+    "highlight": highlight,
+    "pick": pick,
+    "gui_selection": gui_selection,
+    "show_window": show_window,
     "snapshot": snapshot,
     "export": export,
     "close_session": close_session,

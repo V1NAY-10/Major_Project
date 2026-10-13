@@ -1,14 +1,76 @@
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { ApiError, apiBlob, apiFetch, postJson } from "@/lib/api";
-import { CadState, FreeCADStatus } from "@/types/cad";
+import { CadState, FreeCADStatus, HighlightMesh, PickResult, SelectMode } from "@/types/cad";
 
 /** CAD state for the active chat session. The backend + FreeCAD own the truth; this mirrors it. */
 export function useCADSession() {
   const [cad, setCad] = useState<CadState | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [highlights, setHighlights] = useState<HighlightMesh[]>([]);
+  const highlightTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const highlightSeq = useRef(0);
 
-  const resetCadState = useCallback(() => setCad(null), []);
+  const resetCadState = useCallback(() => {
+    setCad(null);
+    setHighlights([]);
+  }, []);
+
+  // Feature geometry belongs to one version of one model: drop it when either changes.
+  // (adjusting state during render instead of in an effect avoids a cascading re-render)
+  const sessionId = cad?.session_id;
+  const modelKey = `${sessionId}:${cad?.version}`;
+  const [highlightKey, setHighlightKey] = useState(modelKey);
+  if (highlightKey !== modelKey) {
+    setHighlightKey(modelKey);
+    setHighlights([]);
+  }
+
+  /**
+   * Highlight features (H3, P1-P2, PAT1…) in the web viewer and select them in FreeCAD.
+   * Debounced; failures are ignored (highlighting is a convenience).
+   */
+  const highlight = useCallback(
+    (ids: string[]) => {
+      if (!sessionId) return;
+      if (highlightTimer.current) clearTimeout(highlightTimer.current);
+      const seq = ++highlightSeq.current;
+      if (!ids.length) {
+        setHighlights([]);
+        return;
+      }
+      highlightTimer.current = setTimeout(() => {
+        postJson<{ meshes: HighlightMesh[]; missing: string[] }>(`/cad/highlight/${sessionId}`, { ids, select: true })
+          .then((res) => {
+            if (seq === highlightSeq.current) setHighlights(res.meshes ?? []);
+          })
+          .catch(() => {});
+      }, 150);
+    },
+    [sessionId]
+  );
+
+  /** The component under a point clicked in the viewer (global mm). */
+  const pick = useCallback(
+    async (point: [number, number, number], mode: SelectMode): Promise<PickResult | null> => {
+      if (!sessionId) return null;
+      return postJson<PickResult>(`/cad/pick/${sessionId}`, { point, mode });
+    },
+    [sessionId]
+  );
+
+  /** IDs of what is currently selected in the FreeCAD window. */
+  const freecadSelection = useCallback(async (): Promise<string[]> => {
+    if (!sessionId) return [];
+    const res = await apiFetch<{ ids: string[] }>(`/cad/freecad-selection/${sessionId}`);
+    return res.ids ?? [];
+  }, [sessionId]);
+
+  /** Bring FreeCAD (with this session's document) to the front. */
+  const showInFreeCAD = useCallback(async () => {
+    if (!sessionId) return;
+    await postJson(`/cad/show/${sessionId}`);
+  }, [sessionId]);
 
   /** Load the session's CAD state (404 = no model yet) and bring its document to front in FreeCAD. */
   const loadSessionCad = useCallback(async (sessionId: string) => {
@@ -47,7 +109,7 @@ export function useCADSession() {
     }
   }, []);
 
-  /** Exports need the auth header, so they are fetched as a blob and saved via a temporary link. */
+  /** Exports are fetched as a blob and saved via a temporary link (keeps the backend error message on failure). */
   const download = useCallback(
     async (format: string) => {
       if (!cad) return;
@@ -74,9 +136,14 @@ export function useCADSession() {
     upload,
     undo: (sessionId: string) => step(sessionId, "undo"),
     redo: (sessionId: string) => step(sessionId, "redo"),
-    /** Backend path of the current version's STL (fetched with auth by the viewer). */
+    /** Backend path of the current version's STL. */
     modelPath: cad ? cad.mesh_url : null,
     download,
+    highlights,
+    highlight,
+    showInFreeCAD,
+    pick,
+    freecadSelection,
   };
 }
 

@@ -1,5 +1,5 @@
 "use client";
-import { Check, CheckCircle2, Copy, GitCommitHorizontal, XCircle, Zap } from "lucide-react";
+import { Check, CheckCircle2, Copy, Crosshair, GitCommitHorizontal, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Message, Operation } from "@/types/chat";
@@ -11,6 +11,9 @@ const TOOL_LABELS: Record<string, string> = {
   remove_features: "Remove features",
   push_pull_face: "Push/pull face",
   set_face_distance: "Set distance",
+  set_dimension: "Set dimension",
+  edit_hole_pattern: "Edit pattern",
+  list_dimensions: "Dimensions",
   fillet_edges: "Fillet",
   chamfer_edges: "Chamfer",
   add_primitive: "Add primitive",
@@ -26,7 +29,18 @@ const TOOL_LABELS: Record<string, string> = {
 function fmtValue(v: unknown): string {
   if (typeof v === "number") return Number.isInteger(v) ? `${v}` : v.toFixed(3);
   if (Array.isArray(v)) return `[${v.map(fmtValue).join(", ")}]`;
+  if (v && typeof v === "object")
+    return Object.entries(v as Record<string, unknown>)
+      .map(([k, x]) => `${k}=${fmtValue(x)}`)
+      .join(", ");
   return String(v);
+}
+
+function fmtField(field: string): string {
+  if (field.startsWith("distance_to:")) return field.replace(/^distance_to:/, "↔ ");
+  if (field === "dimension") return "";
+  if (field === "pattern") return "pattern";
+  return field;
 }
 
 function OperationCard({ op }: { op: Operation }) {
@@ -53,7 +67,7 @@ function OperationCard({ op }: { op: Operation }) {
             <div className="mt-1 flex flex-wrap gap-1.5">
               {verified.map((v, i) => (
                 <span key={i} className="rounded bg-green-500/10 px-1.5 py-0.5 font-mono text-[10px] text-green-600 dark:text-green-400">
-                  ✓ {v.id} {v.field.replace(/^distance_to:/, "↔ ")} = {fmtValue(v.value)}
+                  ✓ {v.id}{fmtField(v.field) ? ` ${fmtField(v.field)}` : ""} = {fmtValue(v.value)}
                 </span>
               ))}
             </div>
@@ -72,7 +86,7 @@ function OperationCard({ op }: { op: Operation }) {
 
 export default function ChatMessage({ message }: { message: Message }) {
   const [copied, setCopied] = useState(false);
-  const { role, content, operations, version, kind } = message;
+  const { role, content, operations, version, kind, selection } = message;
   const isAssistant = role === "assistant";
 
   const handleCopy = async () => {
@@ -124,7 +138,19 @@ export default function ChatMessage({ message }: { message: Message }) {
             <ReactMarkdown>{content}</ReactMarkdown>
           </div>
         ) : (
-          <p className="text-sm leading-relaxed font-medium whitespace-pre-wrap">{content}</p>
+          <>
+            {!!selection?.length && (
+              <p className="mb-1 flex flex-wrap items-center gap-1 text-[10px] text-white/70">
+                <Crosshair size={10} /> on
+                {selection.map((id) => (
+                  <span key={id} className="rounded bg-white/15 px-1 font-mono font-bold text-white">
+                    {id}
+                  </span>
+                ))}
+              </p>
+            )}
+            <p className="text-sm leading-relaxed font-medium whitespace-pre-wrap">{content}</p>
+          </>
         )}
 
         {!!operations?.length && (

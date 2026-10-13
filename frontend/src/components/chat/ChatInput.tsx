@@ -1,4 +1,4 @@
-import { Send, Loader2, Paperclip } from "lucide-react";
+import { Send, Loader2, Paperclip, Crosshair, X } from "lucide-react";
 import { useRef } from "react";
 
 export const CAD_ACCEPT = ".step,.stp,.iges,.igs,.brep,.brp,.fcstd";
@@ -12,6 +12,11 @@ interface ChatInputProps {
   onSubmit: (e?: React.FormEvent) => void;
   hasCad: boolean;
   suggestions?: string[];
+  /** Components selected in the viewer; the message applies to them. */
+  selection?: { id: string; text: string }[];
+  onRemoveSelection?: (id: string) => void;
+  /** Lets the page focus the message box (e.g. after a quick action). */
+  textareaRef?: React.RefObject<HTMLTextAreaElement | null>;
 }
 
 export default function ChatInput({
@@ -23,13 +28,42 @@ export default function ChatInput({
   onSubmit,
   hasCad,
   suggestions = [],
+  selection = [],
+  onRemoveSelection,
+  textareaRef,
 }: ChatInputProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   return (
     <div className="p-4 md:px-8 md:pb-6 shrink-0 bg-linear-to-t from-background via-background to-transparent">
       <form onSubmit={onSubmit} className="max-w-3xl mx-auto relative group">
-        {hasCad && !prompt && suggestions.length > 0 && (
+        {hasCad && selection.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1.5 mb-2 text-[11px]">
+            <span className="flex items-center gap-1 text-amber-600 dark:text-amber-400 font-semibold">
+              <Crosshair size={12} /> Editing
+            </span>
+            {selection.map((s) => (
+              <span
+                key={s.id}
+                className="flex items-center gap-1 pl-2 pr-1 py-0.5 rounded-full border border-amber-500/40 bg-amber-500/10"
+              >
+                <span className="font-mono font-bold">{s.id}</span>
+                {s.text && <span className="text-foreground/55 max-w-[180px] truncate">{s.text}</span>}
+                {onRemoveSelection && (
+                  <button
+                    type="button"
+                    onClick={() => onRemoveSelection(s.id)}
+                    className="p-0.5 rounded-full hover:bg-foreground/10 text-foreground/40"
+                    title="Remove from selection"
+                  >
+                    <X size={10} />
+                  </button>
+                )}
+              </span>
+            ))}
+          </div>
+        )}
+        {hasCad && !prompt && !selection.length && suggestions.length > 0 && (
           <div className="flex flex-wrap gap-1.5 mb-2">
             {suggestions.map((s) => (
               <button
@@ -65,6 +99,7 @@ export default function ChatInput({
             {isUploadingCad ? <Loader2 size={20} className="animate-spin text-purple-400" /> : <Paperclip size={20} />}
           </button>
           <textarea
+            ref={textareaRef}
             value={prompt}
             onChange={(e) => setPrompt(e.target.value)}
             onKeyDown={(e) => {
@@ -74,7 +109,9 @@ export default function ChatInput({
               }
             }}
             placeholder={
-              hasCad
+              hasCad && selection.length
+                ? `Describe the change to ${selection.map((s) => s.id).join(", ")}, e.g. “make it 2 mm bigger”…`
+                : hasCad
                 ? "Ask about the part or describe a change, e.g. “make H2 Ø8 mm”…"
                 : "Attach a CAD file to start, or ask a CAD question…"
             }

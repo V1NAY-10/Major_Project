@@ -73,11 +73,8 @@ flowchart LR
     LLM[("LLM provider<br/>Groq / any OpenAI-compatible")]
     DB[("MongoDB<br/>sessions · messages")]
     FS[("backend/data/sessions/&lt;id&gt;/<br/>FCStd · STL · meta.json")]
-    CL[("Clerk<br/>auth")]
 
     UI -- HTTP/JSON --> R
-    UI -. sign-in, session token .-> CL
-    R -. verify JWT via JWKS .-> CL
     R --> A
     R --> S
     A --> S
@@ -95,14 +92,14 @@ flowchart LR
 
 | Process | Started by | Port | Role |
 |---|---|---|---|
-| Next.js dev server | `npm run dev` in `frontend/` | 3000 | Serves the UI; Clerk middleware guards pages |
+| Next.js dev server | `npm run dev` in `frontend/` | 3000 | Serves the UI (no login: single-user local app) |
 | FastAPI (Uvicorn) | `python main.py` in `backend/` | 8000 | HTTP API, LLM agent, session store |
 | FreeCAD + bridge | Auto-launched by the backend, or by running `freecad_listener.py` | 6666 (localhost only) | Geometry kernel; executes engine methods |
 | MongoDB | External (e.g. Atlas) | — | Optional persistence of sessions and chat |
 | LLM provider | External | — | Groq by default (`openai/gpt-oss-120b`) |
 
-The browser only talks to the backend, and every request carries the user's Clerk session token. The backend
-is the only client of FreeCAD and of the LLM.
+The browser only talks to the backend; there is no login (single-user local app). The backend is the only
+client of FreeCAD and of the LLM.
 
 ---
 
@@ -120,8 +117,7 @@ Major_Project/
 │   ├── requirements.txt          fastapi, uvicorn, openai, pydantic, python-dotenv, motor, pymongo…
 │   ├── .env.example              Configuration template (copy to .env)
 │   ├── app/
-│   │   ├── auth.py               Clerk session-token verification (FastAPI dependency)
-│   │   ├── sessions.py           /sessions endpoints + session ownership checks
+│   │   ├── sessions.py           /sessions endpoints + session lookup
 │   │   ├── routes.py             /freecad/status, /cad/*, /chat endpoints + error mapping
 │   │   ├── cad_service.py        Per-session folders, meta.json, locks, versions, undo/redo, export
 │   │   ├── freecad_client.py     JSON-RPC client, FreeCAD executable discovery and auto-launch
@@ -139,20 +135,18 @@ Major_Project/
 └── frontend/
     ├── next.config.ts            Dev origins, server-action body limit
     └── src/
-        ├── middleware.ts         Clerk: every route except /sign-in and /sign-up requires auth
         ├── app/
-        │   ├── layout.tsx        ClerkProvider + ThemeProvider
-        │   ├── page.tsx          Main page: chat, upload, undo/redo, 3D workspace
-        │   ├── sign-in/…         Clerk sign-in page
-        │   └── sign-up/…         Clerk sign-up page
+        │   ├── layout.tsx        ThemeProvider, fonts
+        │   └── page.tsx          Main page: chat, upload, undo/redo, 3D workspace, selection
         ├── components/
         │   ├── chat/ChatMessage.tsx   Message bubble + operation cards with verified values
         │   ├── chat/ChatInput.tsx     Textarea, attach button, suggestions
         │   ├── cad/CADViewer.tsx      React Three Fiber STL viewer (Z-up)
-        │   ├── cad/ModelPanel.tsx     Size, features, parameters, version history
+        │   ├── cad/ModelPanel.tsx     Size, parts, features, dimensions, parameters, version history
+        │   ├── cad/SelectionInspector.tsx  Data + quick-edit buttons for the selected components
         │   └── ui/Sidebar.tsx         Session list, rename, new chat
         ├── hooks/useCADSession.ts     CAD state, upload, undo/redo, FreeCAD status polling
-        ├── lib/api.ts                 Backend URL, authenticated fetch helpers (token attached)
+        ├── lib/api.ts                 Backend URL, fetch helpers with readable errors
         └── types/                     cad.ts, chat.ts: TypeScript mirrors of backend JSON
 ```
 
@@ -172,7 +166,6 @@ Major_Project/
    - `CORSMiddleware` allows `http://localhost:3000`, `http://127.0.0.1:3000` and `http://192.168.x.x:3000`.
 3. `app.include_router(sessions.router)` and `app.include_router(router)` add the session and CAD/chat routes;
    `install_error_handlers(app)` maps domain errors to HTTP statuses (see [§13.4](#134-error-mapping)).
-   Importing `app.auth` prints a warning if `CLERK_SECRET_KEY` is missing or `AUTH_DISABLED=1`.
 4. In the `lifespan` handler (FastAPI's replacement for `on_event("startup")`), `init_db()` connects to MongoDB (5 s timeout + ping). On failure it prints a
    warning and the app keeps running with in-memory storage.
 5. `uvicorn.run("main:app", reload=True, reload_excludes=["data/*", "freecad_bridge/*"])`: the auto-reloader
@@ -214,9 +207,7 @@ sequenceDiagram
 
 ### 4.3 Frontend startup
 
-`npm run dev` starts Next.js. `src/middleware.ts` runs Clerk's `clerkMiddleware`: any route other than
-`/sign-in(.*)` and `/sign-up(.*)` calls `auth.protect()`, so unauthenticated users are redirected to sign-in.
-(Next.js 16 warns that the `middleware` file convention is deprecated in favour of `proxy`; it still works.)
+`npm run dev` starts Next.js. There is no middleware and no login.
 
 ---
 
@@ -289,9 +280,14 @@ with a traceback (unexpected; also printed to FreeCAD's report view).
 | `ping` | — | `{pong, gui, version}` | Health check |
 | `open_model` | `session_id, source_path, work_path, registry?` | `{info, registry}` | Import the uploaded file into a new document, save as `work.FCStd`, analyse |
 | `reload` | `session_id, work_path, registry?` | `{info, registry}` | Close and re-open `work.FCStd` (after undo/redo) |
-| `model_info` | `session_id, work_path, registry?` | `{info, registry}` | Re-analyse the current document |
+| `model_info` | `session_id, work_path, registry?` | `{info, registry, manual_edit}` | Re-analyse the current document; `manual_edit` = the user changed the geometry by hand in FreeCAD (§11.7) |
 | `apply` | `session_id, work_path, op, params, registry` | `{message, verified, volume_before, volume_after, info, registry}` | Run one edit operation transactionally |
-| `find_features` | `session_id, work_path, registry, kind?, diameter_min?, diameter_max?, normal?, near?, object?, limit?` | `{features, total, registry}` | Filtered/sorted feature query |
+| `find_features` | `session_id, work_path, registry, kind?, diameter_min?, diameter_max?, normal?, near?, object?, limit?` | `{features, total, registry}` | Filtered/sorted feature query (`object` = name or label) |
+| `dimensions` | `session_id, work_path, registry, object?, feature?, type?, limit?` | `{dimensions, total, patterns, registry}` | Driving dimensions (§7.9), filtered |
+| `highlight` | `session_id, work_path, ids, registry, select?, zoom?` | `{meshes: [{id, kind, positions, indices}], missing, registry}` | Triangles of features / dimensions / patterns for the web viewer; selects them in the FreeCAD GUI |
+| `pick` | `session_id, work_path, point, registry, mode?` | `{id, feature, part, face, distance, registry}` | The component under a point clicked in the web viewer (§8.4) |
+| `gui_selection` | `session_id, work_path, registry` | `{ids, gui, registry}` | What is selected in the FreeCAD window, as feature / part IDs (§8.4) |
+| `show_window` | `session_id?, work_path?` | `{shown}` | Bring FreeCAD and the session document to the front |
 | `measure` | `session_id, work_path, a, b, registry` | distances (see [§9.3](#93-query-methods)) | Measure between features, objects or points |
 | `list_objects` | `session_id, work_path, registry, name_contains?` | `{objects, total, overall_bbox, registry}` | Every solid object, largest first, with parent assembly and bbox |
 | `snapshot` | `session_id, work_path, fcstd_path, stl_path` | paths | Save, copy to `vN.FCStd`, mesh to `vN.stl` |
@@ -445,7 +441,61 @@ For `.FCStd` files the engine also reports:
 
 `is_parametric` is true when there are parametric objects or sketches.
 
-### 7.7 Model info structure (`_model_info`)
+### 7.7a B-spline and other non-analytic faces (`analysis.surface_info`)
+
+Some exporters write every face as a B-spline. `surface_info` reads analytic surfaces directly and otherwise
+fits one: `Face.findPlane` for planes; for the rest it samples a 9×9 grid of points and normals inside the
+face and fits with numpy:
+
+- **sphere**: all normal lines meet in one point (least squares), with constant radius;
+- **cylinder**: normals are perpendicular to the axis, so the axis is the eigenvector of `NᵀN` with eigenvalue ≈ 0;
+  the axis position is where the normal lines' projections meet; the radius must be constant;
+- **cone**: normals make a constant angle with the axis (`N·a = const`); radius is linear along the axis.
+
+A fit is accepted when its residual is below `max(10·tol, 1e-4)`. The angular span of a fitted cylinder
+(full hole vs partial fillet) is measured from points on its boundary. Faces that match nothing are counted
+per object as `unrecognized_faces`, so the UI can say the parse is incomplete.
+
+Every face that no rule classifies becomes a **free-form face feature** (`kind: "face"`, ID `F#`, with
+`surface`, `area`, `center`, `position`), so every face of every part has exactly one ID (checked by the test
+suite on all fixtures). It is still counted in `unrecognized_faces`.
+
+### 7.7b Countersinks and counterbores
+
+A countersink's depth and entry now include the cone: a Ø5 hole with a 90° Ø10 countersink in a 10 mm plate
+reports `depth 10` and its entry on the top face. A **counterbore** is a larger blind, flat-bottomed hole whose
+floor meets an open end of a smaller coaxial hole (`analysis.link_counterbores`). The smaller hole gets
+`counterbore: {diameter, depth, feature}` and its entry/depth cover the whole stack; the larger keeps its own ID
+with `counterbore_of`. Moving a hole moves its counterbore; resizing it refuses a size larger than its counterbore.
+
+### 7.8 Hole patterns (`analysis.hole_patterns`)
+
+Holes are grouped by object, diameter, axis, through/depth and entry plane. Groups of ≥ 3 are tested, in order:
+
+| Pattern | Test | Reported |
+|---|---|---|
+| `circular` | centres fit a circle (algebraic fit, residual < 10·tol) with equal angular steps (full circle or arc) | `pcd, count, angle_step_deg, start_angle_deg, full_circle, center, axis, ref_dir` |
+| `grid` | centres form a complete `nu × nv` grid along the in-plane axes with uniform spacing | `count_u, count_v, spacing_u, spacing_v, dir_u, dir_v, center` |
+| `linear` | centres are collinear with uniform spacing | `spacing, count, direction, start` |
+
+Patterns get IDs `PAT1…` (ordered by their first hole) and each member hole carries `pattern`.
+
+### 7.9 Driving dimensions (`analysis.dimensions`)
+
+The dimension layer is what lets a request like "make it 120 long" become one exact operation. Per object:
+
+- **Plane pairs with opposite normals.** For each face, the nearest opposite face whose projection overlaps it
+  (a point on face A whose projection lands on face B) is found on each side. The midpoint between them is
+  probed: inside material → `thickness`, in air → `gap` (slot / pocket width).
+- **Overall sizes** (`extent`): the largest outermost faces at the bounding-box limits on X, Y and Z.
+- **Hole positions** (`edge_distance`): for each hole, the nearest face parallel to its axis on the material side,
+  one per direction, provided the hole's projection lands on that face.
+
+Each dimension is `{id, type, value, refs, axis, object, label}` where `id` is the two feature IDs, e.g. `P5-P6`
+or `H3-P5` (lower coordinate first for plane pairs). Because the IDs are stable, dimension IDs are too. Dimensions
+are computed lazily and cost ~0.25 s for a 30-part assembly.
+
+### 7.10 Model info structure (`_model_info`)
 
 ```json
 {
@@ -457,6 +507,8 @@ For `.FCStd` files the engine also reports:
   "bbox": {"min": [...], "max": [...], "size": [100, 60, 10]},
   "features": {"hole": [...], "boss": [...], "round": [...], "plane": [...], "cone": [...], "sphere": [...]},
   "counts": {"hole": 4, "plane": 10, "round": 4},
+  "patterns": [{"id": "PAT1", "type": "grid", "holes": ["H1", "H2", "H3", "H4"], "spacing_u": 80, "spacing_v": 40, "...": "..."}],
+  "dimensions": [{"id": "P5-P6", "type": "extent", "value": 100.0, "refs": ["P5", "P6"], "label": "overall X size"}],
   "parametric": [...], "sketches": [...], "spreadsheets": [...],
   "is_parametric": false
 }
@@ -492,6 +544,12 @@ features against it on every analysis.
 - Spheres: centre `c`, radius `r`.
 - `next` holds the next number per prefix. **Numbers are never reused**, so a removed `H2` stays gone and a
   new hole becomes `H5`, not `H2`.
+
+- Free-form faces (`F#`): centre `c` and area; matched when the centre is within 10·tol and the area within 0.1 %.
+- `parts` maps each solid object's FreeCAD name to its **part ID** `B#` (`next["B"]`). Object names never
+  change inside a document, so part IDs are stable across edits; deleted parts' IDs are not reused. Every
+  feature carries `part`, `objects[]` carry `id`, and any `object` parameter (tools, `find_features`,
+  `dimensions`) accepts a part ID.
 
 The registry is stored in `meta.json` by the backend and sent with every RPC call.
 
@@ -552,7 +610,9 @@ produce *"Unknown feature id … Use get_model_info / find_features"* so the LLM
 | `move_hole` | `hole`, `offset` or `to` | Only the component **perpendicular** to the hole axis is used (a hole can't move along its own axis). Fill the old hole, cut an identical one (tip, countersinks) on the shifted axis. |
 | `add_holes` | `face` (plane), `diameter`, `positions?`, `depth?` | Each position is projected onto the face plane and must lie inside the face. A cylinder starts a margin above the face and goes along −normal: through (depth = 2 × diag) or blind (given depth). No positions → face centre. Multiple holes are cut in one boolean. |
 | `remove_features` | `features[]` | Groups by object, then calls OpenCASCADE **defeaturing** on all the feature's faces (walls, caps, countersink cones). If defeaturing changes nothing or yields an invalid shape: a single hole is plugged exactly; otherwise it errors with "try removing them one at a time". |
-| `push_pull_face` | `face`, `distance` | Extrudes the planar face along its outward normal by `distance` into a prism; **fuse** if positive (adds material), **cut** if negative (removes). |
+| `set_dimension` | `dimension` (e.g. `"P5-P6"`, `"H3-P5"`, `"H1-H2"`), `value`, `anchor?` | Plane–plane: moves the faces so the distance is exact; `anchor` = `start` (first ID stays, default), `end` (second stays) or `symmetric`. Hole–plane: moves the hole (and its counterbore) along the face normal. Hole–hole: moves the holes along the line joining them. Any parallel pair works, not only listed dimensions. Verified by re-measuring the dimension. |
+| `edit_hole_pattern` | `pattern`, `pcd?`, `count?`, `start_angle?`, `spacing?`, `spacing_u?`, `spacing_v?`, `anchor?` | Computes the new hole positions (`analysis.pattern_positions`), fills all holes in one defeaturing pass and re-cuts them (tips, countersinks, counterbores kept). Count changes keep the surviving IDs; grids can't change count. Verified by re-detecting the pattern. |
+| `push_pull_face` | `face`, `distance` | Extrudes the planar face along its outward normal by `distance` into a prism; **fuse** if positive (adds material), **cut** if negative (removes). Holes, countersinks and counterbores that open on the face are re-cut relative to its new position, so blind features keep their depth below it and through holes just get longer. |
 | `set_face_distance` | `face`, `reference_face`, `distance` | Faces must be parallel. Computes the current signed distance along `face`'s normal and push/pulls `face` by the difference, so the distance becomes exact. The reference stays fixed. Used for "make it 120 mm long". |
 | `fillet_edges` | `radius`, `edges[]`, `object?` | Resolves edges via selectors (below), keeps only **sharp** edges, calls `makeFillet`. Verification expects a new round with that radius. |
 | `chamfer_edges` | `size`, `edges[]`, `object?` | Same selection; `makeChamfer` with equal distance. |
@@ -690,17 +750,15 @@ works without MongoDB (data is lost on restart).
 
 ### 11.4 Sessions (`app/sessions.py`)
 
-Sessions are chat threads owned by a Clerk user ID. The user always comes from the verified token
-([§11.6](#116-authentication-appauthpy)), never from the request body or query.
+Sessions are chat threads. The app is single-user with no login, so every session is visible.
 
-- `GET /sessions` lists the user's sessions, newest first (max 200).
+- `GET /sessions` lists all sessions, newest first (max 200).
 - `POST /sessions` creates one (`title` is the first message or `CAD: <filename>`; stored up to 120 chars).
-- `PATCH /sessions/{id}` renames (owner only).
-- `GET /sessions/{id}` and `GET /sessions/{id}/messages` (owner only).
-- `require_owned(session_id, user)` returns the session or raises **404** (not 403, so the existence of other
-  users' sessions isn't revealed). The CAD and chat routes use it too.
+- `PATCH /sessions/{id}` renames.
+- `GET /sessions/{id}` and `GET /sessions/{id}/messages`.
+- `require_session(session_id)` returns the session or raises **404**. The CAD and chat routes use it too.
 
-`_session_out` returns a **whitelist** of fields (`id, title, user_id, created_at, cad_filename`). Session
+`_session_out` returns a **whitelist** of fields (`id, title, created_at, cad_filename`). Session
 documents created by older versions of the app contain binary fields that are not JSON-serialisable;
 whitelisting keeps them out of responses. `cad_filename` comes from the session's `meta.json`.
 
@@ -709,7 +767,8 @@ names the folder under `data/sessions/`.
 
 ### 11.5 Messages (`app/messages.py`)
 
-`add(session_id, role, content, operations?, version?, kind?)` stores a message with a UTC timestamp.
+`add(session_id, role, content, operations?, version?, kind?, selection?)` stores a message with a UTC
+timestamp; `selection` holds the IDs selected in the viewer when a user message was sent.
 `kind` is one of `upload`, `undo`, `redo`, `error`, or absent for normal chat.
 
 `history_for_llm(session_id)` builds the conversation history sent to the LLM:
@@ -719,33 +778,41 @@ names the folder under `data/sessions/`.
 - each content cut to `LLM_HISTORY_MESSAGE_CHARS` (default 1,500),
 - assistant messages get a suffix listing the edits they applied and the model version
   (`[Edits applied: H2: Ø6 → Ø8 mm]`, `[Model version 3]`), so the LLM knows what already happened even if the
-  text reply was short.
+  text reply was short; user messages sent with a selection get `[Selected: H3]`.
 
-### 11.6 Authentication (`app/auth.py`)
+### 11.6 Selection (`/cad/pick`, `/cad/freecad-selection`, `/chat` `selection`)
 
-```mermaid
-sequenceDiagram
-    participant FE as Frontend (Clerk)
-    participant BE as Backend
-    participant CK as Clerk API
-    FE->>FE: getToken() → short-lived session JWT (RS256)
-    FE->>BE: request + Authorization: Bearer <JWT>
-    BE->>CK: GET /v1/jwks (first time, then cached 1 h; Bearer CLERK_SECRET_KEY)
-    CK-->>BE: public signing keys
-    BE->>BE: verify signature, exp (10 s leeway), require sub
-    BE->>BE: user = sub → ownership check on the session
-```
+There is no authentication; the backend serves one local user. Instead this section covers how the user points
+at a component:
 
-- `current_user` is a FastAPI dependency used by every `/sessions`, `/cad/*` and `/chat` endpoint.
-  `/` and `/freecad/status` are public.
-- Missing header → 401 *"Not signed in"*; expired → 401 *"Session expired"*; bad token → 401; Clerk
-  unreachable → 503; `CLERK_SECRET_KEY` unset → 500 *"Server authentication is not configured"*.
-- The JWKS request sends a `User-Agent` header (Clerk's edge rejects Python's default one with 403).
-- **`AUTH_DISABLED=1`** turns verification off for local testing; the user is then `?user_id=` or `"local"`.
-- Binary endpoints (`/cad/model`, `/cad/download`) are protected too, so the frontend fetches them with the
-  header and turns the response into a blob ([§14.2](#142-backend-url-and-requests-libapits)).
+- **Click in the web viewer**: the viewer sends the clicked point on the STL to `POST /cad/pick/{id}`; the
+  engine returns the feature whose face is nearest (or the part in `mode: "part"`).
+- **From FreeCAD**: `GET /cad/freecad-selection/{id}` maps what is selected in the FreeCAD window to IDs.
+- **Panel**: any ID chip selects it.
+- The selected IDs are highlighted in both views (`/cad/highlight`) and sent with the next message as
+  `selection`. The runner first tries the fast path with the ID filled in (one selected `H2` + `Ø8` →
+  `H2 Ø8`; `P5-P6` + `120` → `P5-P6 = 120`); otherwise it appends `[Selected in the viewer: …]` with each
+  component's key data to the LLM user message (`prompt.with_selection`), and the system prompt tells the model
+  that "this"/"it" means the selection.
 
 ---
+
+### 11.7 FreeCAD side by side and manual edits
+
+- **Pre-launch**: with `FREECAD_PRELAUNCH=1` (default unless autostart is off) the backend starts FreeCAD in a
+  background thread at startup. When the backend launches FreeCAD it passes `AETHERCAD_BACKEND`, so the
+  listener finds the bridge code.
+- **Window layout**: on the first model opened in a FreeCAD session, the engine moves the main window to the right
+  half of the screen (`FREECAD_WINDOW=right|left|max|none`) and raises it; `/cad/show` brings it back.
+- **Manual edits**: after every save and load the engine records a geometry signature (per solid: volume, area,
+  face count, bbox). `model_info` compares it with the current document; if it changed, the user edited the model
+  in the FreeCAD window, so the engine saves and returns `manual_edit: true`. The runner (at the start of each
+  turn) and `activate` then commit that state as a version "Manual edit in FreeCAD", so it can be undone and the
+  LLM sees current data. (FreeCAD's own GUI *Modified* flag isn't used: it is set by view changes on open and
+  isn't cleared reliably by saving.)
+- **Highlighting**: `/cad/highlight/{id}` returns feature triangles that the web viewer draws in amber over the
+  STL and selects the same faces in FreeCAD (through `App::Part` containers). Chat replies include `highlight`
+  IDs (edited features + IDs mentioned in the reply).
 
 ## 12. The AI agent
 
@@ -909,8 +976,7 @@ change them.
 ## 13. HTTP API reference
 
 Base URL: `http://127.0.0.1:8000`. All bodies are JSON unless noted. Errors are `{"detail": "<message>"}`.
-Every endpoint except `GET /` and `GET /freecad/status` requires `Authorization: Bearer <Clerk session token>`
-([§11.6](#116-authentication-appauthpy)); session-specific endpoints return 404 unless the caller owns the session.
+There is no authentication. Session-specific endpoints return 404 for an unknown session.
 
 ### 13.1 Sessions (`main.py`)
 
@@ -918,12 +984,12 @@ Every endpoint except `GET /` and `GET /freecad/status` requires `Authorization:
 |---|---|---|
 | `GET /` | — | `{"message": "AetherCAD backend is running"}` |
 | `GET /sessions` | — | `[Session]` of the signed-in user, newest first |
-| `POST /sessions` | `{title}` | `Session` owned by the signed-in user |
+| `POST /sessions` | `{title}` | `Session` |
 | `PATCH /sessions/{id}` | `{title}` | `{id, title}` |
 | `GET /sessions/{id}` | — | `Session` |
 | `GET /sessions/{id}/messages` | — | `[Message]` oldest first |
 
-`Session = {id, title, user_id, created_at, cad_filename}`
+`Session = {id, title, created_at, cad_filename}`
 
 ### 13.2 CAD (`routes.py`)
 
@@ -935,12 +1001,17 @@ Every endpoint except `GET /` and `GET /freecad/status` requires `Authorization:
 | `POST /cad/activate/{session_id}` | — | `CadState` (re-analysed; document brought to front in FreeCAD) |
 | `POST /cad/undo/{session_id}` | — | `CadState`; stores an `undo` message |
 | `POST /cad/redo/{session_id}` | — | `CadState`; stores a `redo` message |
+| `POST /cad/highlight/{session_id}` | `{ids, select?}` | `{meshes, missing}`: triangles per ID (features, dimensions, patterns, parts); also selects them in FreeCAD |
+| `POST /cad/pick/{session_id}` | `{point: [x,y,z], mode?: "feature"\|"part"}` | `{id, feature, part, face, distance}` (`id` null when nothing is there) |
+| `GET /cad/freecad-selection/{session_id}` | — | `{ids, gui}` |
+| `POST /cad/show/{session_id}` | — | `{shown}` |
 | `GET /cad/model/{session_id}` | `?v=` (default head) | STL file (`model/stl`, `Cache-Control: no-store`) |
 | `GET /cad/download/{session_id}` | `?format=step\|iges\|stl\|fcstd\|brep` | File attachment `<stem>_v<N>.<ext>` |
 
 ### 13.3 Chat
 
-`POST /chat` with `{session_id, message}` → `{message: Message, state: CadState | null}`.
+`POST /chat` with `{session_id, message, selection?}` → `{message: Message, state: CadState | null, highlight}`.
+`selection` = IDs the request applies to (§11.6).
 
 Order of work: build history → store the user message → `run_turn` → store the assistant message (with
 `operations` and `version`) → return it with the new state. On a known error the backend stores
@@ -953,7 +1024,6 @@ Order of work: build history → store the user message → `run_turn` → store
 | `CadError` | its own status (400 default; 404 no model / missing version; 422 FreeCAD import failure) |
 | `LLMError` | its own status (429, 413, 500, 502) |
 | `FreeCADUnavailable` | 503 |
-| Auth (`HTTPException` from `current_user`) | 401 / 500 / 503 (see §11.6) |
 | `FreeCADError` | 500 (`"FreeCAD error: …"`) |
 | anything else | 500 via `_json_errors` (`"Server error: …"`) |
 
@@ -961,11 +1031,9 @@ Order of work: build history → store the user message → `run_turn` → store
 
 ## 14. Frontend
 
-### 14.1 Authentication
+### 14.1 No login
 
-`ClerkProvider` wraps the app (`layout.tsx`); `middleware.ts` protects every page except sign-in/sign-up.
-`page.tsx` registers Clerk's `getToken` with `setAuthTokenGetter`, so every backend request carries a fresh
-session token; the backend derives the user from it.
+The app has no authentication: it is a single-user tool run locally next to FreeCAD.
 
 ### 14.2 Backend URL and requests (`lib/api.ts`)
 
@@ -975,11 +1043,10 @@ another device on the LAN.
 
 | Helper | Purpose |
 |---|---|
-| `setAuthTokenGetter(fn)` | Registers the token source (Clerk `getToken`) |
-| `authFetch(path, init)` | `fetch` with `Authorization: Bearer <token>`; network failure → *"Cannot reach the backend…"* |
-| `apiFetch<T>(path, init)` | `authFetch` + JSON; non-2xx → `ApiError(detail, status)` |
+| `backendFetch(path, init)` | `fetch` against the backend; network failure → *"Cannot reach the backend…"* |
+| `apiFetch<T>(path, init)` | `backendFetch` + JSON; non-2xx → `ApiError(detail, status)` |
 | `postJson<T>(path, body)` | JSON POST via `apiFetch` |
-| `apiBlob(path)` | `authFetch` for binaries; returns the blob and the filename from `Content-Disposition` (exposed by CORS) |
+| `apiBlob(path)` | `backendFetch` for binaries; returns the blob and the filename from `Content-Disposition` (exposed by CORS) |
 
 ### 14.3 Main page (`app/page.tsx`)
 
@@ -991,10 +1058,11 @@ comes from `useCADSession()`, FreeCAD status from `useFreeCADStatus()`.
 | **Select a session** | Effect loads `GET /cad/state` (+ fire-and-forget `POST /cad/activate`) and `GET /sessions/{id}/messages`. |
 | **New chat** | Clears all local state. A session is created lazily by `ensureSession()` on first upload or message (title = file name or message). The `createdHere` ref prevents the select-effect from refetching a session this page just created. |
 | **Upload** (button or drag-and-drop) | `ensureSession` → `POST /cad/upload` → set CAD state → reload messages (to show the upload summary). |
-| **Send** | Optimistically shows the user message → `POST /chat` → append the assistant message, update CAD state. On error: show the banner, restore the prompt, reload the transcript from the backend. |
+| **Send** | Optimistically shows the user message → `POST /chat` (with the current `selection`) → append the assistant message, update CAD state, re-highlight the selection (or the reply's IDs when nothing is selected). On error: show the banner, restore the prompt, reload the transcript from the backend. |
 | **Undo / Redo** | `POST /cad/undo|redo` → new state → reload messages. Buttons are disabled when `can_undo`/`can_redo` is false or a request is running. |
-| **Click a feature ID** | `insertRef` appends it to the prompt. |
-| **Download** | `download(format)` fetches `/cad/download/{id}?format=…` with the token via `apiBlob`, then saves it through a temporary object-URL link (a plain `<a href>` can't send the auth header). |
+| **Select** | Click the model (viewer, Feature/Part mode), an ID chip, or "From FreeCAD" → `selection` state → highlighted in both views, shown in the `SelectionInspector` and as chips in the input; Shift/Ctrl+click toggles. Cleared on new chat / session switch / upload. |
+| **Click a dimension** | Selects it and puts `P5-P6 = ` in the prompt. |
+| **Download** | `download(format)` fetches `/cad/download/{id}?format=…` via `apiBlob`, then saves it through a temporary object-URL link (so a backend error message can be shown). |
 
 The header shows file name and version, undo/redo, and a FreeCAD badge (green "FreeCAD" with version and
 GUI/headless on hover, or amber "FreeCAD offline").
@@ -1008,7 +1076,7 @@ GUI/headless on hover, or amber "FreeCAD offline").
 
 ### 14.5 3D viewer (`CADViewer.tsx`)
 
-- Fetches the STL with the auth header (`apiBlob`), parses it with three-stdlib's `STLLoader.parse`, computes
+- Fetches the STL (`apiBlob`), parses it with three-stdlib's `STLLoader.parse`, computes
   vertex normals, renders a single
   `MeshStandardMaterial` mesh with an `Edges` overlay (edges whose angle exceeds 25°).
 - **Z-up camera** (`up: [0,0,1]`), matching FreeCAD, so the part appears as it does in FreeCAD; a gizmo
@@ -1016,13 +1084,19 @@ GUI/headless on hover, or amber "FreeCAD offline").
 - `Bounds fit` frames the model. The `<Canvas key={fitKey}>` uses `session_id:filename`, so the camera
   re-frames for a new file but **keeps your view** when only the version changes.
 - `OrbitControls` for rotate/pan/zoom.
+- **Click to pick**: a click on the model (pointer moved ≤ 4 px, so orbit drags don't count) calls
+  `onPick(point, additive)`; highlight meshes don't intercept the ray. A `toolbar` slot holds the
+  Feature/Part mode switch and the "From FreeCAD" button.
 
 ### 14.6 Model panel (`ModelPanel.tsx`)
 
 - Overall X/Y/Z size tiles, object count, total volume.
 - **Features** tab: holes (Ø, through/depth, countersink, entry point, position), bosses, fillets, planar
-  faces (largest first, caps hidden, up to 60), cones. Every ID is a clickable chip that inserts it into the
-  prompt.
+  faces (largest first, caps hidden, up to 60), free-form faces, cones, and a **Parts** list with part IDs.
+  Every ID is a chip that selects the component (Shift+click adds); selected chips are drawn in amber.
+- **Selection inspector** (`SelectionInspector.tsx`, between the viewer and the panel): one card per selected
+  ID with all its data (sizes, depth, countersink/counterbore, normal, entry, centre, area, part), related IDs,
+  its dimensions (click to set) and quick-edit buttons that start the message (e.g. `Ø`, "Move it by…").
 - **Parameters** tab: parametric objects and their properties (ƒ marks expression-driven ones), sketch
   constraints and spreadsheet aliases, all clickable. For B-rep models it explains there is no parametric
   data.
@@ -1033,7 +1107,7 @@ GUI/headless on hover, or amber "FreeCAD offline").
 - `ChatMessage` renders assistant text as Markdown, a version badge (`v3`), a copy button, and an
   **operation card** per edit: green/red status, tool label, first line of the message or the error, ✓ chips
   for verified values (`✓ H2 diameter = 8.000`), ⚠ warnings for unverifiable values, and new feature IDs.
-- `ChatInput`: textarea (Enter sends, Shift+Enter newline), attach button limited to
+- `ChatInput`: "Editing" chips for the selected components (removable), textarea (Enter sends, Shift+Enter newline), attach button limited to
   `.step,.stp,.iges,.igs,.brep,.brp,.fcstd`, and suggestion chips while the conversation is new.
 - `Sidebar`: lists sessions (`GET /sessions`), inline rename (`PATCH`), new chat. Switching chats only
   changes the selected ID; the page then calls `/cad/state` and `/cad/activate`.
@@ -1051,7 +1125,7 @@ sequenceDiagram
     participant BE as Backend
     participant FC as FreeCAD engine
     U->>FE: drop bracket.step
-    FE->>BE: POST /sessions {title:"CAD: bracket.step"} + Bearer token
+    FE->>BE: POST /sessions {title:"CAD: bracket.step"}
     BE-->>FE: {id: "6ac95…"}
     FE->>BE: POST /cad/upload (file, session_id)
     BE->>BE: validate ext, write original.step (lock held)
@@ -1180,9 +1254,6 @@ TypeScript mirrors are in `frontend/src/types/cad.ts` and `chat.ts`.
 
 | Variable | Default | Read in | Meaning |
 |---|---|---|---|
-| `CLERK_SECRET_KEY` | — | auth | Clerk secret (same as frontend) used to fetch the JWKS; required unless `AUTH_DISABLED=1` |
-| `CLERK_JWKS_URL` | `https://api.clerk.com/v1/jwks` | auth | JWKS endpoint |
-| `AUTH_DISABLED` | `0` | auth | `1` = no token verification (local testing only) |
 | `AGENT_ALLOW_PYTHON` | `0` | tools | `1` = offer and allow `run_freecad_python` |
 | `GROQ_API_KEY` | — | runner | LLM key (fallback) |
 | `LLM_API_KEY` | — | runner | LLM key (wins over `GROQ_API_KEY`) |
@@ -1203,14 +1274,14 @@ TypeScript mirrors are in `frontend/src/types/cad.ts` and `chat.ts`.
 | `FREECAD_GUI_EXE` / `FREECAD_CMD_EXE` | auto | freecad_client | Executable paths |
 | `FREECAD_HOST` / `FREECAD_PORT` | `127.0.0.1` / `6666` | freecad_client, server.py | Bridge address; the bridge reads `FREECAD_PORT` from FreeCAD's environment (the auto-launched FreeCAD inherits the backend's) |
 | `AETHERCAD_DATA` | `backend/data` | cad_service | Data root (`sessions/` inside it) |
-| `AETHERCAD_BACKEND` | `C:\VINAY_MAIN\Major_Project\backend` | freecad_listener | Backend folder when the listener is `exec`'d from the console (no `__file__`) |
+| `AETHERCAD_BACKEND` | set by the backend when it launches FreeCAD; else the folder of the listener script on the command line | freecad_listener | Backend folder when the listener has no `__file__` |
+| `FREECAD_PRELAUNCH` | `1` (unless autostart is `off`) | main | Start FreeCAD when the backend starts |
+| `FREECAD_WINDOW` | `right` | engine (inside FreeCAD) | FreeCAD window placement: `right`, `left`, `max`, `none` |
 
 ### 17.2 `frontend/.env.local`
 
 | Variable | Meaning |
 |---|---|
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY` | Clerk keys (the secret is also needed in `backend/.env`) |
-| `NEXT_PUBLIC_CLERK_SIGN_IN_URL`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | Sign-in/up routes |
 | `NEXT_PUBLIC_API_URL` | Optional backend URL override |
 
 `next.config.ts` lists `allowedDevOrigins` (LAN IP for dev access from other devices) and a 20 MB server-action
@@ -1222,10 +1293,6 @@ body limit.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `Not signed in` / `Invalid session token` (401) | Missing/invalid Clerk token | Sign in again; reload the page. |
-| `Server authentication is not configured` (500) | `CLERK_SECRET_KEY` missing in `backend/.env` | Copy it from `frontend/.env.local`, restart. |
-| `Could not reach Clerk to verify the session` (503) | No internet / Clerk down | Retry; for offline work set `AUTH_DISABLED=1`. |
-| Session list empty after enabling auth | Sessions are stored per Clerk user id | Sessions created with another user id (or `local`) belong to that user. |
 | AI picks the wrong face as "top" | Model is Y-up | Name the part ("the table top") or the face ID; the agent identifies parts by label and size. |
 | Badge says **FreeCAD offline** | Nothing listening on 6666 | Normal before first use; it launches on the next CAD request. Or run `freecad_listener.py` in FreeCAD. |
 | `FreeCAD is not running and its executable was not found` | Auto-discovery failed | Set `FREECAD_GUI_EXE` (or `FREECAD_CMD_EXE` for headless). |
@@ -1252,9 +1319,7 @@ body limit.
 
 | Former issue | Fix |
 |---|---|
-| No auth on `/cad/*` and `/chat`; anyone with a session ID could read or edit it | Clerk JWT verification on every endpoint + ownership checks (§11.6) |
-| `PATCH /sessions/{id}` didn't check ownership | Owner-only via `require_owned` |
-| `user_id` taken from the query string (spoofable) | User comes only from the verified token |
+| Clerk sign-in was required for a single-user local tool | Removed: no login; all sessions are visible |
 | Sidebar called non-existent `/sessions/{id}/sync` and `/sessions/new/sync` | Calls removed |
 | Assembly containers (`App::Part`) analysed as solids, duplicating ~2/3 of all features | Containers skipped (§6.2) |
 | Large parts dropped from the LLM summary of big assemblies | Objects sorted by volume; `list_objects` tool |
@@ -1272,15 +1337,25 @@ body limit.
 - **Editing a parametric object with a B-rep tool** still produces a plain `AIEdit` solid (FreeCAD can't write
   arbitrary B-rep edits back into a feature tree). The prompt steers the LLM to parametric tools first and the
   user is told when it happens.
-- **Recognition covers analytic surfaces only** (planes, cylinders, cones, spheres, tori). B-spline faces aren't
-  classified; slots, pockets and patterns are not single features (a slot appears as planes + partial
-  cylinders). Planned in phase 3 of [PLAN.md](PLAN.md).
+- **Recognition**: B-spline faces are fitted to planes/cylinders/cones/spheres; free-form faces stay unclassified
+  (counted as `unrecognized_faces`). Slots and pockets are not single features, but their widths and depths show up
+  as `gap` / `thickness` dimensions. Patterns are recognised for holes only.
+- **Face moves** keep a fillet along the moved face's edge where it was, and pushing a face past the top of a boss
+  standing on it leaves a pocket above the boss. Grid patterns can't change their hole count.
 - **Orientation**: face labels use global axes. Y-up models (common from SolidWorks) get "top" labels on the
   wrong faces; the agent compensates using part labels and sizes, but naming the part helps.
 - **Single process / single FreeCAD**: per-session locks and memory-mode storage live in one backend process,
   and one FreeCAD instance serves all sessions sequentially. Run one backend worker; long edits queue others.
 - **Viewer**: single-colour STL without face picking or highlighting (phase 2 of the plan).
 - **Free-tier LLM limits**: 8 k tokens/minute on Groq free; multi-step turns pause while waiting (§12.5).
+
+### Tests
+
+`backend/tests/test_engine.py` (run with `freecadcmd`) builds parts with known ground truth (`tests/fixtures.py`),
+round-trips them through STEP like a real upload, and checks recognition (holes, countersinks, counterbores,
+drill tips, bosses, fillets, patterns, dimensions, assemblies, B-spline faces) and every edit against independent
+measurements (bounding boxes, analytic volume changes, re-analysis), plus ID stability, rollback, highlight and
+performance — 153 checks, ~10 s. `backend/app/agent/test_fastpath.py` covers the fast-path parser.
 
 ## 20. Extending AetherCAD
 
@@ -1319,7 +1394,7 @@ raise `MODEL_SUMMARY_CHARS`, `LLM_HISTORY_MESSAGES` and `LLM_INPUT_TOKEN_BUDGET`
 | **B-rep** | Boundary representation: a solid described by its faces, edges and vertices (what STEP/IGES contain). |
 | **Bridge** | The JSON-RPC server running inside FreeCAD (`freecad_bridge/server.py`). |
 | **Engine** | The code inside FreeCAD that analyses and edits geometry (`freecad_bridge/engine.py`). |
-| **Feature** | A recognised geometric element with an ID: hole `H`, boss `C`, round/fillet `R`, plane `P`, cone `K`, sphere `S`. |
+| **Feature** | A recognised geometric element with an ID: hole `H`, boss `C`, round/fillet `R`, plane `P`, cone `K`, sphere `S`, free-form face `F`. Whole parts have part IDs `B`. |
 | **Registry** | The map of feature IDs to geometric descriptors used to keep IDs stable across edits. |
 | **Cap** | A planar face that closes the bottom of a blind hole (hidden from lists). |
 | **Defeaturing** | OpenCASCADE operation that removes faces and heals the solid as if the feature had never been modelled. |

@@ -172,6 +172,52 @@ async def refresh_info(meta):
     return res["info"]
 
 
+async def sync_manual_edits(meta):
+    """Re-analyse the document; if the user edited it by hand in FreeCAD, record that as a new version.
+
+    Returns True when a manual edit was found. Callers must hold the session lock.
+    """
+    res = await query(meta, "model_info")
+    meta["info"] = res["info"]
+    if res.get("manual_edit"):
+        await commit_version(meta, "Manual edit in FreeCAD")
+        return True
+    return False
+
+
+async def highlight(session_id, ids, select=True):
+    """Meshes of the given features for the web viewer; also selects them in the FreeCAD GUI."""
+    async with lock(session_id):
+        meta = require(session_id)
+        res = await query(meta, "highlight", ids=list(ids or [])[:50], select=bool(select))
+        save(meta)
+        return {"meshes": res.get("meshes", []), "missing": res.get("missing", [])}
+
+
+async def pick(session_id, point, mode="feature"):
+    """The component (feature or part ID) under a point clicked in the web viewer."""
+    async with lock(session_id):
+        meta = require(session_id)
+        res = await query(meta, "pick", point=[float(x) for x in point][:3], mode=mode)
+        save(meta)
+        return res
+
+
+async def gui_selection(session_id):
+    """IDs of what is selected in the FreeCAD window."""
+    async with lock(session_id):
+        meta = require(session_id)
+        res = await query(meta, "gui_selection")
+        save(meta)
+        return res
+
+
+async def show_window(session_id):
+    async with lock(session_id):
+        require(session_id)
+        return await fc.call("show_window", session_id=session_id, work_path=_p(work_path(session_id)))
+
+
 async def commit_version(meta, description):
     """Snapshot the working document as a new version (drops any redo history)."""
     sid = meta["session_id"]
@@ -233,8 +279,8 @@ async def activate(session_id):
     """Bring the session's document to front in FreeCAD (re-opening it if needed)."""
     async with lock(session_id):
         meta = require(session_id)
-        await refresh_info(meta)
-        save(meta)
+        if not await sync_manual_edits(meta):
+            save(meta)
         return public_state(meta)
 
 

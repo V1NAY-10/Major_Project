@@ -46,6 +46,13 @@ def write_msg(conn, obj):
     conn.sendall(struct.pack(">I", len(data)) + data)
 
 
+def _reload():
+    """Reload analysis first, then engine (which imports it)."""
+    from freecad_bridge import analysis, engine
+    importlib.reload(analysis)
+    importlib.reload(engine)
+
+
 def _engine():
     from freecad_bridge import engine
     return engine
@@ -54,8 +61,7 @@ def _engine():
 def handle(request):
     method = request.get("method")
     if method == "reload_engine":
-        from freecad_bridge import engine
-        importlib.reload(engine)
+        _reload()
         resp = {"ok": True, "result": {"reloaded": True}}
     else:
         resp = _engine().dispatch(method, request.get("params") or {})
@@ -138,8 +144,7 @@ def _serve_gui_socket(srv):
 def start_gui():
     """Start the bridge inside the FreeCAD GUI (call from the main thread)."""
     if _state["running"]:
-        from freecad_bridge import engine
-        importlib.reload(engine)
+        _reload()
         print("[AetherCAD] bridge already running — engine reloaded")
         return
     try:

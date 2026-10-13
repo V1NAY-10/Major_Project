@@ -1,15 +1,14 @@
-"""Chat sessions (one CAD model + conversation each), owned by a Clerk user."""
+"""Chat sessions (one CAD model + conversation each). Single-user app: there is no login."""
 
 import datetime
 import uuid
 
 from bson import ObjectId
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from . import cad_service as cad
 from . import messages
-from .auth import current_user
 from .db import get_db
 
 router = APIRouter()
@@ -33,46 +32,43 @@ def _session_out(doc):
     return {
         "id": sid,
         "title": doc.get("title", ""),
-        "user_id": doc.get("user_id"),
         "created_at": created.isoformat() if isinstance(created, datetime.datetime) else created,
         "cad_filename": meta["filename"] if meta else None,
     }
 
 
-async def find_owned(session_id: str, user_id: str):
-    """The session document if it exists and belongs to user_id, else None."""
+async def find_session(session_id: str):
+    """The session document, or None."""
     db = get_db()
     if db is None:
-        s = _memory_sessions.get(session_id)
-        return s if s and s["user_id"] == user_id else None
+        return _memory_sessions.get(session_id)
     try:
-        return await db.sessions.find_one({"_id": ObjectId(session_id), "user_id": user_id})
+        return await db.sessions.find_one({"_id": ObjectId(session_id)})
     except Exception:
         return None
 
 
-async def require_owned(session_id: str, user_id: str):
-    s = await find_owned(session_id, user_id)
+async def require_session(session_id: str):
+    s = await find_session(session_id)
     if not s:
         raise HTTPException(status_code=404, detail="Session not found")
     return s
 
 
 @router.get("/sessions")
-async def list_sessions(user: str = Depends(current_user)):
+async def list_sessions():
     db = get_db()
     if db is None:
-        rows = [s for s in _memory_sessions.values() if s["user_id"] == user]
-        rows.sort(key=lambda s: s["created_at"], reverse=True)
+        rows = sorted(_memory_sessions.values(), key=lambda s: s["created_at"], reverse=True)
     else:
-        rows = await db.sessions.find({"user_id": user}).sort("created_at", -1).to_list(length=200)
+        rows = await db.sessions.find({}).sort("created_at", -1).to_list(length=200)
     return [_session_out(s) for s in rows]
 
 
 @router.post("/sessions")
-async def create_session(session: SessionCreate, user: str = Depends(current_user)):
+async def create_session(session: SessionCreate):
     db = get_db()
-    doc = {"title": session.title[:120], "user_id": user,
+    doc = {"title": session.title[:120],
            "created_at": datetime.datetime.now(datetime.timezone.utc)}
     if db is None:
         doc["_id"] = uuid.uuid4().hex
@@ -83,8 +79,8 @@ async def create_session(session: SessionCreate, user: str = Depends(current_use
 
 
 @router.patch("/sessions/{session_id}")
-async def rename_session(session_id: str, session: SessionUpdate, user: str = Depends(current_user)):
-    s = await require_owned(session_id, user)
+async def rename_session(session_id: str, session: SessionUpdate):
+    s = await require_session(session_id)
     title = session.title[:120]
     db = get_db()
     if db is None:
@@ -95,11 +91,11 @@ async def rename_session(session_id: str, session: SessionUpdate, user: str = De
 
 
 @router.get("/sessions/{session_id}")
-async def get_session(session_id: str, user: str = Depends(current_user)):
-    return _session_out(await require_owned(session_id, user))
+async def get_session(session_id: str):
+    return _session_out(await require_session(session_id))
 
 
 @router.get("/sessions/{session_id}/messages")
-async def get_messages(session_id: str, user: str = Depends(current_user)):
-    await require_owned(session_id, user)
+async def get_messages(session_id: str):
+    await require_session(session_id)
     return await messages.list_messages(session_id)

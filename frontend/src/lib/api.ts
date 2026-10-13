@@ -37,21 +37,10 @@ export class ApiError extends Error {
   }
 }
 
-type TokenGetter = () => Promise<string | null>;
-let tokenGetter: TokenGetter | null = null;
-
-/** Registered once by the signed-in app (Clerk's getToken) so every request carries the session token. */
-export function setAuthTokenGetter(getter: TokenGetter | null) {
-  tokenGetter = getter;
-}
-
-/** fetch against the backend with the Clerk session token attached. */
-export async function authFetch(path: string, init: RequestInit = {}): Promise<Response> {
-  const headers = new Headers(init.headers);
-  const token = tokenGetter ? await tokenGetter() : null;
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+/** fetch against the backend, with a readable error when it is not running. */
+export async function backendFetch(path: string, init: RequestInit = {}): Promise<Response> {
   try {
-    return await fetch(`${API_URL}${path}`, { ...init, headers });
+    return await fetch(`${API_URL}${path}`, init);
   } catch {
     throw new ApiError("Cannot reach the backend. Is it running on port 8000?", 0);
   }
@@ -63,16 +52,16 @@ async function errorFrom(res: Response): Promise<ApiError> {
   return new ApiError(detail, res.status);
 }
 
-/** Authenticated fetch + JSON with the backend's `{detail}` error shape turned into an ApiError. */
+/** fetch + JSON with the backend's `{detail}` error shape turned into an ApiError. */
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await authFetch(path, init);
+  const res = await backendFetch(path, init);
   if (!res.ok) throw await errorFrom(res);
   return (await res.json().catch(() => ({}))) as T;
 }
 
-/** Authenticated binary download (meshes, exports). */
+/** Binary download (meshes, exports). */
 export async function apiBlob(path: string): Promise<{ blob: Blob; filename: string | null }> {
-  const res = await authFetch(path);
+  const res = await backendFetch(path);
   if (!res.ok) throw await errorFrom(res);
   const disposition = res.headers.get("Content-Disposition") ?? "";
   const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);

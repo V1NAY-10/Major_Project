@@ -14,38 +14,54 @@ The original rebuild plan is in [docs/PLAN.md](docs/PLAN.md).
 
 ```
 Next.js chat UI ──HTTP :8000──► FastAPI backend ──JSON-RPC/TCP :6666──► FreeCAD (GUI or headless)
- (Clerk auth, 3D viewer)        LLM agent + typed tools                  freecad_bridge/engine.py
+ (3D viewer, click-to-select)   LLM agent + typed tools                  freecad_bridge/engine.py
                                 session/version store
                                 MongoDB (sessions + chat)
 ```
 
 1. **FreeCAD is the geometry kernel and the source of truth.** Each chat session has its own FreeCAD
-   document (`backend/data/sessions/<id>/work.FCStd`).
-2. **Feature recognition with stable IDs.** The engine finds holes (`H#`, with diameter, depth, through or blind,
-   and countersinks), bosses (`C#`), fillets (`R#`), planar faces (`P#`, labelled top, bottom, left and so on),
-   cones (`K#`) and spheres (`S#`). For `.FCStd` files it also reads parametric properties, sketch constraints
-   and spreadsheet aliases. IDs are matched geometrically, so `H3` stays `H3` after other edits.
-3. **The LLM calls typed tools rather than writing code:** `resize_hole`, `move_hole`, `add_holes`,
-   `remove_features`, `push_pull_face`, `set_face_distance`, `fillet_edges`, `chamfer_edges`,
-   `add_primitive`, `transform_object`, `scale_object`, `set_property`, `set_sketch_constraint`,
-   `set_spreadsheet_cell`, `delete_object`, plus `get_model_info`, `list_objects`, `find_features` and
-   `measure` for questions. `add_primitive` can also **replace** a whole part's shape (e.g. turn a rectangular
-   table top into a round one). `run_freecad_python` is disabled unless `AGENT_ALLOW_PYTHON=1`.
-7. **Assemblies.** Each part of a STEP assembly is analysed separately (container groups are skipped, so
-   nothing is counted twice), and the agent can find parts by name or size.
-8. **Authenticated API.** Every backend request carries the user's Clerk session token; the backend verifies
-   it and only lets users see and edit their own sessions.
-4. **Verified edits.** Each operation runs in a FreeCAD transaction. Invalid results are rolled back, and
-   successful ones are re-measured (e.g. `H2 Ø6 → Ø8, verified 8.000`).
-5. **Versions.** Each chat turn that changes geometry creates `vN`. Undo and redo restore snapshots in
-   FreeCAD and in the viewer. Export to STEP, IGES, STL or FCStd at any time.
-6. Ambiguous requests ("make the hole bigger") get a clarifying question listing the candidates.
+   document (`backend/data/sessions/<id>/work.FCStd`). With `FREECAD_AUTOSTART=gui` the backend starts FreeCAD
+   when it starts, puts its window on the right half of the screen (`FREECAD_WINDOW`) and every edit appears
+   there live, side by side with the web app.
+2. **Precise parsing with stable IDs.** The engine recognises holes (`H#`: diameter, depth, through/blind,
+   drill tip, **countersinks and counterbores**), bosses (`C#`), fillets (`R#`), planar faces (`P#`), cones (`K#`)
+   and spheres (`S#`). Faces stored as B-splines (common in STEP files from some exporters) are recognised by
+   least-squares fitting. On top of features it extracts:
+   - **Hole patterns** (`PAT#`): bolt circles (PCD, count, start angle), rectangular grids and linear rows.
+   - **Driving dimensions**, each tied to the IDs that define it: overall sizes and thicknesses (`P1-P2`),
+     gaps/slot widths, and hole-to-edge distances (`H3-P5`).
+   For `.FCStd` files it also reads parametric properties, sketch constraints and spreadsheet aliases.
+   IDs are matched geometrically, so `H3` stays `H3` after other edits.
+3. **Edits use the parsed data.** "Make it 120 mm long" → `set_dimension("P5-P6", 120)`; "bolt circle 80" →
+   `edit_hole_pattern("PAT1", pcd=80)`. The LLM calls typed tools rather than writing code:
+   `set_dimension`, `edit_hole_pattern`, `resize_hole`, `move_hole`, `add_holes`, `remove_features`,
+   `push_pull_face`, `set_face_distance`, `fillet_edges`, `chamfer_edges`, `add_primitive`, `transform_object`,
+   `scale_object`, `set_property`, `set_sketch_constraint`, `set_spreadsheet_cell`, `delete_object`, plus
+   `get_model_info`, `list_objects`, `find_features`, `list_dimensions` and `measure` for questions.
+   Features that open on a moved face move with it (a blind hole keeps its depth below the face).
+   `run_freecad_python` is disabled unless `AGENT_ALLOW_PYTHON=1`.
+4. **Fast path, no LLM.** Exact commands run instantly without an LLM call: `P5-P6 = 120`,
+   `H3-P5 = 12 symmetric`, `H2 Ø8`, `PAT1 pcd 80`. Clicking a dimension in the panel fills in `P5-P6 = `.
+5. **Verified edits.** Each operation runs in a FreeCAD transaction. Invalid results are rolled back, and
+   successful ones are re-measured (e.g. `P5-P6 = 120.000 ✓`).
+6. **Versions.** Each chat turn that changes geometry creates `vN`. Undo and redo restore snapshots in
+   FreeCAD and in the viewer. Edits you make **by hand in the FreeCAD window** are detected and saved as a
+   version ("Manual edit in FreeCAD") before the next chat turn. Export to STEP, IGES, STL or FCStd at any time.
+7. **Select, inspect, edit.** Every face of every part has an ID: features (H#, P#, C#, R#, K#, S#, F# for
+   free-form faces) and whole parts (B#). Click the model in the 3D viewer (Feature or Part mode), click an ID in
+   the panel, or take the current selection from the FreeCAD window. The selection is highlighted in both views,
+   an inspector shows all its data (sizes, position, related dimensions, pattern) with quick-edit buttons, and
+   your next message applies to it: select H3 and type `Ø8`, or "move this 5 mm to the left".
+   Features an answer mentions are highlighted automatically.
+8. **Assemblies.** Each part of a STEP assembly is analysed separately in global coordinates.
+9. **No login.** Single-user local app; every chat session is visible in the sidebar.
+10. Ambiguous requests ("make the hole bigger") get a clarifying question listing the candidates.
 
 ## Technology stack
 
 | Layer | Technology |
 |---|---|
-| Frontend | Next.js 16 (App Router, Turbopack), React 19, React Three Fiber + drei (STL viewer), TailwindCSS 4, Clerk auth, react-markdown |
+| Frontend | Next.js 16 (App Router, Turbopack), React 19, React Three Fiber + drei (STL viewer), TailwindCSS 4, react-markdown |
 | Backend | FastAPI + Uvicorn, OpenAI Python SDK (any OpenAI-compatible endpoint; Groq by default), Motor (async MongoDB) |
 | Geometry | FreeCAD 1.0+ (OpenCASCADE) running the bridge in `backend/freecad_bridge/` |
 | Storage | Files on disk for models/versions, MongoDB (optional) for sessions and chat messages |
@@ -62,16 +78,18 @@ backend/
     freecad_client.py      TCP client for the bridge + FreeCAD auto-launch
     messages.py            Chat message storage and LLM history
     db.py                  MongoDB connection (falls back to memory)
-    auth.py                Clerk session-token verification
     sessions.py            /sessions endpoints + ownership checks
     agent/
       runner.py            LLM ⇄ tools loop, token budget, rate-limit handling
       prompt.py            System prompt + compact model summary
       tools.py             Tool schemas and execution
+      fastpath.py          Exact commands (P1-P2 = 25, H3 Ø8, PAT1 pcd 80) without the LLM
   freecad_bridge/
     server.py              JSON-RPC server inside FreeCAD (GUI or headless)
-    engine.py              Feature recognition, operations, verification, export
+    engine.py              Feature recognition, IDs, operations, verification, export
+    analysis.py            B-spline surface fitting, counterbores, hole patterns, dimensions
     headless.py            Entry point for freecadcmd
+  tests/                   Engine test suite (run with freecadcmd) + fixture parts
   data/sessions/<id>/      Per-session files (created at runtime)
 frontend/
   src/app/page.tsx         Main chat + 3D workspace page
@@ -86,9 +104,8 @@ docs/
 ## Setup
 
 ### Prerequisites
-- Python 3.10+, Node.js 18+, FreeCAD 1.0+
+- Python 3.10+, Node.js 18+, FreeCAD 1.0+ (tested with 1.1.4)
 - An LLM API key for any OpenAI-compatible endpoint with tool calling (a free Groq key works)
-- A Clerk account (free) for frontend sign-in
 - MongoDB (optional; without it, sessions and chat history live in memory and are lost on restart)
 
 ### Backend
@@ -105,8 +122,6 @@ python main.py                   # http://127.0.0.1:8000
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLERK_SECRET_KEY` | none | **Required.** Same value as in `frontend/.env.local`; used to verify session tokens |
-| `AUTH_DISABLED` | `0` | `1` skips token verification (local testing only; user comes from `?user_id=`) |
 | `GROQ_API_KEY` / `LLM_API_KEY` | none | LLM key (`LLM_API_KEY` wins) |
 | `LLM_BASE_URL` | `https://api.groq.com/openai/v1` | Any OpenAI-compatible endpoint |
 | `LLM_MODEL` | `openai/gpt-oss-120b` | Must support tool calling |
@@ -115,6 +130,8 @@ python main.py                   # http://127.0.0.1:8000
 | `FREECAD_AUTOSTART` | `gui` | `gui`: launch FreeCAD with the listener if it isn't running. `headless`: use `freecadcmd`. `off`: never launch |
 | `FREECAD_GUI_EXE`, `FREECAD_CMD_EXE` | auto-detected | Paths to `freecad.exe` / `freecadcmd.exe` |
 | `FREECAD_HOST`, `FREECAD_PORT` | `127.0.0.1`, `6666` | Bridge address (the bridge reads `FREECAD_PORT` too) |
+| `FREECAD_PRELAUNCH` | `1` | Start FreeCAD when the backend starts (so the first upload doesn't wait) |
+| `FREECAD_WINDOW` | `right` | Where the FreeCAD window goes: `right` (browser on the left half), `left`, `max`, `none` |
 | `AETHERCAD_DATA` | `backend/data` | Where session files and versions are stored |
 | `AGENT_ALLOW_PYTHON` | `0` | `1` lets the agent run arbitrary Python inside FreeCAD (`run_freecad_python`) |
 
@@ -139,7 +156,7 @@ backend log). Leave that window open; if you close it, it is relaunched on the n
 To start it by hand instead (for example with `FREECAD_AUTOSTART=off`), open FreeCAD and run the listener once:
 **Macro ▸ Macros… ▸ `backend/freecad_listener.py` ▸ Execute**, or in the Python console:
 ```python
-exec(open(r"C:/VINAY_MAIN/Major_Project/backend/freecad_listener.py").read())
+exec(open(r"D:/Soham_Jadhav/Major_Project/backend/freecad_listener.py").read())
 ```
 Running the listener again hot-reloads `freecad_bridge/engine.py`.
 
@@ -150,24 +167,34 @@ npm install
 npm run dev                      # http://localhost:3000
 ```
 
-`frontend/.env.local`:
+`frontend/.env.local` (optional):
 
 | Variable | Purpose |
 |---|---|
-| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY`, `CLERK_SECRET_KEY` | Clerk auth keys (copy `CLERK_SECRET_KEY` to `backend/.env` too) |
-| `NEXT_PUBLIC_CLERK_SIGN_IN_URL`, `NEXT_PUBLIC_CLERK_SIGN_UP_URL` | Usually `/sign-in` and `/sign-up` |
 | `NEXT_PUBLIC_API_URL` | Optional. Backend URL; defaults to `http://<current host>:8000` |
 
 ## Using it
 
-1. Sign in, then attach or drop a CAD file in the chat. It opens in FreeCAD and appears in the 3D workspace.
+1. Attach or drop a CAD file in the chat. It opens in FreeCAD and appears in the 3D workspace.
 2. Ask questions: *"How thick is the plate?"*, *"List the holes and their positions"*, *"Distance between H2 and H4?"*
 3. Request changes: *"Make the four 6 mm holes 8 mm"*, *"Make it 120 mm long"*,
    *"Round the vertical corners R5"*, *"Add a Ø5 through hole at 70, 30 on the top face"*,
    *"Make the table top round, diameter = its depth"*.
    For `.FCStd` files: *"Set the pad length to 25"*.
-4. Click a feature ID in the panel to insert it into your message. Use undo/redo in the header, and download
-   from the workspace (STEP, FCStd, STL, IGES).
+4. Click the part in the 3D viewer (or an ID in the panel) to select it: it is highlighted here and in FreeCAD,
+   and the inspector shows its ID and data. Then just describe the change ("Ø8", "make it 3 mm deeper",
+   "move this 5 mm left"). Shift+click adds to the selection; "Part" mode selects whole parts; "From FreeCAD"
+   uses what you selected in the FreeCAD window. Use undo/redo in the header, and download from the workspace
+   (STEP, FCStd, STL, IGES).
+
+## Tests
+
+```bash
+# Engine: parsing + every edit, against parts with known ground truth (headless FreeCAD, ~10 s)
+"C:/Program Files/FreeCAD 1.1/bin/freecadcmd.exe" backend/tests/test_engine.py
+# Fast-path command parser
+cd backend && venv\Scripts\python -m unittest app.agent.test_fastpath
+```
 
 ## Free-tier LLM limits
 
@@ -186,8 +213,6 @@ Check your limits at <https://console.groq.com/settings/limits>.
 
 | Symptom | Cause / fix |
 |---|---|
-| `Not signed in` / `Invalid session token` (401) | Sign in again; the frontend sends the Clerk token automatically. |
-| `Server authentication is not configured` | Set `CLERK_SECRET_KEY` in `backend/.env` and restart. |
 | `FreeCAD offline` badge | The bridge on port 6666 isn't reachable. It is launched on the next CAD request, or run the listener by hand. |
 | `Request too large … tokens per minute` | LLM free-tier limit. See [Free-tier LLM limits](#free-tier-llm-limits). |
 | `LLM API key is missing or invalid` | Set `GROQ_API_KEY` or `LLM_API_KEY` in `backend/.env` and restart the backend. |

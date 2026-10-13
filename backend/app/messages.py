@@ -19,7 +19,7 @@ def _jsonable(doc):
     return doc
 
 
-async def add(session_id, role, content, operations=None, version=None, kind=None):
+async def add(session_id, role, content, operations=None, version=None, kind=None, selection=None):
     doc = {
         "session_id": session_id,
         "role": role,
@@ -32,6 +32,8 @@ async def add(session_id, role, content, operations=None, version=None, kind=Non
         doc["version"] = version
     if kind:
         doc["kind"] = kind
+    if selection:
+        doc["selection"] = selection
     db = get_db()
     if db is not None:
         res = await db.messages.insert_one(doc)
@@ -63,6 +65,8 @@ async def history_for_llm(session_id, limit=HISTORY_MESSAGES):
         content = m.get("content") or ""
         if len(content) > HISTORY_MESSAGE_CHARS:
             content = content[:HISTORY_MESSAGE_CHARS] + " …[truncated]"
+        if m.get("selection"):
+            content += f"\n[Selected: {', '.join(m['selection'])}]"
         ops = [o for o in m.get("operations") or [] if o.get("ok")]
         if ops:
             content += "\n[Edits applied: " + "; ".join(o["message"].split("\n")[0] for o in ops) + "]"

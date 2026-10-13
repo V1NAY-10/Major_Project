@@ -97,7 +97,8 @@ def _launch():
                                  "Set FREECAD_GUI_EXE / FREECAD_CMD_EXE or start FreeCAD and run "
                                  "backend/freecad_listener.py.")
     print(f"[FreeCAD] launching {exe} {script}")
-    subprocess.Popen([exe, str(script)], cwd=str(BACKEND_DIR))
+    subprocess.Popen([exe, str(script)], cwd=str(BACKEND_DIR),
+                     env={**os.environ, "AETHERCAD_BACKEND": str(BACKEND_DIR)})
 
 
 def ensure_running(wait=90):
@@ -120,6 +121,24 @@ def ensure_running(wait=90):
             except FreeCADUnavailable:
                 continue
     raise FreeCADUnavailable("FreeCAD was launched but the bridge did not come up in time.")
+
+
+PRELAUNCH = os.getenv("FREECAD_PRELAUNCH", "1").lower() in ("1", "true", "yes") and AUTOSTART != "off"
+
+
+def prelaunch():
+    """Start FreeCAD in the background at backend startup so the first upload doesn't wait for it."""
+    if not PRELAUNCH:
+        return
+
+    def run():
+        try:
+            info = ensure_running()
+            print(f"[FreeCAD] bridge ready (FreeCAD {info.get('version')}, {'GUI' if info.get('gui') else 'headless'})")
+        except Exception as e:
+            print(f"[FreeCAD] prelaunch failed: {e}")
+
+    threading.Thread(target=run, name="freecad-prelaunch", daemon=True).start()
 
 
 async def call(method, timeout=300, **params):

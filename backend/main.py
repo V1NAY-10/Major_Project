@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
-from app import sessions  # noqa: E402
+from app import freecad_client, sessions  # noqa: E402
 from app.db import init_db  # noqa: E402
 from app.routes import install_error_handlers, router  # noqa: E402
 
@@ -16,6 +16,7 @@ from app.routes import install_error_handlers, router  # noqa: E402
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await init_db()
+    freecad_client.prelaunch()  # non-blocking: FreeCAD opens beside the browser while the app starts
     yield
 
 
