@@ -11,6 +11,10 @@ Geometry analysis helpers — run INSIDE FreeCAD, used by engine.py.
   * dimensions        the driving dimensions of each part: overall sizes, wall thicknesses,
                       gaps/slot widths and hole-to-edge distances, each tied to the feature IDs
                       that define it so it can be changed with set_dimension.
+  * fillet_chains     tangent-continuous fillet faces (cylinders, tori, spherical corners) → one round.
+  * recesses          slots (obround / rectangular, through / blind) and pockets (blind, planar floor).
+  * chamfers          narrow planar bevels between two faces.
+  * edge_rows         every edge with its type, length, adjacent faces and convexity (edge IDs E#).
 """
 
 import math
@@ -401,7 +405,7 @@ def _linear(g, pts, a, e1, e2, entry_t, tol):
 
 
 def pattern_positions(pat, pcd=None, count=None, spacing=None, spacing_u=None, spacing_v=None,
-                      start_angle=None, anchor="center"):
+                      start_angle=None, anchor="center", count_u=None, count_v=None):
     """New hole axis points (on the entry plane) for an edited pattern."""
     a = _v3(pat["axis"])
     if pat["type"] == "circular":
@@ -419,7 +423,7 @@ def pattern_positions(pat, pcd=None, count=None, spacing=None, spacing_u=None, s
         du, dv = _v3(pat["dir_u"]), _v3(pat["dir_v"])
         su = float(spacing_u) if spacing_u is not None else pat["spacing_u"]
         sv = float(spacing_v) if spacing_v is not None else pat["spacing_v"]
-        nu, nv = pat["count_u"], pat["count_v"]
+        nu, nv = int(count_u or pat["count_u"]), int(count_v or pat["count_v"])
         c = _v3(pat["center"])
         return [c + du * (su * (iu - (nu - 1) / 2)) + dv * (sv * (iv - (nv - 1) / 2))
                 for iv in range(nv) for iu in range(nu)]
@@ -500,6 +504,7 @@ def dimensions(shapes, feats, tol, limit_per_object=400):
         bb = shape.BoundBox
         planes = [f for f in feats if f["_obj"] == objname and f["kind"] == "plane" and not f.get("is_cap")]
         holes = [f for f in feats if f["_obj"] == objname and f["kind"] == "hole" and "_cb_inner" not in f]
+        recs = [f for f in feats if f["_obj"] == objname and f["kind"] in ("slot", "pocket")]
         dims = {}
 
         # Plane pairs with opposite normals: thickness (material between) or gap (air between).
@@ -538,8 +543,8 @@ def dimensions(shapes, feats, tol, limit_per_object=400):
                 d["type"] = "extent"
                 d["label"] = f"overall {axis} size"
 
-        # Hole axis to the nearest bounding face on each side (edge distances).
-        for h in holes:
+        # Hole axis (slot / pocket centre) to the nearest bounding face on each side (edge distances).
+        for h in holes + recs:
             a = h["_a"]
             mid = h["_base"] + a * ((h["_t"][0] + h["_t"][1]) / 2)
             per_axis = {}
@@ -554,7 +559,10 @@ def dimensions(shapes, feats, tol, limit_per_object=400):
                     continue
                 u = canon_axis(n)
                 key = (round(u.x, 4), round(u.y, 4), round(u.z, 4))
-                if key not in per_axis or -d < per_axis[key][0]:
+                # nearest face per axis; a hole midway between two faces always picks the lower ID, so the
+                # dimension ID doesn't flip between the two sides from one analysis to the next
+                old = per_axis.get(key)
+                if old is None or -d < old[0] - tol * 10 or (abs(-d - old[0]) <= tol * 10 and _idnum(p) < _idnum(old[1])):
                     per_axis[key] = (-d, p, u)
             for dist, p, u in per_axis.values():
                 did = f"{h['id']}-{p['id']}"
@@ -563,12 +571,109 @@ def dimensions(shapes, feats, tol, limit_per_object=400):
                              "axis": _vl(u), "object": objname,
                              "label": f"{h['id']} axis to {p.get('label', p['id'])}" + (f" (along {an})" if an else "")}
 
-        rows = sorted(dims.values(), key=lambda d: ({"extent": 0, "thickness": 1, "gap": 2, "edge_distance": 3}[d["type"]],
-                                                     -d.get("_area", 0), d["id"]))
+        _hole_pair_dims(dims, holes, objname)
+        _angle_dims(dims, shape, planes, objname)
+        for f in feats:
+            if f["_obj"] != objname:
+                continue
+            if f["kind"] == "boss":
+                did = f"{f['id']}.Ø"
+                dims[did] = {"id": did, "type": "diameter", "value": f["diameter"], "refs": [f["id"]],
+                             "axis": f["axis"], "object": objname, "label": f"{f['id']} boss diameter"}
+            elif f["kind"] in ("round", "sphere"):
+                did = f"{f['id']}.R"
+                dims[did] = {"id": did, "type": "radius", "value": f["radius"], "refs": [f["id"]],
+                             **({"axis": f["axis"]} if f.get("axis") else {}), "object": objname,
+                             "label": f"{f['id']} {'fillet' if f['kind'] == 'round' else 'sphere'} radius"}
+
+        rows = sorted(dims.values(), key=lambda d: (DIM_ORDER[d["type"]], -d.get("_area", 0), d["id"]))
         for d in rows[:limit_per_object]:
             d.pop("_area", None)
             out.append(d)
     return out
+
+
+DIM_ORDER = {"extent": 0, "thickness": 1, "gap": 2, "edge_distance": 3, "center_distance": 4, "angle": 5,
+             "diameter": 6, "radius": 7, "coaxial": 8}
+MAX_PAIR_HOLES = 400  # nearest-neighbour search is O(n²) per part
+
+
+def _idnum(f):
+    return int("".join(c for c in f["id"] if c.isdigit()) or 0)
+
+
+def axis_offset(a, b):
+    """Distance between the axis lines of two parallel axial features."""
+    w = b["_base"] - a["_base"]
+    return (w - a["_a"] * w.dot(a["_a"])).Length
+
+
+def _hole_pair_dims(dims, holes, objname):
+    """Hole-to-hole centre distance to each hole's nearest parallel neighbour, and coaxial hole pairs
+    (axes closer than the smaller radius: meant to be in line). Counterbores are part of their hole."""
+    if len(holes) > MAX_PAIR_HOLES:
+        return
+    for h in holes:
+        near = []  # (offset, a, b) of the nearest neighbours (ties kept: a bolt hole has two)
+        for g in holes:
+            if g is h or abs(h["_a"].dot(g["_a"])) < 1 - 1e-7:
+                continue
+            off = axis_offset(h, g)
+            a, b = sorted((h, g), key=_idnum)
+            if off < min(h["_r"], g["_r"]):
+                did = f"{a['id']}◎{b['id']}"
+                dims[did] = {"id": did, "type": "coaxial", "value": _r(off), "refs": [a["id"], b["id"]],
+                             "axis": _vl(h["_a"]), "object": objname,
+                             "label": f"coaxiality {a['id']}/{b['id']} (axis offset)"}
+            elif not near or off < near[0][0] - 1e-6:
+                near = [(off, a, b)]
+            elif abs(off - near[0][0]) <= 1e-6:
+                near.append((off, a, b))
+        for off, a, b in near:
+            did = f"{a['id']}-{b['id']}"
+            if did not in dims:
+                dims[did] = {"id": did, "type": "center_distance", "value": _r(off), "refs": [a["id"], b["id"]],
+                             "axis": _vl(a["_a"]), "object": objname, "label": f"{a['id']} to {b['id']} centre distance"}
+
+
+def included_angle(na, nb):
+    """Included (interior) angle in degrees between two planar faces with outward normals na, nb:
+    90 for a square corner, 135 for a 45° chamfer next to its face."""
+    c = max(-1.0, min(1.0, na.dot(nb)))
+    return 180.0 - math.degrees(math.acos(c))
+
+
+def shared_edges(fa, fb):
+    """Edges two faces have in common."""
+    return [e for e in fa.Edges if any(e.isSame(x) for x in fb.Edges)]
+
+
+def _angle_dims(dims, shape, planes, objname):
+    """Angles between adjacent planar faces that are neither parallel nor square (inclined faces, chamfers,
+    tapers). Any pair of non-parallel planes can still be set with set_dimension."""
+    by_edge = {}
+    for p in planes:
+        for e in shape.Faces[p["_faces"][0]].Edges:
+            bucket = by_edge.setdefault(e.hashCode(), [])
+            bucket.append((e, p))
+    seen = set()
+    for bucket in by_edge.values():
+        for i in range(len(bucket)):
+            for j in range(i + 1, len(bucket)):
+                (ea, pa), (eb, pb) = bucket[i], bucket[j]
+                if pa is pb or not ea.isSame(eb):
+                    continue
+                c = pa["_n"].dot(pb["_n"])
+                if abs(c) > 1 - 1e-7 or abs(c) < 1e-7:  # parallel or square
+                    continue
+                a, b = sorted((pa, pb), key=_idnum)
+                did = f"{a['id']}∠{b['id']}"
+                if did in seen:
+                    continue
+                seen.add(did)
+                dims[did] = {"id": did, "type": "angle", "value": _r(included_angle(a["_n"], b["_n"])), "unit": "deg",
+                             "refs": [a["id"], b["id"]], "axis": _vl(canon_axis(a["_n"].cross(b["_n"]))),
+                             "object": objname, "label": f"angle between {a['id']} and {b['id']}"}
 
 
 def _pair_id(a, b):
@@ -588,3 +693,442 @@ def _add_plane_dim(dims, p, q, dist, kind, objname):
          "_area": min(a["area"], b["area"])}
     dims[did] = d
     return d
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Face adjacency
+# ─────────────────────────────────────────────────────────────────────────────
+
+class Adjacency:
+    """Which faces share each edge of a shape (edges matched with isSame, bucketed by hashCode)."""
+
+    def __init__(self, shape):
+        self.shape = shape
+        self.buckets = {}
+        for fi, f in enumerate(shape.Faces):
+            for e in f.Edges:
+                self.buckets.setdefault(e.hashCode(), []).append((e, fi))
+
+    def faces_of_edge(self, e):
+        return sorted({fi for e2, fi in self.buckets.get(e.hashCode(), []) if e2.isSame(e)})
+
+    def neighbours(self, fi, edges=None):
+        """Faces sharing an edge with face fi (only through `edges` when given)."""
+        out = set()
+        for e in (edges if edges is not None else self.shape.Faces[fi].Edges):
+            out.update(j for j in self.faces_of_edge(e) if j != fi)
+        return out
+
+    def unique_edges(self):
+        """[(edge, [face indices])] once per edge."""
+        out = []
+        for bucket in self.buckets.values():
+            seen = []
+            for e, fi in bucket:
+                for entry in seen:
+                    if entry[0].isSame(e):
+                        if fi not in entry[1]:
+                            entry[1].append(fi)
+                        break
+                else:
+                    seen.append((e, [fi]))
+            out.extend(seen)
+        return out
+
+
+def normal_at(face, p):
+    """Outward normal of a face at a point on it."""
+    try:
+        u, v = face.Surface.parameter(p)
+        return face.normalAt(u, v)
+    except Exception:
+        u0, u1, v0, v1 = face.ParameterRange
+        return face.normalAt((u0 + u1) / 2, (v0 + v1) / 2)
+
+
+def edge_kind(e):
+    """('line' | 'circle' | 'arc' | 'ellipse' | 'bspline' | …) of an edge."""
+    c = e.Curve
+    name = type(c).__name__
+    if name in ("Line", "LineSegment"):
+        return "line"
+    if name == "Circle":
+        return "circle" if e.isClosed() else "arc"
+    return name.lower().replace("curve", "")
+
+
+def edge_convexity(shape, e, faces, tol):
+    """'convex' (material inside the corner), 'concave', 'tangent' (smooth), 'seam' or 'free' for an edge."""
+    if len(faces) != 2:  # a seam (one face meets itself) or a free edge
+        return "seam" if len(faces) == 1 else "free"
+    p = e.valueAt((e.FirstParameter + e.LastParameter) / 2.0)
+    n1, n2 = normal_at(shape.Faces[faces[0]], p), normal_at(shape.Faces[faces[1]], p)
+    if n1.getAngle(n2) < math.radians(1.0):
+        return "tangent"
+    bis = n1 + n2
+    if bis.Length < 1e-9:
+        return "convex"
+    bis.normalize()
+    eps = max(tol * 50, 0.02)
+    return "convex" if not _inside(shape, p + bis * eps, tol) else "concave"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fillet chains
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fillet_chains(shape, feats, tol, adj=None):
+    """Merge rounds (and spherical corner blends) that meet tangentially with the same radius into one round
+    feature: a fillet run around several edges becomes one R#. Returns the new feature list."""
+    adj = adj or Adjacency(shape)
+    members = [f for f in feats if f["kind"] in ("round", "sphere")]
+    if len(members) < 2:
+        return feats
+    owner = {i: m for m in members for i in m["_faces"]}
+    parent = {id(m): id(m) for m in members}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def radius(m):
+        return float(m.get("_r") or m.get("radius") or 0)
+
+    for m in members:
+        for i in m["_faces"]:
+            for e in shape.Faces[i].Edges:
+                for j in adj.faces_of_edge(e):
+                    m2 = owner.get(j)
+                    if m2 is None or m2 is m or abs(radius(m) - radius(m2)) > tol * 10:
+                        continue
+                    if edge_convexity(shape, e, [i, j], tol) == "tangent":
+                        parent[find(id(m))] = find(id(m2))
+    groups = {}
+    for m in members:
+        groups.setdefault(find(id(m)), []).append(m)
+    out, drop = [], set()
+    for g in groups.values():
+        if len(g) < 2:
+            continue
+        cyl = [m for m in g if m["kind"] == "round" and m.get("torus_major_radius") is None]
+        main = max(cyl or g, key=lambda m: sum(shape.Faces[i].Area for i in m["_faces"]))
+        if main["kind"] == "sphere":
+            continue  # only spherical blends: leave them as they are
+        chain = dict(main)
+        chain["_faces"] = sorted({i for m in g for i in m["_faces"]})
+        chain["chain_faces"] = len(chain["_faces"])
+        chain["length"] = _r(sum(float(m.get("length") or 0) for m in g))
+        chain["_members"] = g
+        for m in g:
+            drop.add(id(m))
+        out.append(chain)
+    return [f for f in feats if id(f) not in drop] + out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slots and pockets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _t_range(face, n):
+    ts = [v.Point.dot(n) for v in face.Vertexes] or [face.CenterOfMass.dot(n)]
+    return min(ts), max(ts)
+
+
+def recesses(shape, feats, tol, adj=None, position=None):
+    """Closed recesses that open on a planar face through an inner outline, with vertical walls:
+
+      slot   — obround (two parallel walls + two half-cylinder ends of radius width/2) or rectangular with sharp
+               corners and length ≥ 2 × width; through (exits through an opposite face) or blind (planar floor)
+      pocket — any other blind recess with a planar floor; corner_radius = its corner rounds (0 if sharp)
+
+    Walls and floors become part of the new feature (they are removed from the plane / round lists).
+    Returns the new feature list."""
+    adj = adj or Adjacency(shape)
+    by_face = {}
+    for f in feats:
+        for i in f["_faces"]:
+            by_face.setdefault(i, f)
+    planes = [f for f in feats if f["kind"] == "plane" and not f.get("is_cap")]
+    used_faces, drop, new = set(), set(), []
+    for T in planes:
+        ti = T["_faces"][0]
+        if ti in used_faces:
+            continue
+        face = shape.Faces[ti]
+        nT, dT = T["_n"], T["_d"]
+        for w in face.Wires:
+            if w.isSame(face.OuterWire):
+                continue
+            rec = _recess_from_opening(shape, adj, by_face, T, w, tol)
+            if rec is None or set(rec["_faces"]) & used_faces:
+                continue
+            rec["position"] = position(rec["_c"]) if position else ""
+            used_faces.update(rec["_faces"])
+            for i in rec["_faces"]:
+                f = by_face.get(i)
+                if f is not None:
+                    drop.add(id(f))
+            new.append(rec)
+    return [f for f in feats if id(f) not in drop] + new
+
+
+def _recess_from_opening(shape, adj, by_face, T, wire, tol):
+    ti, nT, dT = T["_faces"][0], T["_n"], T["_d"]
+    walls = adj.neighbours(ti, wire.Edges)
+    if not walls:
+        return None
+    wall_feats = [(j, by_face.get(j)) for j in sorted(walls)]
+    planes_w, rounds_w = [], []
+    for j, f in wall_feats:
+        if f is None:
+            return None
+        if f["kind"] == "plane" and not f.get("is_cap") and abs(f["_n"].dot(nT)) < 1e-6:
+            planes_w.append((j, f))
+        elif f["kind"] == "round" and f.get("concave") and f.get("_a") is not None \
+                and abs(abs(f["_a"].dot(nT)) - 1) < 1e-6 and len(f["_faces"]) == 1:
+            rounds_w.append((j, f))
+        else:
+            return None  # holes, bosses, drafted or curved walls: not a slot / pocket
+    lows = []
+    for j in walls:
+        lo, hi = _t_range(shape.Faces[j], nT)
+        if hi > dT + tol * 10:
+            return None
+        lows.append(lo)
+    low = min(lows)
+    if max(lows) - low > tol * 10 or dT - low < tol * 10:
+        return None
+    below = set()
+    for j in walls:
+        below |= adj.neighbours(j) - walls - {ti}
+    if len(below) != 1:
+        return None
+    k = next(iter(below))
+    bf = by_face.get(k)
+    if bf is None or bf["kind"] != "plane" or bf.get("is_cap"):
+        return None
+    if bf["_n"].dot(nT) > 1 - 1e-6 and abs(bf["_d"] - low) < tol * 10:
+        through, floor = False, k
+        # the floor's outline must be closed by the walls
+        if adj.neighbours(k, shape.Faces[k].OuterWire.Edges) - walls:
+            return None
+    elif bf["_n"].dot(nT) < -1 + 1e-6 and abs(-bf["_d"] - low) < tol * 10:
+        through, floor = True, None
+        if nT.dot(canon_axis(nT)) < 0:
+            return None  # a through cutout is entered from the face pointing up (+Z / +Y / +X), like holes
+    else:
+        return None
+    depth = dT - low
+    e1, e2 = basis(nT)
+    obj = T["_obj"]
+    faces = sorted(walls | ({floor} if floor is not None else set()))
+
+    def on_top(p):
+        return p + nT * (dT - p.dot(nT))
+
+    common = {"_obj": obj, "_faces": faces, "_n": nT, "_floor": floor, "_top": T, "_walls": sorted(walls),
+              "_depth": depth, "_exit": None if floor is not None else k, "depth": _r(depth), "through": through,
+              "normal": _vl(nT)}
+    a = canon_axis(nT)
+
+    def finish(f, centre, half_width):
+        c = on_top(centre)
+        t0, t1 = sorted((c.dot(a), (c - nT * depth).dot(a)))
+        f.update(_c=c, center=_vl(c), _a=a, _base=perp_base(c, a), _t=(t0, t1), _r=half_width)
+        return f
+
+    # Obround slot: two facing parallel walls + two half-cylinder ends of radius = half the wall gap.
+    if len(planes_w) == 2 and len(rounds_w) == 2:
+        (_, p1), (_, p2) = planes_w
+        (_, r1), (_, r2) = rounds_w
+        gap = abs((p2["_c"] - p1["_c"]).dot(p1["_n"]))
+        if p1["_n"].dot(p2["_n"]) < -1 + 1e-6 and abs(r1["_r"] - r2["_r"]) < tol * 10 \
+                and abs(gap - 2 * r1["_r"]) < tol * 10:
+            c1, c2 = on_top(r1["_base"]), on_top(r2["_base"])
+            d = c2 - c1
+            if d.Length > tol * 10:
+                length = d.Length + 2 * r1["_r"]
+                d = canon_axis(d)
+                f = {"kind": "slot", "shape": "obround", "width": _r(2 * r1["_r"]), "length": _r(length),
+                     "direction": _vl(d), "_width": 2 * r1["_r"], "_length": length, "_dir": d, **common}
+                return finish(f, (c1 + c2) * 0.5, r1["_r"])
+    # Rectangular outline (4 walls in two facing pairs): a slot when sharp and elongated, else a pocket.
+    if len(planes_w) == 4:
+        ps = [f for _, f in planes_w]
+        pairs = []
+        for i in range(4):
+            for j in range(i + 1, 4):
+                if ps[i]["_n"].dot(ps[j]["_n"]) < -1 + 1e-6:
+                    pairs.append((ps[i], ps[j]))
+        if len(pairs) == 2 and abs(pairs[0][0]["_n"].dot(pairs[1][0]["_n"])) < 1e-6:
+            seps = [abs((q["_c"] - p_["_c"]).dot(p_["_n"])) for p_, q in pairs]
+            mids = [((p_["_c"] + q["_c"]) * 0.5).dot(p_["_n"]) for p_, q in pairs]
+            centre = pairs[0][0]["_n"] * mids[0] + pairs[1][0]["_n"] * mids[1] + nT * dT
+            corner_r = min((f["_r"] for _, f in rounds_w), default=0.0)
+            li = 0 if seps[0] >= seps[1] else 1
+            length, width = seps[li], seps[1 - li]
+            d = canon_axis(pairs[li][0]["_n"])
+            if not rounds_w and length >= 2 * width - tol * 10:
+                f = {"kind": "slot", "shape": "rectangular", "width": _r(width), "length": _r(length),
+                     "direction": _vl(d), "_width": width, "_length": length, "_dir": d, **common}
+                return finish(f, centre, width / 2)
+            if not through and len(rounds_w) in (0, 4):
+                f = {"kind": "pocket", "outline": "rectangular", "width": _r(width), "length": _r(length),
+                     "direction": _vl(d), "corner_radius": _r(corner_r), "_corner_radius": corner_r,
+                     "_corners": [j for j, _ in rounds_w], **common}
+                return finish(f, centre, corner_r)
+    if through:
+        return None
+    # Any other blind outline: a pocket, centred on its floor.
+    fl = shape.Faces[floor]
+    us = [v.Point.dot(e1) for j in walls for v in shape.Faces[j].Vertexes]
+    vs = [v.Point.dot(e2) for j in walls for v in shape.Faces[j].Vertexes]
+    corner_r = min((f["_r"] for _, f in rounds_w), default=0.0)
+    f = {"kind": "pocket", "outline": "other", "width": _r(min(max(us) - min(us), max(vs) - min(vs))),
+         "length": _r(max(max(us) - min(us), max(vs) - min(vs))), "corner_radius": _r(corner_r),
+         "_corner_radius": corner_r, "_corners": [j for j, _ in rounds_w], "floor_area": _r(fl.Area, 3), **common}
+    return finish(f, fl.CenterOfMass, corner_r)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chamfers
+# ─────────────────────────────────────────────────────────────────────────────
+
+CHAMFER_MAX_RATIO = 0.25  # a bevel at most this fraction of its neighbours' width is a chamfer, not a face
+
+
+def _is_line(e):
+    return len(e.Vertexes) == 2 and type(e.Curve).__name__ in ("Line", "LineSegment")
+
+
+def _line_dir(e):
+    return (e.Vertexes[1].Point - e.Vertexes[0].Point).normalize()
+
+
+def _extent_across(face, u, n):
+    """Width of a planar face measured in its plane, perpendicular to direction u."""
+    w = u.cross(n)
+    if w.Length < 1e-9:
+        return 0.0
+    w.normalize()
+    ts = [v.Point.dot(w) for v in face.Vertexes]
+    return max(ts) - min(ts) if ts else 0.0
+
+
+def _plane_intersection(pa, na, pb, nb):
+    """(point, direction) of the line where two planes meet."""
+    d = na.cross(nb)
+    d.normalize()
+    # point on both planes closest to pa: solve in the basis (na, nb, d)
+    import numpy as np
+    A = np.array([[na.x, na.y, na.z], [nb.x, nb.y, nb.z], [d.x, d.y, d.z]])
+    b = np.array([na.dot(pa), nb.dot(pb), d.dot(pa)])
+    x = np.linalg.solve(A, b)
+    return V(*x), d
+
+
+def _dist_to_line(p, q, d):
+    w = p - q
+    return (w - d * w.dot(d)).Length
+
+
+def chamfers(shape, feats, tol, adj=None):
+    """Planar strips that bevel the edge between two planar faces: 4 straight edges, the two long ones parallel
+    and shared (convex) with the two faces, inclined to both, and narrow (≤ CHAMFER_MAX_RATIO of each face's
+    width across the edge). Returns the new feature list."""
+    adj = adj or Adjacency(shape)
+    by_face = {}
+    for f in feats:
+        for i in f["_faces"]:
+            by_face.setdefault(i, f)
+    out, drop = [], set()
+    for P in [f for f in feats if f["kind"] == "plane" and not f.get("is_cap")]:
+        i = P["_faces"][0]
+        face = shape.Faces[i]
+        if len(face.Wires) != 1 or len(face.OuterWire.Edges) != 4:
+            continue
+        edges = face.OuterWire.Edges
+        if not all(_is_line(e) for e in edges):
+            continue
+        best = None
+        for a in range(4):
+            for b in range(a + 1, 4):
+                if abs(_line_dir(edges[a]).dot(_line_dir(edges[b]))) > 1 - 1e-6:
+                    if best is None or edges[a].Length + edges[b].Length > best[2]:
+                        best = (a, b, edges[a].Length + edges[b].Length)
+        if best is None:
+            continue
+        ea, eb = edges[best[0]], edges[best[1]]
+        others = [edges[k] for k in range(4) if k not in best[:2]]
+        if min(ea.Length, eb.Length) <= max(o.Length for o in others):
+            continue
+        fa = [j for j in adj.faces_of_edge(ea) if j != i]
+        fb = [j for j in adj.faces_of_edge(eb) if j != i]
+        if len(fa) != 1 or len(fb) != 1:
+            continue
+        A, B = by_face.get(fa[0]), by_face.get(fb[0])
+        if A is None or B is None or A["kind"] != "plane" or B["kind"] != "plane" or A is B:
+            continue
+        nP = P["_n"]
+        ok = True
+        for Q in (A, B):
+            ang = math.degrees(nP.getAngle(Q["_n"]))
+            if not 5.0 < ang < 85.0 or (Q["_c"] - P["_c"]).dot(nP) > tol * 10:  # inclined and convex
+                ok = False
+        if not ok:
+            continue
+        u = _line_dir(ea)
+        width = _dist_to_line(eb.Vertexes[0].Point, ea.Vertexes[0].Point, u)
+        if width > CHAMFER_MAX_RATIO * _extent_across(shape.Faces[fa[0]], u, A["_n"]) or \
+                width > CHAMFER_MAX_RATIO * _extent_across(shape.Faces[fb[0]], u, B["_n"]):
+            continue
+        corner, cd = _plane_intersection(A["_c"], A["_n"], B["_c"], B["_n"])
+        da = _dist_to_line(ea.Vertexes[0].Point, corner, cd)
+        db = _dist_to_line(eb.Vertexes[0].Point, corner, cd)
+        ax = canon_axis(cd)
+        ts = [v.Point.dot(ax) for e in (ea, eb) for v in e.Vertexes]
+        ch = {"kind": "chamfer", "_obj": P["_obj"], "_faces": [i], "_n": nP, "_c": P["_c"], "_A": A, "_B": B,
+              "_corner": corner, "_a": ax, "_base": perp_base(corner, ax), "_t": (min(ts), max(ts)), "_r": da,
+              "_size": da if abs(da - db) < tol * 10 else None, "_distances": (da, db),
+              "size": _r(da) if abs(da - db) < tol * 10 else None, "distances": [_r(da), _r(db)],
+              "angle_deg": _r(math.degrees(nP.getAngle(A["_n"])), 3), "length": _r(max(ea.Length, eb.Length)),
+              "normal": _vl(nP), "center": _vl(P["_c"]), "area": P["area"]}
+        drop.add(id(P))
+        out.append(ch)
+    return [f for f in feats if id(f) not in drop] + out
+
+
+def finish_features(feats):
+    """After IDs are assigned: name the faces composite features refer to."""
+    for f in feats:
+        if f["kind"] in ("slot", "pocket") and f.get("_top") is not None:
+            f["face"] = f["_top"].get("id")
+        if f["kind"] == "chamfer":
+            f["faces"] = [f["_A"].get("id"), f["_B"].get("id")]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Edges
+# ─────────────────────────────────────────────────────────────────────────────
+
+def edge_rows(shape, objname, owner_ids, tol):
+    """Every edge of one object: {_edge, _obj, _mid, kind, length, mid, faces (feature IDs), convexity}."""
+    adj = Adjacency(shape)
+    rows = []
+    for e, faces in adj.unique_edges():
+        try:
+            mid = e.valueAt((e.FirstParameter + e.LastParameter) / 2.0)
+        except Exception:
+            continue
+        ids = []
+        for fi in faces:
+            fid = owner_ids.get(fi)
+            if fid and fid not in ids:
+                ids.append(fid)
+        rows.append({"_edge": e, "_obj": objname, "_mid": mid, "kind": edge_kind(e), "length": _r(e.Length),
+                     "_length": e.Length, "mid": _vl(mid), "faces": ids,
+                     "convexity": edge_convexity(shape, e, faces, tol),
+                     "ends": [_vl(v.Point) for v in e.Vertexes]})
+    return rows

@@ -28,6 +28,8 @@ It describes the code as it exists in this repository. For setup instructions se
 19. [Known limitations and technical debt](#19-known-limitations-and-technical-debt)
 20. [Extending AetherCAD](#20-extending-aethercad)
 21. [Glossary](#21-glossary)
+22. [Precision layer (Phase 1): units, tolerance, side effects, locks, datums, standards](#22-precision-layer-phase-1)
+23. [Feature recognition (Phase 2): slots, pockets, chamfers, edges, threads, wall thickness](#23-feature-recognition-phase-2)
 
 ---
 
@@ -123,6 +125,9 @@ Major_Project/
 │   │   ├── freecad_client.py     JSON-RPC client, FreeCAD executable discovery and auto-launch
 │   │   ├── messages.py           Chat message persistence + history for the LLM
 │   │   ├── db.py                 MongoDB connection with in-memory fallback
+│   │   ├── units.py              Unit parsing / formatting shared by the fast path and tool arguments (§22.1)
+│   │   ├── standards.py          ISO hole-size tables: resolve requests, name recognised holes (§22.6)
+│   │   ├── precision.py          Session settings, side-effect report, verification display (§22.2–22.3)
 │   │   └── agent/
 │   │       ├── runner.py         One chat turn: LLM ⇄ tool loop, budget, retries, commit
 │   │       ├── prompt.py         System prompt text and compact model summary
@@ -138,7 +143,9 @@ Major_Project/
         ├── app/
         │   ├── layout.tsx        ThemeProvider, fonts
         │   └── page.tsx          Main page: chat, upload, undo/redo, 3D workspace, selection
+        ├── lib/units.tsx              Display-unit context: formats mm/deg in the session unit (§22.8)
         ├── components/
+        │   ├── cad/SettingsBar.tsx    Display unit, decimals and tolerance of the session
         │   ├── chat/ChatMessage.tsx   Message bubble + operation cards with verified values
         │   ├── chat/ChatInput.tsx     Textarea, attach button, suggestions
         │   ├── cad/CADViewer.tsx      React Three Fiber STL viewer (Z-up)
@@ -279,13 +286,16 @@ with a traceback (unexpected; also printed to FreeCAD's report view).
 |---|---|---|---|
 | `ping` | — | `{pong, gui, version}` | Health check |
 | `open_model` | `session_id, source_path, work_path, registry?` | `{info, registry}` | Import the uploaded file into a new document, save as `work.FCStd`, analyse |
-| `reload` | `session_id, work_path, registry?` | `{info, registry}` | Close and re-open `work.FCStd` (after undo/redo) |
-| `model_info` | `session_id, work_path, registry?` | `{info, registry, manual_edit}` | Re-analyse the current document; `manual_edit` = the user changed the geometry by hand in FreeCAD (§11.7) |
-| `apply` | `session_id, work_path, op, params, registry` | `{message, verified, volume_before, volume_after, info, registry}` | Run one edit operation transactionally |
+| `reload` | `session_id, work_path, registry?, datums?` | `{info, registry}` | Close and re-open `work.FCStd` (after undo/redo) |
+| `model_info` | `session_id, work_path, registry?, datums?` | `{info, registry, manual_edit}` | Re-analyse the current document; `manual_edit` = the user changed the geometry by hand in FreeCAD (§11.7) |
+| `apply` | `session_id, work_path, op, params, registry, tolerance?, locks?, datums?` | `{message, verified, touched, volume_before, volume_after, info, registry, lock_resolution?}` | Run one edit operation transactionally; tolerance and locks are checked before commit (§22) |
+| `evaluate_locks` | `session_id, work_path, locks, registry, datums?` | `{locks: [{…, value, unit}]}` | Current value of each lock target (used when a lock is created) |
+| `find_edges` | `session_id, work_path, registry, feature?, object?, convexity?, kind?, near?, min_length?, limit?` | `{edges, total, registry}` | Edges with IDs (E#), §23.4 |
+| `wall_thickness` | `session_id, work_path, registry, object?, threshold?, samples?` | `{parts: [{part, min_thickness, at, faces, thin}]}` | Minimum wall per part, §23.6 |
 | `find_features` | `session_id, work_path, registry, kind?, diameter_min?, diameter_max?, normal?, near?, object?, limit?` | `{features, total, registry}` | Filtered/sorted feature query (`object` = name or label) |
 | `dimensions` | `session_id, work_path, registry, object?, feature?, type?, limit?` | `{dimensions, total, patterns, registry}` | Driving dimensions (§7.9), filtered |
 | `highlight` | `session_id, work_path, ids, registry, select?, zoom?` | `{meshes: [{id, kind, positions, indices}], missing, registry}` | Triangles of features / dimensions / patterns for the web viewer; selects them in the FreeCAD GUI |
-| `pick` | `session_id, work_path, point, registry, mode?` | `{id, feature, part, face, distance, registry}` | The component under a point clicked in the web viewer (§8.4) |
+| `pick` | `session_id, work_path, point, registry, mode?` | `{id, feature, part, face, distance, edge?, registry}` | The component under a point clicked in the web viewer (§8.4); `mode: "edge"` returns the nearest edge |
 | `gui_selection` | `session_id, work_path, registry` | `{ids, gui, registry}` | What is selected in the FreeCAD window, as feature / part IDs (§8.4) |
 | `show_window` | `session_id?, work_path?` | `{shown}` | Bring FreeCAD and the session document to the front |
 | `measure` | `session_id, work_path, a, b, registry` | distances (see [§9.3](#93-query-methods)) | Measure between features, objects or points |
@@ -491,8 +501,16 @@ The dimension layer is what lets a request like "make it 120 long" become one ex
 - **Hole positions** (`edge_distance`): for each hole, the nearest face parallel to its axis on the material side,
   one per direction, provided the hole's projection lands on that face.
 
-Each dimension is `{id, type, value, refs, axis, object, label}` where `id` is the two feature IDs, e.g. `P5-P6`
-or `H3-P5` (lower coordinate first for plane pairs). Because the IDs are stable, dimension IDs are too. Dimensions
+- **Hole to hole** (`center_distance`, Phase 1): each hole's nearest parallel neighbour(s) (ties kept, so every bolt
+  hole has both neighbours), `H1-H2`.
+- **Coaxiality** (`coaxial`): parallel holes whose axes are closer than the smaller radius, `H1◎H2`, value = axis offset.
+- **Angles** (`angle`): adjacent planar faces that are neither parallel nor square, `P3∠P7`, value = included angle in
+  degrees (`unit: "deg"`; 90° = square corner, 135° = a 45° chamfer next to its face).
+- **Radial** (`diameter` / `radius`): boss diameters `C1.Ø`, fillet and sphere radii `R2.R`.
+
+Each dimension is `{id, type, value, refs, axis, object, label, unit?}` where `id` is built from the feature IDs, e.g.
+`P5-P6` or `H3-P5` (lower coordinate first for plane pairs). A hole midway between two parallel faces always refers to
+the lower-numbered face, so edge-distance IDs don't flip between analyses. Because the IDs are stable, dimension IDs are too. Dimensions
 are computed lazily and cost ~0.25 s for a 30-part assembly.
 
 ### 7.10 Model info structure (`_model_info`)
@@ -607,12 +625,16 @@ produce *"Unknown feature id … Use get_model_info / find_features"* so the LLM
 | Operation | Parameters | Algorithm |
 |---|---|---|
 | `resize_hole` | `hole`, `diameter` | **Fill** the old hole (`_fill_hole`), then **cut** a new cylinder of the new diameter on the same axis and axial range. Open ends are extended by a margin (`max(2 % of diag, 1 mm)`) so the cut fully clears. A blind hole with a drill tip gets a new tip cone with the same angle; countersinks are recreated with the same outer diameter and angle. |
-| `move_hole` | `hole`, `offset` or `to` | Only the component **perpendicular** to the hole axis is used (a hole can't move along its own axis). Fill the old hole, cut an identical one (tip, countersinks) on the shifted axis. |
-| `add_holes` | `face` (plane), `diameter`, `positions?`, `depth?` | Each position is projected onto the face plane and must lie inside the face. A cylinder starts a margin above the face and goes along −normal: through (depth = 2 × diag) or blind (given depth). No positions → face centre. Multiple holes are cut in one boolean. |
-| `remove_features` | `features[]` | Groups by object, then calls OpenCASCADE **defeaturing** on all the feature's faces (walls, caps, countersink cones). If defeaturing changes nothing or yields an invalid shape: a single hole is plugged exactly; otherwise it errors with "try removing them one at a time". |
-| `set_dimension` | `dimension` (e.g. `"P5-P6"`, `"H3-P5"`, `"H1-H2"`), `value`, `anchor?` | Plane–plane: moves the faces so the distance is exact; `anchor` = `start` (first ID stays, default), `end` (second stays) or `symmetric`. Hole–plane: moves the hole (and its counterbore) along the face normal. Hole–hole: moves the holes along the line joining them. Any parallel pair works, not only listed dimensions. Verified by re-measuring the dimension. |
-| `edit_hole_pattern` | `pattern`, `pcd?`, `count?`, `start_angle?`, `spacing?`, `spacing_u?`, `spacing_v?`, `anchor?` | Computes the new hole positions (`analysis.pattern_positions`), fills all holes in one defeaturing pass and re-cuts them (tips, countersinks, counterbores kept). Count changes keep the surviving IDs; grids can't change count. Verified by re-detecting the pattern. |
-| `push_pull_face` | `face`, `distance` | Extrudes the planar face along its outward normal by `distance` into a prism; **fuse** if positive (adds material), **cut** if negative (removes). Holes, countersinks and counterbores that open on the face are re-cut relative to its new position, so blind features keep their depth below it and through holes just get longer. |
+| `move_hole` | `hole`, `offset`, `to` or `to_datum` | Only the component **perpendicular** to the hole axis is used (a hole can't move along its own axis). `to_datum: {B: 15, C: 20}` places the axis at those distances from the datum faces (§22.5). Fill the old hole, cut an identical one (tip, countersinks) on the shifted axis. |
+| `add_holes` | `face` (plane), `diameter`, `positions?`, `depth?` | A position is `[x,y,z]`, `[u,v]` on an axis-aligned face, or datum distances `{B: 15, C: 20}`. Each position is projected onto the face plane and must lie inside the face. A cylinder starts a margin above the face and goes along −normal: through (depth = 2 × diag) or blind (given depth). No positions → face centre. Multiple holes are cut in one boolean. |
+| `remove_features` | `features[]` | Groups by object, then calls OpenCASCADE **defeaturing** on all the feature's faces (walls, caps, countersink cones, slot / pocket walls and floor, chamfer face). If defeaturing changes nothing or yields an invalid shape: a single hole, slot or pocket is plugged exactly; otherwise it errors with "try removing them one at a time". |
+| `edit_slot` | `slot`, `width?`, `length?`, `depth?`, `offset?` / `to?` / `to_datum?` | Fuses an exact plug of the slot (its obround / rectangular outline × depth), cuts the new slot from the same opening (extended through for through slots). Refuses a blind depth that would break through. §23.2 |
+| `edit_pocket` | `pocket`, `depth?` or `corner_radius?` | Depth: moves the floor like `push_pull_face` (holes in the floor keep their depth below it). Corner radius: removes the corner rounds by defeaturing and fillets the vertical wall-to-wall edges (0 = sharp). §23.2 |
+| `edit_chamfer` | `chamfer`, `size?` or `to_fillet?` | Removes the chamfer face by defeaturing (sharp edge back), then chamfers or fillets that edge. §23.3 |
+| `set_dimension` | `dimension` (e.g. `"P5-P6"`, `"H3-P5"`, `"H1-H2"`, `"P3∠P7"`, `"C1.Ø"`, `"R2.R"`, `"H1◎H2"`), `value`, `anchor?` | Plane–plane: moves the faces so the distance is exact; `anchor` = `start` (first ID stays, default), `end` (second stays) or `symmetric`. Hole–plane: moves the hole (and its counterbore) along the face normal. Hole–hole: moves the holes along the line joining them; value 0 makes them coaxial. **Non-parallel planes** (or `∠`): rotates one face about the straight edge it shares with the other (anchor start: the second rotates) — the swept wedge, bounded by the face's flat convex neighbours, is fused or cut. **`.Ø` / `.R`**: holes are re-cut, bosses grown (fuse a tube) or shrunk (cut a tube), cylindrical fillets removed by defeaturing and re-made on the restored edge. Verified by re-measuring the dimension. |
+| `set_hole_profile` | `hole`, `diameter?`, `counterbore_diameter?`, `counterbore_depth?`, `countersink_diameter?`, `countersink_angle?`, `remove_counterbore?`, `remove_countersink?`, `note?` | Fills the hole (and its counterbore/countersinks) and re-cuts it on the same axis with the same far end (through / blind depth / drill tip) and entry face, with the requested counterbore or countersink. Unspecified parts are kept. Used by `set_hole_standard`. Every requested size is verified. |
+| `edit_hole_pattern` | `pattern`, `pcd?`, `count?`, `start_angle?`, `spacing?`, `spacing_u?`, `spacing_v?`, `count_u?`, `count_v?`, `anchor?` | Computes the new hole positions (`analysis.pattern_positions`), fills all holes in one defeaturing pass and re-cuts them (tips, countersinks, counterbores kept). Count changes keep the surviving IDs; grids change their counts with `count_u` / `count_v` about the same centre. Verified by re-detecting the pattern. |
+| `push_pull_face` | `face`, `distance` | Extrudes the planar face along its outward normal by `distance` into a prism; **fuse** if positive (adds material), **cut** if negative (removes). Holes, countersinks and counterbores that open on the face are re-cut relative to its new position, so blind features keep their depth below it and through holes just get longer. Since Phase 2: cylindrical fillets running along the face's edges are lifted and re-made at the new corner, and pushing out fills the footprints of bosses standing on the face (§23.7). |
 | `set_face_distance` | `face`, `reference_face`, `distance` | Faces must be parallel. Computes the current signed distance along `face`'s normal and push/pulls `face` by the difference, so the distance becomes exact. The reference stays fixed. Used for "make it 120 mm long". |
 | `fillet_edges` | `radius`, `edges[]`, `object?` | Resolves edges via selectors (below), keeps only **sharp** edges, calls `makeFillet`. Verification expects a new round with that radius. |
 | `chamfer_edges` | `size`, `edges[]`, `object?` | Same selection; `makeChamfer` with equal distance. |
@@ -690,7 +712,10 @@ flowchart TD
 | `fillet_edges` | at least one *new* round with that radius exists |
 
   A verification entry has `status: "ok"` with the measured `value`, or `status: "missing"` with a note (for
-  example the feature merged into another). The UI shows ✓ chips and ⚠ warnings accordingly, and the system
+  example the feature merged into another). Since Phase 1 every entry with a target also carries
+  `requested, achieved, deviation, within_tolerance, unit`, the check happens **before** the transaction is
+  committed, and more operations are verified (push/pull offset, pattern values, new holes, datum distances,
+  translations, scaling, removals, property values); see §22.2. The UI shows ✓ chips and ⚠ warnings accordingly, and the system
   prompt tells the LLM to call a value "verified" only when it appears here.
 - `volume_before` / `volume_after` per object are returned for every edit, so the effect of any change
   (including custom scripts) is visible.
@@ -911,8 +936,9 @@ units, conventions).
 
 | Group | Tools |
 |---|---|
-| Query | `get_model_info`, `list_objects`, `find_features` (filters: kind, diameter range, normal, near, object), `measure` |
-| B-rep edits | `resize_hole`, `move_hole`, `add_holes`, `remove_features`, `push_pull_face`, `set_face_distance`, `fillet_edges`, `chamfer_edges`, `add_primitive`, `transform_object`, `scale_object` |
+| Query | `get_model_info`, `list_objects`, `find_features` (filters: kind, diameter range, normal, near, object), `list_dimensions`, `measure`, `list_locks` |
+| Session (no geometry change) | `lock_dimension`, `unlock_dimension`, `set_datums` |
+| B-rep edits | `resize_hole`, `set_hole_standard` (→ engine `set_hole_profile`), `move_hole`, `add_holes`, `remove_features`, `push_pull_face`, `set_face_distance`, `set_dimension`, `edit_hole_pattern`, `fillet_edges`, `chamfer_edges`, `add_primitive`, `transform_object`, `scale_object` |
 | Parametric edits | `set_property`, `set_sketch_constraint`, `set_spreadsheet_cell`, `delete_object` |
 | Escape hatch | `run_freecad_python` (mapped to the engine op `run_python`); only offered when `AGENT_ALLOW_PYTHON=1` |
 
@@ -1002,11 +1028,16 @@ There is no authentication. Session-specific endpoints return 404 for an unknown
 | `POST /cad/undo/{session_id}` | — | `CadState`; stores an `undo` message |
 | `POST /cad/redo/{session_id}` | — | `CadState`; stores a `redo` message |
 | `POST /cad/highlight/{session_id}` | `{ids, select?}` | `{meshes, missing}`: triangles per ID (features, dimensions, patterns, parts); also selects them in FreeCAD |
-| `POST /cad/pick/{session_id}` | `{point: [x,y,z], mode?: "feature"\|"part"}` | `{id, feature, part, face, distance}` (`id` null when nothing is there) |
+| `POST /cad/pick/{session_id}` | `{point: [x,y,z], mode?: "feature"\|"part"\|"edge"}` | `{id, feature, part, face, distance, edge?}` (`id` null when nothing is there) |
 | `GET /cad/freecad-selection/{session_id}` | — | `{ids, gui}` |
 | `POST /cad/show/{session_id}` | — | `{shown}` |
 | `GET /cad/model/{session_id}` | `?v=` (default head) | STL file (`model/stl`, `Cache-Control: no-store`) |
 | `GET /cad/download/{session_id}` | `?format=step\|iges\|stl\|fcstd\|brep` | File attachment `<stem>_v<N>.<ext>` |
+| `PUT /cad/settings/{session_id}` | `{display_unit?: "mm"\|"in", precision?, tolerance_length?, tolerance_angle?}` | `CadState` |
+| `POST /cad/locks/{session_id}` | `{target, mode?: "value"\|"centered", axis?}` | `CadState` (400 if the target doesn't exist) |
+| `POST /cad/locks/{session_id}/remove` | `{target, mode?}` (`target: "all"` clears) | `CadState` |
+| `PUT /cad/datums/{session_id}` | `{A?, B?, C?}` plane IDs, `"default"` resets one | `CadState` (re-analysed) |
+| `GET /cad/wall-thickness/{session_id}` | `?object=&threshold=` | `{parts: [WallThickness]}` |
 
 ### 13.3 Chat
 
@@ -1200,11 +1231,16 @@ Selecting a session calls `GET /cad/state` and `POST /cad/activate`, which re-op
   ],
   "registry": {"items": {"P1": {"k": "plane", "n": [0,-1,0], "d": -10.0, "c": [0,10,0]}}, "next": {"P": 41}},
   "info": { "...": "model info, §7.7" },
-  "dirty": false
+  "dirty": false,
+  "settings": {"display_unit": "mm", "precision": 3, "tolerance": {"length": 0.001, "angle": 0.01}},
+  "locks": [{"target": "P1-P2", "mode": "value", "value": 10.0, "unit": "mm", "label": "P1-P2 = 10.000 mm"},
+            {"target": "H3", "mode": "centered", "axis": "X", "value": {"X": 0.0}, "label": "H3 centred along X"}],
+  "datums": {"A": "P1"}
 }
 ```
 
-`head` is the version currently loaded; `versions[head+1:]` is the redo branch. `dirty` is true only while a
+`settings` carry over when a new file is uploaded into the session; `locks` and `datums` (explicit choices only) are
+reset because they refer to the old model's IDs. `head` is the version currently loaded; `versions[head+1:]` is the redo branch. `dirty` is true only while a
 turn has applied edits that are not yet committed.
 
 ### 16.2 MongoDB collections (`MONGODB_DB_NAME`, default `freecad_ai`)
@@ -1239,8 +1275,11 @@ turn has applied edits that are not yet committed.
   version: number;                 // head
   versions: VersionEntry[];        // up to and including head
   can_undo: boolean; can_redo: boolean; dirty: boolean;
-  info: ModelInfo;                 // §7.7
+  info: ModelInfo;                 // §7.7 (+ datums, hole standard names)
   mesh_url: string;                // "/cad/model/<id>?v=<head>"
+  settings: SessionSettings;       // §22.1
+  locks: Lock[];                   // §22.4
+  datums: {A?, B?, C?};            // explicit datum choices (resolved ones are in info.datums)
 }
 ```
 
@@ -1355,7 +1394,9 @@ body limit.
 round-trips them through STEP like a real upload, and checks recognition (holes, countersinks, counterbores,
 drill tips, bosses, fillets, patterns, dimensions, assemblies, B-spline faces) and every edit against independent
 measurements (bounding boxes, analytic volume changes, re-analysis), plus ID stability, rollback, highlight and
-performance — 153 checks, ~10 s. `backend/app/agent/test_fastpath.py` covers the fast-path parser.
+performance, and since Phase 1 angle/radial/hole-to-hole dimensions, tolerance rollback, locks, datums and hole
+profiles — 242 checks, ~13 s. `python -m unittest discover -s app -t .` (from `backend/`) runs 37 pure-Python
+tests: the fast-path parser, units, standards, the side-effect report and the tool-argument unit layer.
 
 ## 20. Extending AetherCAD
 
@@ -1394,7 +1435,7 @@ raise `MODEL_SUMMARY_CHARS`, `LLM_HISTORY_MESSAGES` and `LLM_INPUT_TOKEN_BUDGET`
 | **B-rep** | Boundary representation: a solid described by its faces, edges and vertices (what STEP/IGES contain). |
 | **Bridge** | The JSON-RPC server running inside FreeCAD (`freecad_bridge/server.py`). |
 | **Engine** | The code inside FreeCAD that analyses and edits geometry (`freecad_bridge/engine.py`). |
-| **Feature** | A recognised geometric element with an ID: hole `H`, boss `C`, round/fillet `R`, plane `P`, cone `K`, sphere `S`, free-form face `F`. Whole parts have part IDs `B`. |
+| **Feature** | A recognised geometric element with an ID: hole `H`, boss `C`, round/fillet `R`, plane `P`, cone `K`, sphere `S`, free-form face `F`, slot `SL`, pocket `PK`, chamfer `CH`. Whole parts have part IDs `B`; edges `E`. |
 | **Registry** | The map of feature IDs to geometric descriptors used to keep IDs stable across edits. |
 | **Cap** | A planar face that closes the bottom of a blind hole (hidden from lists). |
 | **Defeaturing** | OpenCASCADE operation that removes faces and heals the solid as if the feature had never been modelled. |
@@ -1402,3 +1443,320 @@ raise `MODEL_SUMMARY_CHARS`, `LLM_HISTORY_MESSAGES` and `LLM_INPUT_TOKEN_BUDGET`
 | **Turn** | One user message and everything the agent does in response (≤ 1 new version). |
 | **TPM / RPD** | Tokens per minute / requests per day: LLM provider rate limits. |
 | **Verified value** | A dimension re-measured from the geometry after an edit, not just the requested value. |
+
+---
+
+## 22. Precision layer (Phase 1)
+
+Goal: every number the system shows or produces is exact, unit-correct and explicitly verified. All of it sits on the
+existing pipeline; FreeCAD remains the only geometry kernel.
+
+```mermaid
+flowchart LR
+    U["user text / LLM tool args<br/>'4.5 in', '1/4&quot;', '30°'"] --> P["units.py<br/>→ mm / deg"]
+    P --> T["tools.execute<br/>(set_hole_standard → standards.resolve)"]
+    T --> E["engine.apply<br/>tolerance + locks + datums"]
+    E -->|"inside the transaction"| V{"within tolerance?<br/>locks kept?"}
+    V -- no --> AB["abort → try other anchor<br/>or refuse with reason"]
+    V -- yes --> C["commit, return verified + touched"]
+    C --> SE["precision.side_effects<br/>(info before vs after)"]
+    SE --> UI["chat: ✓/⚠ chips, side-effect table"]
+```
+
+### 22.1 Units and session settings (`app/units.py`, `app/precision.py`)
+
+- One parser for the fast path and the tool-argument layer: mm, cm, m, µm, in / `"`, ft / `'`, fractions (`1/4"`,
+  `3 1/2 in`), degrees / rad, and size prefixes `Ø ⌀ dia D` (diameter) and `R r radius` (radius).
+- Tool arguments (`tools.coerce_args`): numbers from the LLM are mm (degrees for angles); strings may carry a unit and
+  are converted exactly. For `set_dimension`, an angle dimension (`∠`, or two non-parallel planes in the model info)
+  takes degrees and refuses a length unit, and vice versa.
+- Fast path: a bare number is in the **session display unit**; an explicit unit always wins.
+- Session settings in `meta.json` (`settings`): `display_unit` (mm | in), `precision` (decimals; inch shows one more),
+  `tolerance.length` (mm) and `tolerance.angle` (°). Changed with `PUT /cad/settings` or the settings bar.
+
+### 22.2 Tolerance-aware verification (`engine._apply_once`, `_verify_item`)
+
+Operations append `(id, field, requested)` to `ctx.verify`. After the operation and recompute, still **inside** the
+transaction, the engine re-analyses (with the expected registry patches) and measures every entry at full precision:
+`{requested, achieved, deviation, within_tolerance, unit}`. Vectors (hole centres, bounding boxes) use the Euclidean
+distance; patterns compare each requested key (count exactly, start angles of full circles modulo the step). Any entry
+outside the tolerance aborts the transaction and raises
+*"Outside tolerance, so the edit was rolled back: H3 diameter requested 8.0, achieved 8.01 (deviation 0.01 > ±0.001 mm)"*.
+
+| Operation | Verified with a target |
+|---|---|
+| `resize_hole`, `set_hole_profile` | diameter (+ counterbore diameter/depth, countersink diameter/angle) |
+| `move_hole` | hole centre (or each datum distance with `to_datum`) |
+| `add_holes` | each new hole's diameter, and the number of new holes |
+| `set_dimension`, `set_face_distance` | the dimension / distance |
+| `push_pull_face` | the face's new offset along its normal |
+| `edit_hole_pattern` | requested pcd / spacing / count / start angle |
+| `fillet_edges` | each new round's radius |
+| `transform_object` (translation only), `scale_object` | bounding-box min / size |
+| `set_property`, `set_sketch_constraint` | the value read back |
+| `remove_features` | the features are gone (no tolerance) |
+
+`apply` also returns `touched`: the features the operation moved or rebuilt (registry patches, verified IDs, the
+refs of verified dimensions, new and removed IDs).
+
+### 22.3 Side-effect report (`precision.side_effects`)
+
+The backend snapshots every dimension value, feature parameter (hole diameter/depth, counterbore, countersink, boss
+diameter/length, radii, cone angles) and pattern value of the model info before and after an edit. Every change larger
+than the tolerance that is not a target (`precision.target_keys(verified)`) becomes a row
+`{key, label, before, after, delta, kind, expected}`; `expected` = it involves a touched feature. Removed values are rows
+with `after: null`; added ones are only counted. The UI record gets up to 100 rows (unexpected first); the LLM gets
+counts and the first few unexpected changes as text.
+
+### 22.4 Locks (`cad_service.add_lock`, `engine._lock_value`, `_lock_violations`, `_alternatives`)
+
+A lock is `{target, mode, axis?, value, unit, label}`: target = a dimension ID, a feature ID (its radius, axis position
+and depth / plane offset and normal), a pattern ID or a part ID (volume + bounding box); `mode: "centered"` keeps a
+hole/boss at its part's bounding-box centre along the given axis (or every axis perpendicular to its own). The value is
+read from the engine when the lock is created (`evaluate_locks`). On every edit the engine evaluates all locks after the
+operation; a change beyond the tolerance (or a missing target) raises a lock violation inside the transaction. Then:
+
+- `set_dimension` **without an explicit anchor** is retried with `end` and `symmetric`;
+- `set_face_distance` is retried with the face and reference swapped;
+- the first attempt that keeps every lock is committed, and the message says which lock decided it
+  (`lock_resolution` in the record); if none does, the edit is refused: *"Refused: locked P1-P2 would change from 10.0
+  to 12.0. Nothing was changed."*
+
+An explicit anchor is never overridden. Locks are per session, persist across undo/redo, and are cleared on re-upload.
+
+### 22.5 Datums (`engine._resolve_datums`, `_add_datum_positions`, `_datum_point`)
+
+Datums A, B, C are planar faces. Defaults on the largest part: A = largest planar face, B = largest outermost face
+perpendicular to A, C = largest outermost face perpendicular to both (ties prefer the low side, −X/−Y/−Z). Explicit
+choices (`meta.datums`, plane IDs) override per letter. `info.datums` lists the resolved faces. Each hole/boss on the
+datum part gets `datum_position {A, B, C}`: the axis distance from datums parallel to the axis and the entry / free-end
+distance from a datum perpendicular to it, always measured into the material. Datum coordinates are solved exactly
+(least squares on the plane equations; directions the datums don't fix keep the current position) for
+`move_hole(to_datum)` and `add_holes(positions=[{…}])`.
+
+### 22.6 Standard sizes (`app/standards.py`)
+
+Tables: ISO 273 clearance holes (fine / normal / coarse, M1.6–M36), tap drills for coarse M2–M24 and common fine pitches,
+ISO 4762 counterbores (DIN 974-1 diameters, depth = head height + clearance), ISO 10642 countersinks (90°, theoretical
+head diameter), metric drills (0.5–13 by 0.1, 13–25 by 0.5, 26–50 by 1, plus tap-drill sizes) and fractional drills
+(1/64"–1"). `annotate(info)` runs on every info update and names each hole (`standard`, `standards`, most specific
+first: counterbore/countersink screw, clearance, tap drill, fractional drill, metric drill). `resolve(size, type, fit)`
+turns a request into exact geometry for the engine op `set_hole_profile`.
+
+### 22.7 New dimension types and edits
+
+See §7.9 for the types and §9.2 (`set_dimension`) for how angles, radii and coaxiality are edited.
+
+### 22.8 Frontend
+
+`lib/units.tsx` provides a `UnitsContext` (from `CadState.settings`) with `len`, `ang`, `vec` formatters used by the
+model panel, the inspector and the operation cards. `SettingsBar` edits unit, decimals and tolerance. Operation cards
+show ✓ (green, within tolerance) or ⚠ (amber) chips with the deviation and a tooltip with requested/achieved, a lock note,
+and a collapsible side-effect table (unexpected rows amber). The Dimensions tab shows the datums and locks strip and a
+lock icon on every dimension; the inspector has a lock toggle per card, "Keep centred" for holes and bosses, datum A/B/C
+buttons on planar faces, and shows standard names and datum positions.
+
+---
+
+## 23. Feature recognition (Phase 2)
+
+Recognition runs per part in `_features_of_shape`; after holes, bosses, rounds, cones and planes are found, three
+passes in `analysis.py` turn groups of faces into composite features. A composite feature **owns** its faces (they are
+removed from the plane / round lists), so every face keeps exactly one ID; the test suite checks coverage and that no
+face is owned twice (except hole floors and boss ends, which are also planes by design). `analysis.Adjacency` maps
+every edge to the faces that share it.
+
+### 23.1 Fillet chains (`analysis.fillet_chains`)
+
+Rounds and spheres that meet along a **tangent** edge (`edge_convexity` = tangent) with the same radius are merged
+(union-find). The chain keeps the descriptor of its largest cylindrical member (so the ID is stable) and reports
+`chain_faces` and the summed length; spherical corner blends disappear into it. Torus faces are marked `toroidal`.
+
+### 23.2 Slots and pockets (`analysis.recesses`)
+
+For each planar face T and each **inner** outline of T: the faces across that outline are the walls. All walls must be
+planes perpendicular to T or concave vertical cylinder segments, end at the same depth, and below them there must be
+exactly one face: a planar **floor** parallel to T whose outline is closed by the walls (blind), or the opposite face
+(through; entered from the face whose normal points to +Z/+Y/+X, like holes). Classification in plan:
+
+| Walls | Feature |
+|---|---|
+| 2 facing parallel planes + 2 half-cylinder ends of radius = half the gap | obround slot |
+| 4 planes in two facing pairs, no corner rounds, length ≥ 2 × width | rectangular slot |
+| 4 planes + 0 or 4 corner rounds (blind) | rectangular pocket (`corner_radius`) |
+| anything else blind | pocket (`outline: "other"`) |
+| anything else through | not a feature (stays planes / rounds) |
+
+Slots, pockets (and chamfers) carry the axial internals (`_a` = opening normal, `_base`, `_t`, `_r`), so they reuse the
+axial ID descriptor, `_dim_value` (edge distances to faces) and `set_dimension` hole-style edits. Public fields:
+`shape/outline, width, length, depth, through, center (of the opening), direction, face, corner_radius, normal`.
+
+Edits: `edit_slot` builds the slot solid from its parameters (`_slot_solid`: obround = box + two cylinders, or box,
+placed with `_frame(centre, direction, normal)`), fuses the old one (exact plug), cuts the new one.
+`edit_pocket(depth)` moves the floor with `_push_faces` (a pseudo-plane for the floor); `_breaks_through` probes below
+several floor points first. `edit_pocket(corner_radius)` defeatures the corner rounds and fillets the vertical edges
+lying on two wall planes. Removal falls back to an exact plug (`_recess_plug`).
+
+### 23.3 Chamfers (`analysis.chamfers`)
+
+A planar face with one wire of 4 straight edges whose two longest edges are parallel and each shared with one planar
+face (A, B); the face is inclined 5°–85° to both, both edges are convex, and its width is ≤ `CHAMFER_MAX_RATIO` (0.25)
+of A's and B's widths across the edge. The original corner line is the intersection of planes A and B; the setbacks
+`distances = [dA, dB]` are measured from it (`size` when equal), `angle_deg` = angle between the chamfer and A. The
+descriptor is the corner line, so resizing keeps the ID. `edit_chamfer` defeatures the face and re-chamfers / fillets
+the restored edge (`_corner_edges`).
+
+### 23.4 Edge IDs (`_edge_table`, `_edge_ids`, `analysis.edge_rows`)
+
+Every edge row has `kind` (line / circle / arc / bspline …), `length`, `mid`, `ends`, `faces` (IDs of the features
+owning the adjacent faces) and `convexity` (convex / concave / tangent from the face normals and a probe along their
+bisector; seam / free otherwise). The edge table is computed only when needed. Edge IDs live in `registry.edges`
+(`{E#: {o: object, k: kind, m: midpoint, l: length}}`) and are matched by object, kind, midpoint (±10·tol) and length;
+unmatched entries are dropped. IDs are assigned only when an edge is listed (`find_edges`), picked (`pick` mode
+`edge`) or highlighted, so the registry stays small for big assemblies. `_select_edges` accepts `{edge: "E12"}` and
+finds the edge in the current shape by midpoint and length. Highlighting an edge returns `lines` (segment pairs) and
+its data; the viewer draws them with drei `<Line>`.
+
+### 23.5 Threads (`_cad_threads`, `cad_service.set_thread`)
+
+For FCStd files, every `PartDesign::Hole` with `Threaded` true gives `{spec: ThreadSize (e.g. "M6x1.0"), depth:
+ThreadDepth, modeled: ModelThread}`; its profile sketch's circle centres (global placement) are matched to recognised
+hole axes → `info.threads`. Users add annotations with `set_thread` (stored in `meta.threads`, checked against the
+tap drill, `note` when the hole isn't tap-drill sized). `annotate_threads` puts `thread` on each hole at every info
+update (session annotations win). FreeCAD's STEP exporter can't write threads / PMI, so annotations stay in the session.
+
+### 23.6 Wall thickness (`wall_thickness`)
+
+For up to `samples` triangle centroids per face (≤ 3,000 rays per request), a segment from the point into the material
+along the inward normal is intersected with the solid (`shape.common(edge)`); the length of the first inside segment is
+the local thickness. The thinnest ray's two faces are then measured exactly with `distToShape` when they don't touch.
+Returns the minimum, the two points and faces, and the faces whose thickness is under `threshold`.
+
+### 23.7 Face moves: fillets and bosses (`_fillets_on`, `_push_profile`)
+
+Before a planar face moves, cylindrical fillets that are tangent to it along one of its edges and whose other neighbour
+is a plane are removed by defeaturing (holes on the face are then plugged with exact geometry, `_plug_holes`); after the
+move each is re-made with its radius on the edge where the moved plane now meets the other plane (`_corner_edges`), and
+its registry axis is shifted so it keeps its ID. When a face is pushed **out**, the profile is the outer boundary minus
+only the openings into the part (holes, pockets); boss footprints are filled, so a boss lower than the new face is
+buried instead of leaving a pocket above it.
+
+## 24. Safer, smarter editing (Phase 3)
+
+### 24.1 Preview / dry run
+
+`engine.apply(..., preview_mesh=path)` runs the edit exactly like a real one (transaction, recompute, re-analysis,
+verification, pre-edit checks, locks), exports the result to `path` and then **aborts** the transaction, so the document
+is unchanged. A plan of several steps can't be measured in one transaction, so `plans.preview` applies the steps,
+exports the mesh and calls `discard_uncommitted` (reload the head version's FCStd). The pending plan is stored in
+`meta["pending"]` (`id`, `steps` with their verified values, `summary`, `ok` / `error`) and shown as a ghost over the
+model with Apply / Cancel.
+
+| Entry point | Behaviour |
+|---|---|
+| `preview <command>` (fast path) | The command's operation is previewed instead of applied |
+| `POST /cad/preview/{sid}` `{steps, summary}` | Preview any list of tool calls |
+| `propose_plan` (agent tool) | Same, from the LLM; ends the turn |
+| Compound requests (`runner.is_compound`: ≥ 2 clauses with ≥ 2 different edit verbs) | Edit-tool calls are queued, not applied; at the end of the turn they become one previewed plan. If that preview fails at step N, the model gets the error once with steps 1..N−1 kept and sends replacements for step N onwards (`_plan_retry`) |
+| Large edits (`plans.is_large`: shell, split, scale, mirror part, draft, replace, ≥ 3 edits, removing ≥ 3 features, patterns ≥ 6) | Previewed instead of applied |
+| `apply` / `yes` / `go ahead`, `cancel` / `no` (fast path), `POST /cad/plan/{sid}/apply` / `cancel` | Apply runs every step for real and commits **one** version; if step N fails, all steps are rolled back to the start version |
+
+### 24.2 Pre-edit checks (`engine._pre_checks`)
+
+Run inside `_apply_once` after verification, before commit:
+
+| Check | Result |
+|---|---|
+| A hole / slot / pocket / boss that disappears and isn't in `ctx.allow_removed` | Refused |
+| A new hole overlapping another (`_check_no_overlap` in `add_holes`, `move_hole`) or breaking out of the part | Refused, with the minimum distance |
+| A part that newly intersects another (`common` volume > 1e-3 mm³) | Refused ("pass force to do it anyway") |
+| A changed part's thinnest wall under `settings.min_wall` | Warning on the operation (`warnings`) |
+
+`force=True` skips the refusals (tool argument / API flag).
+
+### 24.3 New operations (`freecad_bridge/editing.py`)
+
+| Op | Parameters | Verification |
+|---|---|---|
+| `mirror_object` | object, plane (`XY`/`YZ`/`XZ` or face ID), at, mode copy / replace / fuse | bbox, new part count |
+| `mirror_features` | features, plane (`XZ` + at, `y = 20`, or a face ID), at | one new feature per source |
+| `pattern_feature` | feature, linear (count, spacing, direction) or circular (count, axis, center, angle) | new feature count (coincident copies skipped) |
+| `add_slot` | face, width, length, depth, center, direction, shape obround / rect | new `SL#` with the sizes |
+| `add_pocket` | face, length, width, depth, center, direction, corner_radius | new `PK#` with the sizes |
+| `add_counterbore` / `add_countersink` | hole, diameter, depth / angle | hole profile values |
+| `draft_faces` | faces, angle, neutral | face angles (`deg`) |
+| `split_object` | object, plane, at, keep both / above / below | part count, total volume |
+| `shell_object` | thickness, object, open_faces | volume, wall thickness |
+
+`feature_tool(shape, feature)` rebuilds a tool solid (cut or fuse) from a recognised hole / slot / pocket / boss; mirror
+and pattern transform it and apply it to the part, so copies are real features recognised with new IDs.
+
+### 24.4 Version tree (`cad_service`)
+
+Each version stores `parent` (and an optional `name`) and an info snapshot `versions/vN.json`. `commit_version` creates
+`max(v) + 1` with `parent = head`, so an edit after undo starts a branch and nothing is lost. Undo moves to the parent,
+redo to the newest child, `checkout` to any version, `rename_version` names it. `compare(a, b)` diffs the two snapshots
+(dimensions and feature values) and calls the bridge's `compare_versions`, which opens both FCStd files hidden and
+returns per part the added (`b − a`) and removed (`a − b`) volumes and meshes, drawn green / red in the viewer.
+
+### 24.5 Ambiguity and tool groups
+
+`ask_user(question, choices[{id, label}])` ends the turn; the browser shows the choices as buttons that highlight the
+feature on hover and send "Use <id>" with it selected. To keep the per-request tool text within the free-tier budget,
+optional tools are in groups (`modeling`, `analysis`, `more`) loaded by `load_tools` or pre-loaded by keywords
+(`tools.groups_for_message`). `runner._guard_unverified_claims` replaces a reply that reports edits when no tool ran.
+
+## 25. Analysis and manufacturing (Phase 4)
+
+### 25.1 Materials and mass (`app/materials.py`, `manufacturing.mass_properties`)
+
+`meta["materials"]` maps part IDs to material keys (17 materials with density, price per kg, removal rate, category;
+aliases like "aluminum", "al 6061", "ss304"). The bridge computes per part: volume, area, mass (g), centre of mass, the
+inertia tensor about the centre of mass `MatrixOfInertia × ρ × 1e-6` (kg·mm², ρ in g/cm³) and principal moments; plus
+totals. Accuracy is that of OpenCASCADE's exact volume integration (engine test: within 0.1 % of the hand calculation).
+
+### 25.2 DFM (`manufacturing.dfm`)
+
+`dfm(process, params)` returns findings `{severity error|warning|info, rule, message, features, fix?}`. Thresholds in
+`DFM_DEFAULTS` (tool radius 2, max depth ratio 5 / 10, nozzle 0.4, overhang 45°, sheet thickness auto). A fix is a
+tool call (`edit_pocket`, `resize_hole`, `set_dimension`) run by `POST /cad/run-tool/{sid}` through the normal agent
+tool path, so it is verified and versioned like any edit.
+
+### 25.3 Assembly (`bom_groups`, `interference`, `part_meshes`, `app/reports.py`)
+
+Parts are grouped by geometry signature (volume, area, sorted bbox size, rounded). `reports.bom_rows` adds description
+(common label prefix), material and masses; `bom_csv` (UTF-8 BOM for Excel) and `bom_xlsx` (minimal Office Open XML
+written with `zipfile`). `interference(clearance)` returns overlapping pairs with volume and pairs closer than the
+clearance. `part_meshes` gives one mesh per part for visibility toggles and the exploded view
+(offset = (part centre − assembly centre) × factor).
+
+### 25.4 Drawing (`manufacturing.drawing`)
+
+For each view the shape is rotated so the view direction is +Z and projected with `TechDraw.projectEx` (visible sharp,
+smooth and outline edges solid; hidden ones dashed). Edges are discretised to polylines in sheet coordinates. Layout:
+A3 landscape, first-angle (front, top below, left to the right, isometric top-right), the largest standard scale that
+fits. Annotations: overall width / height / depth dimensions, hole callouts grouped by size and profile (`4× Ø6 THRU`,
+`⌴ Ø11 ↧5`, `⌵ Ø12 × 90°`) with centre marks, title block and first-angle symbol. `_Sheet` collects lines / texts once
+and writes both SVG and PDF (PDF 1.4, one content stream, Helvetica WinAnsi).
+
+### 25.5 Cost (`materials.cost_estimate`)
+
+CNC: stock = bbox + 2 mm per side, material = stock mass × price, machining = removed volume / removal rate +
+2 min per feature, at 60 USD/h, plus 30 min setup / quantity. FDM: printed volume × 0.45 infill factor, 12 cm³/h,
+3 USD/h machine time, filament price, 5 min setup. Results carry a "rough estimate" note.
+
+### 25.6 API additions (Phases 3 and 4)
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/cad/preview/{sid}` | Preview a list of tool calls |
+| POST | `/cad/plan/{sid}/apply`, `/cad/plan/{sid}/cancel` | Approve / discard the pending plan |
+| GET | `/cad/preview-mesh/{sid}` | Ghost STL of the pending plan |
+| POST | `/cad/checkout/{sid}/{v}` | Go to any version |
+| PATCH | `/cad/versions/{sid}/{v}` | Name a version |
+| GET | `/cad/compare/{sid}?a=&b=` | Dimension diff + added / removed meshes |
+| GET / PUT | `/cad/materials`, `/cad/materials/{sid}` | Library / assign materials |
+| GET | `/cad/mass/{sid}`, `/cad/dfm/{sid}?process=`, `/cad/cost/{sid}?process=&quantity=` | Analysis |
+| POST | `/cad/run-tool/{sid}` | Run one tool call (DFM fixes) as a chat turn |
+| GET | `/cad/bom/{sid}?format=json\|csv\|xlsx`, `/cad/interference/{sid}?clearance=`, `/cad/part-meshes/{sid}` | Assembly |
+| POST / GET | `/cad/drawing/{sid}?format=svg\|pdf` | Make / download the drawing |

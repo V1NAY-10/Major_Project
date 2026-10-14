@@ -26,7 +26,7 @@ export interface CadObject {
 
 export interface Feature {
   id: string;
-  kind: "hole" | "boss" | "round" | "plane" | "cone" | "sphere" | "face";
+  kind: "hole" | "boss" | "round" | "plane" | "cone" | "sphere" | "face" | "slot" | "pocket" | "chamfer";
   object: string;
   /** Part ID (B#) of the object the feature is on. */
   part?: string;
@@ -51,7 +51,51 @@ export interface Feature {
   counterbore_of?: string;
   /** ID of the hole pattern this hole belongs to. */
   pattern?: string;
+  /** Best-matching standard size, e.g. "M6 clearance (normal)"; all matches in `standards`. */
+  standard?: string;
+  standards?: string[];
+  /** Holes / bosses: distance (mm) from each datum face, measured into the material. */
+  datum_position?: Partial<Record<DatumLetter, number>>;
+  /** Thread annotation on a hole (session note or a threaded hole feature of an FCStd file). */
+  thread?: { spec: string; depth?: number | null; source?: string; note?: string };
+  /** Slots / pockets. */
+  shape?: "obround" | "rectangular";
+  width?: number;
+  corner_radius?: number;
+  /** Slot / pocket: the face it opens on. */
+  face?: string;
+  /** Chamfer: equal size (null when the two distances differ), both distances, angle to the first face. */
+  size?: number | null;
+  distances?: [number, number];
+  angle_deg?: number;
+  faces?: string[];
+  /** Fillet chains: number of tangent faces in the chain. */
+  chain_faces?: number;
+  toroidal?: boolean;
   [key: string]: unknown;
+}
+
+/** An edge (E#) of a part: picked in the viewer or listed by find_edges. */
+export interface EdgeInfo {
+  id: string;
+  kind: string;
+  length: number;
+  mid: Vec3;
+  ends: Vec3[];
+  /** IDs of the features whose faces meet at the edge. */
+  faces: string[];
+  convexity: "convex" | "concave" | "tangent" | "seam" | "free";
+  part?: string;
+}
+
+export interface WallThickness {
+  part: string;
+  object: string;
+  label: string;
+  min_thickness: number;
+  at: [Vec3, Vec3];
+  faces: (string | null)[];
+  thin: { face: string | null; thickness: number; at: Vec3 }[];
 }
 
 export interface Pattern {
@@ -79,15 +123,59 @@ export interface Pattern {
   count_v?: number;
 }
 
+export type DimensionType =
+  | "extent"
+  | "thickness"
+  | "gap"
+  | "edge_distance"
+  | "center_distance"
+  | "angle"
+  | "diameter"
+  | "radius"
+  | "coaxial";
+
 export interface Dimension {
-  /** Two feature IDs, e.g. "P1-P2" or "H3-P5". */
+  /** Feature IDs: "P1-P2", "H3-P5", "H1-H2", angle "P3∠P7", coaxiality "H1◎H2", or radial "C1.Ø" / "R2.R". */
   id: string;
-  type: "extent" | "thickness" | "gap" | "edge_distance";
+  type: DimensionType;
+  /** mm, or degrees when unit is "deg". */
   value: number;
-  refs: [string, string];
-  axis: Vec3;
+  unit?: "deg";
+  refs: string[];
+  axis?: Vec3;
   object: string;
   label: string;
+}
+
+export type DatumLetter = "A" | "B" | "C";
+
+export interface DatumRef {
+  id: string;
+  label: string;
+  normal: Vec3;
+  part?: string;
+  /** Chosen by the user (otherwise a default). */
+  explicit: boolean;
+}
+
+export interface SessionSettings {
+  display_unit: "mm" | "in";
+  /** Decimals shown for mm (inch gets one more). */
+  precision: number;
+  /** Acceptance tolerance of edits: mm and degrees. */
+  tolerance: { length: number; angle: number };
+  /** Pre-edit check: warn when an edit makes a wall thinner than this (mm, 0 = off). */
+  min_wall?: number;
+}
+
+export interface Lock {
+  target: string;
+  mode: "value" | "centered";
+  axis?: "X" | "Y" | "Z";
+  value: number | Record<string, number> | null;
+  unit?: "mm" | "deg" | null;
+  label: string;
+  created_at?: string;
 }
 
 export interface HighlightMesh {
@@ -96,6 +184,9 @@ export interface HighlightMesh {
   /** Flat xyz in global mm (Z-up, same frame as the STL). */
   positions: number[];
   indices: number[];
+  /** Edges: line segments as flat xyz pairs. */
+  lines?: number[];
+  edge?: EdgeInfo;
 }
 
 export interface PickResult {
@@ -105,9 +196,10 @@ export interface PickResult {
   part: string | null;
   face?: number;
   distance?: number;
+  edge?: EdgeInfo;
 }
 
-export type SelectMode = "feature" | "part";
+export type SelectMode = "feature" | "part" | "edge";
 
 export interface ParametricObject {
   name: string;
@@ -132,6 +224,9 @@ export interface ModelInfo {
   counts: Record<string, number>;
   patterns?: Pattern[];
   dimensions?: Dimension[];
+  datums?: Partial<Record<DatumLetter, DatumRef>>;
+  /** Threads read from threaded hole features of an FCStd file. */
+  threads?: { hole: string; spec: string; depth: number; source: string }[];
   parametric: ParametricObject[];
   sketches: SketchInfo[];
   spreadsheets: { name: string; label: string; cells: { cell: string; alias: string; value: unknown }[] }[];
@@ -142,6 +237,21 @@ export interface VersionEntry {
   v: number;
   description: string;
   created_at: string;
+  /** Version this one was made from (null for the upload): versions form a tree. */
+  parent?: number | null;
+  name?: string;
+}
+
+/** A previewed edit / plan waiting for approval. */
+export interface PendingPlan {
+  id: string;
+  summary: string;
+  steps: { tool: string; args: Record<string, unknown>; label: string }[];
+  records: ({ tool: string; ok: boolean; message?: string; error?: string; verified?: unknown[]; warnings?: string[] } | null)[];
+  ok: boolean;
+  error?: string | null;
+  base_version: number;
+  mesh_url: string | null;
 }
 
 export interface CadState {
@@ -154,6 +264,13 @@ export interface CadState {
   dirty: boolean;
   info: ModelInfo;
   mesh_url: string;
+  settings?: SessionSettings;
+  locks?: Lock[];
+  /** Datum faces chosen explicitly by the user (letter → plane ID). */
+  datums?: Partial<Record<DatumLetter, string>>;
+  /** Part ID → material key. */
+  materials?: Record<string, string>;
+  pending?: PendingPlan | null;
 }
 
 export interface FreeCADStatus {
@@ -161,4 +278,70 @@ export interface FreeCADStatus {
   gui?: boolean;
   version?: string;
   error?: string;
+}
+
+// ── Phase 3 / 4 analysis results ─────────────────────────────────────────
+
+export interface DiffMesh {
+  kind: "added" | "removed";
+  object: string;
+  positions: number[];
+  indices: number[];
+}
+
+export interface CompareResult {
+  a: VersionEntry;
+  b: VersionEntry;
+  dimensions: { rows: { key: string; label: string; before: number | null; after: number | null; delta: number | null; kind: string }[]; total: number } | null;
+  geometry: { parts: { object: string; label: string; added_volume: number; removed_volume: number; status: string }[]; meshes: DiffMesh[] };
+}
+
+export interface PartMesh {
+  part: string;
+  label: string;
+  center: Vec3;
+  positions: number[];
+  indices: number[];
+}
+
+export interface MaterialInfo {
+  key: string;
+  name: string;
+  density: number;
+  price_per_kg: number;
+  category: string;
+}
+
+export interface MassRow {
+  part: string;
+  label: string;
+  volume: number;
+  area: number;
+  center_of_mass: Vec3;
+  material?: string | null;
+  density?: number;
+  mass_g?: number;
+  principal_moments_kg_mm2?: number[];
+  inertia_kg_mm2?: number[][];
+}
+
+export interface DfmFinding {
+  severity: "error" | "warning" | "info";
+  rule: string;
+  message: string;
+  features: string[];
+  value?: number;
+  limit?: number;
+  fix?: { tool: string; args: Record<string, unknown>; label: string };
+}
+
+export interface BomRow {
+  item: number;
+  parts: string[];
+  description: string;
+  quantity: number;
+  material: string;
+  unit_mass_g: number | null;
+  total_mass_g: number | null;
+  size: string;
 }

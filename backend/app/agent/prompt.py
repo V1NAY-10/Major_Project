@@ -3,8 +3,10 @@
 import json
 import os
 
+from .. import precision
+
 LIMITS = {"object": 40, "hole": 60, "boss": 30, "round": 30, "plane": 40, "cone": 20, "sphere": 20, "face": 20,
-          "dimension": 60, "pattern": 20}
+          "dimension": 60, "pattern": 20, "slot": 20, "pocket": 20, "chamfer": 20}
 LIMITS_FULL = {k: v * 3 for k, v in LIMITS.items()}
 # Character budgets for the JSON summary (~3.5 chars/token). Small LLM rate limits (e.g. Groq free
 # tier: 8k tokens/minute) need the system prompt summary to stay well under that.
@@ -13,17 +15,21 @@ SUMMARY_CHARS_FULL = int(os.getenv("MODEL_SUMMARY_CHARS_FULL", "9000"))
 
 _KEEP = {
     "hole": ("id", "diameter", "depth", "through", "drill_tip", "entry", "direction", "position", "countersinks",
-             "counterbore", "counterbore_of", "pattern", "object"),
+             "counterbore", "counterbore_of", "pattern", "thread", "object"),
     "boss": ("id", "diameter", "length", "free_end", "base_end", "position", "object"),
-    "round": ("id", "radius", "concave", "center", "axis", "object"),
+    "round": ("id", "radius", "concave", "center", "axis", "chain_faces", "toroidal", "object"),
     "plane": ("id", "label", "normal", "center", "area", "object"),
     "cone": ("id", "half_angle_deg", "apex", "axis", "center", "object"),
     "sphere": ("id", "radius", "center", "object"),
     "face": ("id", "surface", "area", "center", "object"),
+    "slot": ("id", "shape", "width", "length", "depth", "through", "center", "direction", "face", "object"),
+    "pocket": ("id", "length", "width", "depth", "corner_radius", "center", "face", "object"),
+    "chamfer": ("id", "size", "distances", "angle_deg", "faces", "length", "object"),
 }
 
 
-_DIM_ORDER = {"extent": 0, "thickness": 1, "gap": 2, "edge_distance": 3}
+_DIM_ORDER = {"extent": 0, "thickness": 1, "gap": 2, "edge_distance": 3, "center_distance": 4, "angle": 5,
+              "diameter": 6, "radius": 7, "coaxial": 8}
 _PATTERN_KEEP = ("id", "type", "count", "hole_diameter", "pcd", "angle_step_deg", "start_angle_deg", "center",
                  "spacing", "direction", "count_u", "count_v", "spacing_u", "spacing_v", "holes", "object")
 
@@ -64,6 +70,8 @@ def _summarize(info, limits, full):
         keep = _KEEP.get(kind, ("id",))
         if kind == "plane" and full:
             keep = keep + ("bbox",)
+        if kind == "hole" and full:
+            keep = keep + ("standard", "datum_position")
         if kind == "plane":
             items = sorted(items, key=lambda f: ("outermost" not in f.get("label", ""), -f.get("area", 0)))
         rows = [{k: f[k] for k in keep if k in f and (multi or k != "object")} for f in items[: limits.get(kind, 30)]]
@@ -72,12 +80,14 @@ def _summarize(info, limits, full):
         feats[kind] = rows
         if len(items) > limits.get(kind, 30):
             truncated[kind] = len(items) - limits.get(kind, 30)
-    hole_groups = {}
+    hole_groups, hole_std = {}, {}
     for h in (info.get("features") or {}).get("hole", []):
         if h.get("counterbore_of"):
             continue  # a counterbore is part of the hole it belongs to
         key = (h["diameter"], h["through"], None if h["through"] else h["depth"])
         hole_groups.setdefault(key, []).append(h["id"])
+        if h.get("standard"):
+            hole_std.setdefault(key, h["standard"])
     # Largest parts first, so truncation drops small hardware rather than the main bodies.
     objects = sorted(info.get("objects", []), key=lambda o: -(o.get("volume") or 0))
     if len(objects) > limits["object"]:
@@ -91,11 +101,14 @@ def _summarize(info, limits, full):
                     for o in objects[: limits["object"]]],
         "overall_bbox": info.get("bbox"),
         "feature_counts": info.get("counts"),
-        "hole_groups": [{"diameter": d, "through": t, **({} if t else {"depth": dep}), "count": len(ids), "ids": ids}
+        "hole_groups": [{"diameter": d, "through": t, **({} if t else {"depth": dep}), "count": len(ids), "ids": ids,
+                         **({"std": hole_std[(d, t, dep)]} if (d, t, dep) in hole_std else {})}
                         for (d, t, dep), ids in sorted(hole_groups.items())],
         "features": feats,
     }
     dims = sorted(info.get("dimensions") or [], key=lambda d: _DIM_ORDER.get(d.get("type"), 9))
+    if info.get("datums"):
+        out["datums"] = {k: v["id"] for k, v in info["datums"].items()}
     if dims:
         out["dimensions"] = [{"id": d["id"], "type": d["type"], "value": d["value"], "label": d.get("label"),
                               **({"object": d["object"]} if multi and d.get("object") else {})}
@@ -134,6 +147,13 @@ COORDINATES & UNITS
   patterns: circular (pcd = bolt-circle diameter), grid or linear (spacing). A hole with 'counterbore' includes
   its counterbore (a separate H# marked 'counterbore_of').
 
+- Also "H1-H2" hole to hole, "P3∠P7" angle in degrees (included: 90 = square corner), "C1.Ø" boss diameter,
+  "R2.R" fillet radius, "H1◎H2" coaxiality. 'datums' A/B/C are reference faces (holes carry datum_position
+  in get_model_info / find_features); 'std' names standard hole sizes.
+- SL# slots, PK# pockets, CH# chamfers are single features (edit_slot / edit_pocket / edit_chamfer,
+  remove_features). E# are edge IDs (find_edges; fillet/chamfer selector {edge: "E12"}). A round with
+  chain_faces is a whole tangent fillet chain.
+
 - Face labels (top/front/…) use these GLOBAL axes. Imported models are often Y-up (SolidWorks STEP):
   for furniture/assemblies decide what is "top" from part labels and sizes, not only from label words.
 - Assemblies: each part is a separate object with a label (e.g. "TABLE-TOP") and a parent assembly.
@@ -164,19 +184,29 @@ EDITING
 - Replacing a whole part's shape (e.g. "make the rectangular top round") = add_primitive with
   operation "replace" on that object, sized and positioned from its bbox (keep its thickness and centre).
 - If a reference is ambiguous (several plausible features and the user didn't say "all"), do NOT edit:
-  ask one short question listing the candidates (ID, size, location).
+  call ask_user with the candidate IDs as choices (label: size and location).
+- A request needing 2+ different edits, or "preview …": call propose_plan with all steps (the user approves a
+  preview; nothing changes before). Mirror / pattern / add slot or pocket / counterbore / draft / split / shell:
+  load_tools "modeling"; materials, mass, DFM, BOM, interference, drawings, cost: load_tools "analysis".
 - If the request is physically impossible or would break the part (e.g. a hole larger than the wall),
   say so instead of editing.
 - When the model is parametric (parametric_objects / sketches present) prefer set_property,
   set_sketch_constraint or set_spreadsheet_cell, so design intent is kept. Use B-rep tools only when no
   parameter controls the feature. Properties with an "expressions" entry are driven by formulas: edit the source.
+- Lengths: mm numbers, or strings with a unit ("1/4 in", "12 cm") converted exactly by the backend. A bare
+  number in the user's message is in the SESSION display unit.
+- "15 from datum B, 20 from C" → move_hole to_datum / add_holes positions [{"B":15,"C":20}].
+- "M8 clearance", "tap for M6", "M6 counterbore/countersink" → set_hole_standard; "thread H3 M8x1.25" →
+  set_thread (annotation only). "Is any wall too thin?" → measure_wall_thickness.
+- "keep / don't change X" → lock_dimension. A refused edit names the blocking lock: tell the user, don't work
+  around it. Edits outside the tolerance are rolled back automatically.
 - Use run_freecad_python only when no other tool can do the job.
 - If a tool returns ok=false, read the error, correct the call and retry (at most twice), or explain.
 
 REPLY STYLE
-- After edits, reply in 1-4 short lines: what changed, quoting measured values from the tool results'
-  "verified" entries (e.g. "H2 resized Ø6 → Ø8 mm (verified 8.000)"). Only call a value verified when
-  the tool result contains it. No code, no JSON.
+- After edits, reply in 1-4 short lines: what changed, quoting the "display" text of the tool results'
+  "verified" entries (e.g. "✓ H2 diameter = 8.000 mm (Δ 0.0000 mm)"). Only call a value verified when the tool
+  result contains it. If 'side_effects' lists unexpected changes, mention them in one short line. No code, no JSON.
 - Keep answers concise and technical; use markdown lists for multiple items.
 """
 
@@ -224,9 +254,17 @@ def with_selection(message, info, ids):
     return f"{message}\n\n[Selected in the viewer:\n{describe_selection(info, ids)}]"
 
 
+def session_line(meta):
+    """Display unit, tolerance and locks of the session, in one short line for the system prompt."""
+    s = precision.settings_of(meta)
+    locks = [lk.get("label") or lk["target"] for lk in (meta or {}).get("locks") or []]
+    return (f"SESSION: display unit {s['display_unit']}, tolerance ±{s['tolerance']['length']:g} mm / "
+            f"±{s['tolerance']['angle']:g}°" + (f", locked: {'; '.join(locks[:20])}" if locks else ", no locks"))
+
+
 def build_system(meta):
     if meta is None:
         return NO_MODEL_PROMPT
     model = summarize_model(meta["info"])
-    return (SYSTEM_PROMPT + f"\nCURRENT MODEL ({meta['filename']}, version {meta['head']}):\n"
+    return (SYSTEM_PROMPT + "\n" + session_line(meta) + f"\nCURRENT MODEL ({meta['filename']}, version {meta['head']}):\n"
             + json.dumps(model, separators=(",", ":")))

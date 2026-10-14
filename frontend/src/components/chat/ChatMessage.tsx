@@ -1,8 +1,9 @@
 "use client";
-import { Check, CheckCircle2, Copy, Crosshair, GitCommitHorizontal, XCircle, Zap } from "lucide-react";
+import { Check, CheckCircle2, ChevronRight, Copy, Crosshair, Eye, GitCommitHorizontal, Lock, MousePointerClick, TriangleAlert, XCircle, Zap } from "lucide-react";
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
-import { Message, Operation } from "@/types/chat";
+import { Message, Operation, SideEffects, Verification } from "@/types/chat";
+import { Units, useUnits } from "@/lib/units";
 
 const TOOL_LABELS: Record<string, string> = {
   resize_hole: "Resize hole",
@@ -12,6 +13,20 @@ const TOOL_LABELS: Record<string, string> = {
   push_pull_face: "Push/pull face",
   set_face_distance: "Set distance",
   set_dimension: "Set dimension",
+  set_hole_standard: "Standard hole",
+  edit_slot: "Edit slot",
+  edit_pocket: "Edit pocket",
+  edit_chamfer: "Edit chamfer",
+  mirror_object: "Mirror part",
+  mirror_features: "Mirror features",
+  pattern_feature: "Pattern",
+  add_slot: "Add slot",
+  add_pocket: "Add pocket",
+  add_counterbore: "Add counterbore",
+  add_countersink: "Add countersink",
+  draft_faces: "Draft",
+  split_object: "Split",
+  shell_object: "Shell",
   edit_hole_pattern: "Edit pattern",
   list_dimensions: "Dimensions",
   fillet_edges: "Fillet",
@@ -26,9 +41,13 @@ const TOOL_LABELS: Record<string, string> = {
   run_freecad_python: "Custom script",
 };
 
-function fmtValue(v: unknown): string {
-  if (typeof v === "number") return Number.isInteger(v) ? `${v}` : v.toFixed(3);
-  if (Array.isArray(v)) return `[${v.map(fmtValue).join(", ")}]`;
+function fmtValue(v: unknown, u?: Units, unit?: string): string {
+  if (typeof v === "number") {
+    if (u && unit === "mm") return u.len(v);
+    if (u && unit === "deg") return u.ang(v);
+    return Number.isInteger(v) ? `${v}` : v.toFixed(3);
+  }
+  if (Array.isArray(v)) return u && unit === "mm" ? `[${u.vec(v as number[])}]` : `[${v.map((x) => fmtValue(x)).join(", ")}]`;
   if (v && typeof v === "object")
     return Object.entries(v as Record<string, unknown>)
       .map(([k, x]) => `${k}=${fmtValue(x)}`)
@@ -36,11 +55,95 @@ function fmtValue(v: unknown): string {
   return String(v);
 }
 
+/** "✓ P5-P6 = 120.000 mm  Δ 0.0000" chip: green within tolerance, amber outside or without a target. */
+function VerifiedChip({ v }: { v: Verification }) {
+  const u = useUnits();
+  const field = fmtField(v.field);
+  const hasTarget = v.deviation !== undefined && v.deviation !== null;
+  const tol = v.unit === "deg" ? u.settings.tolerance.angle : u.settings.tolerance.length;
+  const dev = !hasTarget
+    ? ""
+    : v.unit === "deg"
+      ? ` Δ ${u.ang(v.deviation)}`
+      : typeof v.deviation === "number"
+        ? ` Δ ${u.len(v.deviation, true)}`
+        : "";
+  const bad = hasTarget && v.within_tolerance === false;
+  return (
+    <span
+      title={
+        hasTarget
+          ? `requested ${fmtValue(v.requested, u, v.unit)} · achieved ${fmtValue(v.achieved, u, v.unit)} · tolerance ±${tol}${v.unit === "deg" ? "°" : " mm"}`
+          : "measured after the edit"
+      }
+      className={`rounded px-1.5 py-0.5 font-mono text-[10px] ${
+        bad ? "bg-amber-500/15 text-amber-700 dark:text-amber-300" : "bg-green-500/10 text-green-600 dark:text-green-400"
+      }`}
+    >
+      {bad ? "⚠" : "✓"} {v.id}
+      {field ? ` ${field}` : ""} = {fmtValue(v.achieved ?? v.value, u, v.unit)}
+      {dev && <span className="opacity-60">{dev}</span>}
+    </span>
+  );
+}
+
+/** Values that changed besides the target, collapsible; changes on untouched features are amber. */
+function SideEffectsTable({ se }: { se: SideEffects }) {
+  const u = useUnits();
+  const [open, setOpen] = useState(se.unexpected > 0);
+  if (!se.total) return null;
+  return (
+    <div className="mt-1.5">
+      <button
+        onClick={() => setOpen(!open)}
+        className={`flex items-center gap-1 text-[10px] ${se.unexpected ? "text-amber-600 dark:text-amber-400" : "text-foreground/45"} hover:underline`}
+      >
+        <ChevronRight size={11} className={`transition-transform ${open ? "rotate-90" : ""}`} />
+        {se.unexpected ? <TriangleAlert size={10} /> : null}
+        {se.total} other value{se.total === 1 ? "" : "s"} changed
+        {se.unexpected ? ` · ${se.unexpected} unexpected` : " · all on the edited features"}
+      </button>
+      {open && (
+        <table className="mt-1 w-full text-[10px] font-mono">
+          <thead>
+            <tr className="text-foreground/40 text-left">
+              <th className="font-normal pr-2">value</th>
+              <th className="font-normal pr-2 text-right">before</th>
+              <th className="font-normal pr-2 text-right">after</th>
+              <th className="font-normal text-right">Δ</th>
+            </tr>
+          </thead>
+          <tbody>
+            {se.rows.map((r) => (
+              <tr
+                key={r.key}
+                title={r.label + (r.expected ? " (involves a feature the edit changed)" : " (unexpected: not on an edited feature)")}
+                className={r.expected ? "text-foreground/60" : "text-amber-700 dark:text-amber-300 bg-amber-500/10"}
+              >
+                <td className="pr-2 truncate max-w-[9rem]">{r.key}</td>
+                <td className="pr-2 text-right">{u.value(r.before, r.kind)}</td>
+                <td className="pr-2 text-right">{r.after === null ? "removed" : u.value(r.after, r.kind)}</td>
+                <td className="text-right">
+                  {r.delta === null ? "" : `${r.delta > 0 ? "+" : ""}${r.kind === "count" ? r.delta : r.kind === "angle" ? u.ang(r.delta) : u.len(r.delta, true)}`}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {open && se.total > se.rows.length && (
+        <p className="text-[10px] text-foreground/40">… and {se.total - se.rows.length} more</p>
+      )}
+    </div>
+  );
+}
+
 function fmtField(field: string): string {
   if (field.startsWith("distance_to:")) return field.replace(/^distance_to:/, "↔ ");
   if (field === "dimension") return "";
   if (field === "pattern") return "pattern";
-  return field;
+  if (field.startsWith("datum:")) return `from datum ${field.slice(6)}`;
+  return field.replace(/_/g, " ");
 }
 
 function OperationCard({ op }: { op: Operation }) {
@@ -66,27 +169,47 @@ function OperationCard({ op }: { op: Operation }) {
           {verified.length > 0 && (
             <div className="mt-1 flex flex-wrap gap-1.5">
               {verified.map((v, i) => (
-                <span key={i} className="rounded bg-green-500/10 px-1.5 py-0.5 font-mono text-[10px] text-green-600 dark:text-green-400">
-                  ✓ {v.id}{fmtField(v.field) ? ` ${fmtField(v.field)}` : ""} = {fmtValue(v.value)}
-                </span>
+                <VerifiedChip key={i} v={v} />
               ))}
             </div>
           )}
           {missing.map((v, i) => (
             <p key={i} className="mt-1 text-[10px] text-amber-500">⚠ {v.id}: {v.note ?? "could not verify"}</p>
           ))}
+          {(op.warnings ?? []).map((w, i) => (
+            <p key={`w${i}`} className="mt-1 text-[10px] text-amber-600 dark:text-amber-400">⚠ {w}</p>
+          ))}
+          {op.lock_resolution && (
+            <p className="mt-1 flex items-center gap-1 text-[10px] text-foreground/50">
+              <Lock size={10} /> A lock was kept: the edit used {op.lock_resolution}.
+            </p>
+          )}
           {!!op.new_features?.length && (
             <p className="mt-1 text-[10px] text-foreground/40">New: {op.new_features.join(", ")}</p>
           )}
+          {op.side_effects && <SideEffectsTable se={op.side_effects} />}
         </div>
       </div>
     </div>
   );
 }
 
-export default function ChatMessage({ message }: { message: Message }) {
+interface ChatMessageProps {
+  message: Message;
+  /** ID of the plan currently waiting for approval (its buttons are active only then). */
+  pendingPlanId?: string | null;
+  onApplyPlan?: () => void;
+  onCancelPlan?: () => void;
+  /** A clickable answer was chosen / hovered (highlight it in the 3D view). */
+  onChoose?: (id: string, label: string) => void;
+  onHoverChoice?: (id: string | null) => void;
+  busy?: boolean;
+}
+
+export default function ChatMessage({ message, pendingPlanId, onApplyPlan, onCancelPlan, onChoose, onHoverChoice, busy }: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
-  const { role, content, operations, version, kind, selection } = message;
+  const { role, content, operations, version, kind, selection, plan, choices } = message;
+  const planActive = !!plan && plan.ok && plan.id === pendingPlanId;
   const isAssistant = role === "assistant";
 
   const handleCopy = async () => {
@@ -157,6 +280,48 @@ export default function ChatMessage({ message }: { message: Message }) {
           <div className="mt-3 space-y-1.5">
             {operations.map((op, i) => (
               <OperationCard key={i} op={op} />
+            ))}
+          </div>
+        )}
+
+        {plan && plan.ok && (
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <span className="flex items-center gap-1 text-[10px] text-cyan-700 dark:text-cyan-300">
+              <Eye size={11} /> {planActive ? "preview shown as a ghost in the 3D view" : "no longer pending"}
+            </span>
+            <button
+              onClick={onApplyPlan}
+              disabled={!planActive || busy}
+              className="ml-auto text-xs font-semibold px-3 py-1 rounded-lg bg-purple-600 text-white disabled:opacity-30"
+            >
+              Apply
+            </button>
+            <button
+              onClick={onCancelPlan}
+              disabled={!planActive || busy}
+              className="text-xs font-semibold px-3 py-1 rounded-lg border border-border disabled:opacity-30"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {!!choices?.length && (
+          <div className="mt-3 flex flex-wrap gap-1.5" onMouseLeave={() => onHoverChoice?.(null)}>
+            {choices.map((c) => (
+              <button
+                key={c.id}
+                onClick={() => onChoose?.(c.id, c.label)}
+                onMouseEnter={() => onHoverChoice?.(c.id)}
+                onFocus={() => onHoverChoice?.(c.id)}
+                disabled={busy}
+                title={`Choose ${c.id} (hover to see it in the 3D view)`}
+                className="flex items-center gap-1.5 text-xs px-2.5 py-1 rounded-lg border border-border hover:border-amber-500/60 hover:bg-amber-500/10 disabled:opacity-40"
+              >
+                <MousePointerClick size={11} />
+                <span className="font-mono font-bold text-purple-600 dark:text-purple-300">{c.id}</span>
+                <span className="text-foreground/70">{c.label}</span>
+              </button>
             ))}
           </div>
         )}

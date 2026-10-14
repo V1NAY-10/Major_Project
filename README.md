@@ -36,12 +36,16 @@ Next.js chat UI ──HTTP :8000──► FastAPI backend ──JSON-RPC/TCP :66
    `edit_hole_pattern("PAT1", pcd=80)`. The LLM calls typed tools rather than writing code:
    `set_dimension`, `edit_hole_pattern`, `resize_hole`, `move_hole`, `add_holes`, `remove_features`,
    `push_pull_face`, `set_face_distance`, `fillet_edges`, `chamfer_edges`, `add_primitive`, `transform_object`,
-   `scale_object`, `set_property`, `set_sketch_constraint`, `set_spreadsheet_cell`, `delete_object`, plus
-   `get_model_info`, `list_objects`, `find_features`, `list_dimensions` and `measure` for questions.
+   `scale_object`, `set_property`, `set_sketch_constraint`, `set_spreadsheet_cell`, `delete_object`,
+   `set_hole_standard`, `lock_dimension`, `unlock_dimension`, `set_datums`, `edit_slot`, `edit_pocket`, `edit_chamfer`,
+   `set_thread`, plus `get_model_info`, `list_objects`, `find_features`, `find_edges`, `list_dimensions`, `list_locks`,
+   `measure_wall_thickness` and `measure` for questions.
    Features that open on a moved face move with it (a blind hole keeps its depth below the face).
    `run_freecad_python` is disabled unless `AGENT_ALLOW_PYTHON=1`.
 4. **Fast path, no LLM.** Exact commands run instantly without an LLM call: `P5-P6 = 120`,
-   `H3-P5 = 12 symmetric`, `H2 Ø8`, `PAT1 pcd 80`. Clicking a dimension in the panel fills in `P5-P6 = `.
+   `H3-P5 = 12 symmetric`, `H2 Ø8`, `PAT1 pcd 80`, `P5-P6 = 4.5 in`, `P3∠P7 = 60`, `C1 Ø30`, `H3 M8 clearance`,
+   `tap H3 for M6`, `lock P1-P2`, `unlock all`, `locks`, `datum A = P3`, `SL1 width 10`, `PK1 depth 6`, `CH1 2`,
+   `fillet E12 R2`, `H3 thread M8x1.25`, `wall thickness`, `PAT1 count_u 3`. Clicking a dimension in the panel fills in `P5-P6 = `.
 5. **Verified edits.** Each operation runs in a FreeCAD transaction. Invalid results are rolled back, and
    successful ones are re-measured (e.g. `P5-P6 = 120.000 ✓`).
 6. **Versions.** Each chat turn that changes geometry creates `vN`. Undo and redo restore snapshots in
@@ -56,6 +60,29 @@ Next.js chat UI ──HTTP :8000──► FastAPI backend ──JSON-RPC/TCP :66
 8. **Assemblies.** Each part of a STEP assembly is analysed separately in global coordinates.
 9. **No login.** Single-user local app; every chat session is visible in the sidebar.
 10. Ambiguous requests ("make the hole bigger") get a clarifying question listing the candidates.
+11. **Precision (Phase 1).**
+    - **Units:** type `4.5 in`, `1/4"`, `3 1/2 in`, `12 cm`, `30°`, `Ø8`, `R4`. A settings bar switches the display
+      between mm and inch and sets the decimals. The model is always stored in mm.
+    - **Tolerance:** every edit reports `requested / achieved / deviation`, shown as ✓ or ⚠. An edit that misses the
+      session tolerance (default ±0.001 mm, ±0.01°) is rolled back inside FreeCAD.
+    - **Side effects:** a table under each edit lists every other value that changed, with unexpected ones in amber.
+    - **Locks:** lock a dimension or feature (lock icon, `lock P1-P2`, `lock H1 centred`). Edits that would change it
+      are refused, or done with another anchor that keeps it.
+    - **Datums:** A/B/C reference faces (defaults chosen automatically). Hole positions are shown from the datums;
+      you can say "15 from datum B, 20 from datum C".
+    - **Standard holes:** recognised holes are named (`Ø6.6 = M6 clearance (normal)`), and "make H3 an M8 clearance
+      hole", "tap H3 for M6" or "H3 M6 counterbore" use the ISO 273 / tap drill / ISO 4762 / ISO 10642 tables.
+    - **More dimensions:** angles `P3∠P7`, boss diameters `C1.Ø`, fillet radii `R2.R`, hole-to-hole `H1-H2` and
+      coaxiality `H1◎H2`, all settable with `set_dimension`.
+12. **Feature recognition (Phase 2).**
+    - **Slots** `SL#` (obround / rectangular, through / blind) and **pockets** `PK#` (blind, planar floor, corner radius)
+      are single features: change width, length, depth, corner radius, move or remove them.
+    - **Chamfers** `CH#` with size and angle: resize, turn into a fillet, remove.
+    - **Edges** `E#`: switch the viewer to *Edge*, click an edge and type `R2` or `C1`, or `fillet E12 R2`.
+    - **Threads:** threaded hole features of FCStd files are shown on their holes; add a note with `H3 thread M8x1.25`.
+    - **Wall thickness:** `wall thickness`, or the button on a selected part, finds the thinnest wall.
+    - Tangent fillet runs are one `R#` chain; ring (toroidal) fillets are marked. Moving a face now carries its edge
+      fillets along, pushing a face past a boss no longer leaves a pocket, and grids can change their hole count.
 
 ## Technology stack
 
@@ -78,6 +105,9 @@ backend/
     freecad_client.py      TCP client for the bridge + FreeCAD auto-launch
     messages.py            Chat message storage and LLM history
     db.py                  MongoDB connection (falls back to memory)
+    units.py               Unit parsing / formatting (mm, cm, in, fractions, degrees, Ø, R)
+    standards.py           ISO clearance, tap drill, counterbore, countersink and drill tables
+    precision.py           Side-effect report, verification display, session settings
     sessions.py            /sessions endpoints + ownership checks
     agent/
       runner.py            LLM ⇄ tools loop, token budget, rate-limit handling
@@ -87,7 +117,7 @@ backend/
   freecad_bridge/
     server.py              JSON-RPC server inside FreeCAD (GUI or headless)
     engine.py              Feature recognition, IDs, operations, verification, export
-    analysis.py            B-spline surface fitting, counterbores, hole patterns, dimensions
+    analysis.py            B-spline surface fitting, counterbores, hole patterns, dimensions (incl. angles, radii)
     headless.py            Entry point for freecadcmd
   tests/                   Engine test suite (run with freecadcmd) + fixture parts
   data/sessions/<id>/      Per-session files (created at runtime)
@@ -179,21 +209,37 @@ npm run dev                      # http://localhost:3000
 2. Ask questions: *"How thick is the plate?"*, *"List the holes and their positions"*, *"Distance between H2 and H4?"*
 3. Request changes: *"Make the four 6 mm holes 8 mm"*, *"Make it 120 mm long"*,
    *"Round the vertical corners R5"*, *"Add a Ø5 through hole at 70, 30 on the top face"*,
-   *"Make the table top round, diameter = its depth"*.
+   *"Make the table top round, diameter = its depth"*, *"Make H3 an M8 clearance hole"*,
+   *"Make it 4.5 in long but keep H1 centred"*, *"Move H2 to 15 from datum B and 20 from datum C"*,
+   *"Make the slot 10 wide"*, *"Round the pocket corners R4"*, *"Is any wall thinner than 3 mm?"*.
    For `.FCStd` files: *"Set the pad length to 25"*.
 4. Click the part in the 3D viewer (or an ID in the panel) to select it: it is highlighted here and in FreeCAD,
    and the inspector shows its ID and data. Then just describe the change ("Ø8", "make it 3 mm deeper",
    "move this 5 mm left"). Shift+click adds to the selection; "Part" mode selects whole parts; "From FreeCAD"
    uses what you selected in the FreeCAD window. Use undo/redo in the header, and download from the workspace
    (STEP, FCStd, STL, IGES).
+5. **Preview and plans** (Phase 3): *"preview P5-P6 = 130"* shows the result as a ghost with Apply / Cancel;
+   compound requests (*"make it 150 long, add two Ø5 holes and round the corners R5"*) and large edits (shell, split,
+   mirror part…) become a plan you approve, applied as one version and rolled back entirely if a step fails. Edits are
+   checked first (overlapping holes, break-out, interference refused; thin walls warned). New edits: *"mirror H3 about
+   y = 20"*, *"pattern H1 3 times 15 mm along X"*, *"add a 6 × 20 slot 4 deep"*, *"add a 20 × 12 pocket R2"*,
+   *"counterbore H2 Ø11 × 5"*, *"shell it to 2 mm, open at the top"*, *"draft the side walls 5°"*, *"split at z = 5"*.
+   The **History** tab is a version tree: go to, name and compare versions (changed dimensions; added / removed
+   material in green / red). Ambiguous requests get clickable choices that highlight in 3D.
+6. **Analysis** (Phase 4, Analysis tab or chat): *"material all steel"*, *"mass"*, *"dfm cnc"* / *"dfm print"* /
+   *"dfm sheet"* (findings with one-click fixes), *"bom"* (CSV / XLSX download), *"interference"*, *"drawing"*
+   (A3 PDF / SVG with views, dimensions and hole callouts), *"cost cnc 10"*. The **Assembly** button shows parts
+   separately with visibility toggles and an explode slider.
 
 ## Tests
 
 ```bash
-# Engine: parsing + every edit, against parts with known ground truth (headless FreeCAD, ~10 s)
+# Engine: parsing + every edit + analysis, against parts with known ground truth (headless FreeCAD, ~30 s, 383 checks)
 "C:/Program Files/FreeCAD 1.1/bin/freecadcmd.exe" backend/tests/test_engine.py
-# Fast-path command parser
-cd backend && venv\Scripts\python -m unittest app.agent.test_fastpath
+# Backend unit tests: fast path, units, standards, side effects, tool units, threads, materials, BOM, plans (56 tests)
+cd backend && venv\Scripts\python -m unittest discover -s app -t .
+# Frontend
+cd frontend && npx tsc --noEmit && npm run lint && npm run build
 ```
 
 ## Free-tier LLM limits

@@ -123,6 +123,195 @@ def slot_block():
     return s.removeSplitter()
 
 
+def chamfer_block():
+    """60 (X) × 40 (Y) × 30 (Z) block whose top-back edge is cut by a 45° chamfer 10 × 10:
+    the chamfer face runs from (y=30, z=30) to (y=40, z=20). Included angles chamfer/top = chamfer/back = 135°."""
+    pts = [V(0, 0, 0), V(0, 40, 0), V(0, 40, 20), V(0, 30, 30), V(0, 0, 30), V(0, 0, 0)]
+    return Part.Face(Part.makePolygon(pts)).extrude(V(60, 0, 0))
+
+
+def coaxial_block():
+    """40 × 40 × 20 block with two pairs of blind holes drilled from the top (z=20) and the bottom (z=0):
+      Ø6 × 6 deep at (20, 20) from both sides — exactly coaxial;
+      Ø8 × 5 deep at (10, 30) from the top and at (10.2, 30) from the bottom — axes 0.2 apart."""
+    s = Part.makeBox(40, 40, 20)
+    s = s.cut(Part.makeCylinder(3, 6, V(20, 20, 14), Z)).cut(Part.makeCylinder(3, 6, V(20, 20, 0), Z))
+    s = s.cut(Part.makeCylinder(4, 5, V(10, 30, 15), Z)).cut(Part.makeCylinder(4, 5, V(10.2, 30, 0), Z))
+    return s.removeSplitter()
+
+
+def _obround(cx, cy, width, length, z0, h, along="X"):
+    """Obround prism (slot cutter): centre (cx, cy), from z0 up h."""
+    straight = length - width
+    if along == "X":
+        a, b = V(cx - straight / 2, cy, z0), V(cx + straight / 2, cy, z0)
+        box = Part.makeBox(straight, width, h, V(cx - straight / 2, cy - width / 2, z0))
+    else:
+        a, b = V(cx, cy - straight / 2, z0), V(cx, cy + straight / 2, z0)
+        box = Part.makeBox(width, straight, h, V(cx - width / 2, cy - straight / 2, z0))
+    return box.fuse(Part.makeCylinder(width / 2, h, a, Z)).fuse(Part.makeCylinder(width / 2, h, b, Z)).removeSplitter()
+
+
+def slot_plate():
+    """100 × 60 × 10 plate with three slots, all opening on the top face (z = 10):
+      obround through slot 8 wide × 30 long along X, centre (30, 30);
+      rectangular blind slot 6 wide × 24 long × 4 deep along X, centre (70, 45);
+      obround blind slot 10 wide × 20 long × 5 deep along Y, centre (80, 15)."""
+    s = Part.makeBox(100, 60, 10)
+    s = s.cut(_obround(30, 30, 8, 30, -1, 12, "X"))
+    s = s.cut(Part.makeBox(24, 6, 5, V(58, 42, 6)))
+    s = s.cut(_obround(80, 15, 10, 20, 5, 6, "Y"))
+    return s.removeSplitter()
+
+
+def pocket_block():
+    """80 × 60 × 20 block with two pockets opening on the top face (z = 20):
+      40 × 30 rounded-rectangle pocket, corner R5, 8 deep, centre (40, 30), with a Ø5 through hole in its floor at (40, 30);
+      12 × 12 square pocket with sharp corners, 5 deep, centre (10, 10)."""
+    s = Part.makeBox(80, 60, 20)
+    pocket = Part.makeBox(40, 30, 9, V(20, 15, 12))
+    edges = [e for e in pocket.Edges if len(e.Vertexes) == 2
+             and abs(e.Vertexes[0].X - e.Vertexes[1].X) < 1e-9 and abs(e.Vertexes[0].Y - e.Vertexes[1].Y) < 1e-9]
+    s = s.cut(pocket.makeFillet(5, edges))
+    s = _drill(s, 40, 30, 5, 12, through_len=12)
+    s = s.cut(Part.makeBox(12, 12, 6, V(4, 4, 15)))
+    return s.removeSplitter()
+
+
+def _edges_of_box(shape, test):
+    return [e for e in shape.Edges if len(e.Vertexes) == 2 and test(e.Vertexes[0].Point, e.Vertexes[1].Point)]
+
+
+def chamfer_box(all_top=True):
+    """60 × 40 × 20 box with a 2 mm 45° chamfer on its 4 top edges (all_top) or only on the top-front edge."""
+    s = Part.makeBox(60, 40, 20)
+    if all_top:
+        edges = _edges_of_box(s, lambda a, b: abs(a.z - 20) < 1e-9 and abs(b.z - 20) < 1e-9)
+    else:
+        edges = _edges_of_box(s, lambda a, b: abs(a.z - 20) < 1e-9 and abs(b.z - 20) < 1e-9 and abs(a.y) < 1e-9 and abs(b.y) < 1e-9)
+    return s.makeChamfer(2, edges)
+
+
+def fillet_chain_box():
+    """60 × 40 × 20 box with every edge filleted R3: 12 cylindrical fillets + 8 spherical corners, one chain."""
+    s = Part.makeBox(60, 40, 20)
+    return s.makeFillet(3, s.Edges)
+
+
+def boss_rim_plate():
+    """60 × 40 × 10 plate with a Ø20 × 10 boss at (30, 20) whose top rim is filleted R2 (a toroidal fillet)."""
+    s = Part.makeBox(60, 40, 10).fuse(Part.makeCylinder(10, 10, V(30, 20, 10), Z)).removeSplitter()
+    rim = [e for e in s.Edges if isinstance(e.Curve, Part.Circle) and abs(e.Curve.Center.z - 20) < 1e-9]
+    return s.makeFillet(2, rim)
+
+
+def thin_wall_plate():
+    """60 × 40 × 10 plate with a Ø6 through hole at (5, 20): the wall between the hole and the left face is 2 mm."""
+    return _drill(Part.makeBox(60, 40, 10), 5, 20, 6, 10, through_len=10).removeSplitter()
+
+
+def write_threaded_fcstd(path):
+    """PartDesign Body: 40 × 30 × 10 box with a threaded (cosmetic) M6x1.0 hole feature, 8 deep, at (10, 15) and
+    (30, 15) from the top. FreeCAD cuts the Ø5 tap drill and records the thread as properties."""
+    doc = App.newDocument("ThreadFixture")
+    body = doc.addObject("PartDesign::Body", "Body")
+    box = body.newObject("PartDesign::AdditiveBox", "Box")
+    box.Length, box.Width, box.Height = 40, 30, 10
+    doc.recompute()
+    sk = body.newObject("Sketcher::SketchObject", "HoleSketch")
+    sk.Placement = App.Placement(V(0, 0, 10), App.Rotation())
+    sk.addGeometry(Part.Circle(V(10, 15, 0), Z, 2.5), False)
+    sk.addGeometry(Part.Circle(V(30, 15, 0), Z, 2.5), False)
+    doc.recompute()
+    h = body.newObject("PartDesign::Hole", "Hole")
+    h.Profile = sk
+    h.Threaded = True
+    h.ThreadType = "ISOMetricProfile"
+    h.ThreadSize = "M6x1.0"
+    h.DepthType = "Dimension"
+    h.Depth = 8
+    doc.recompute()
+    doc.saveAs(path)
+    App.closeDocument(doc.Name)
+    return path
+
+
+def dfm_bad_block():
+    """80 × 50 × 20 block with deliberate manufacturing problems (all from the top, z = 20):
+      Ø1.5 × 20 through hole at (45, 10)            — depth 13.3 × diameter
+      sharp-cornered pocket 20 × 15 × 6 at (20, 25)  — internal corners can't be milled
+      Ø7.77 through hole at (65, 35)                 — not a standard drill
+      Ø6 through hole at (3.5, 8)                    — 0.5 mm wall to the left face
+      rectangular blind slot 3 × 20 × 12 at (50, 40) — 4:1 deep and narrow, sharp corners"""
+    s = Part.makeBox(80, 50, 20)
+    s = _drill(s, 45, 10, 1.5, 20, through_len=20)
+    s = s.cut(Part.makeBox(20, 15, 7, V(10, 17.5, 14)))
+    s = _drill(s, 65, 35, 7.77, 20, through_len=20)
+    s = _drill(s, 3.5, 8, 6, 20, through_len=20)
+    s = s.cut(Part.makeBox(20, 3, 13, V(40, 38.5, 8)))
+    return s.removeSplitter()
+
+
+def overhang_part():
+    """A T: 20 × 20 × 30 column on the build plate with a 60 × 20 × 5 shelf on top (x −10…50): the shelf's underside
+    overhangs 20 mm on each side."""
+    col = Part.makeBox(20, 20, 30, V(10, 10, 0))
+    shelf = Part.makeBox(60, 20, 5, V(-10, 10, 30))
+    return col.fuse(shelf).removeSplitter()
+
+
+def sheet_bracket():
+    """2 mm sheet bent 90° (inner radius 2) into an L, 30 wide (Y): horizontal flange x 4…40, vertical flange z 4…40.
+    Holes Ø5 in the horizontal flange: at x = 8 (1.5 mm from the bend), x = 22 (fine), x = 37 (0.5 mm from the edge)."""
+    t, R, W = 2.0, 2.0, 30.0
+    flat = Part.makeBox(36, W, t, V(4, 0, 0))
+    up = Part.makeBox(t, W, 36, V(0, 0, 4))
+    ring = Part.makeCylinder(R + t, W, V(4, 0, 4), V(0, 1, 0)).cut(Part.makeCylinder(R, W, V(4, 0, 4), V(0, 1, 0)))
+    bend = ring.common(Part.makeBox(4, W, 4, V(0, 0, 0)))
+    s = flat.fuse(up).fuse(bend).removeSplitter()
+    for x in (8, 22, 37):
+        s = _drill(s, x, 15, 5, t, through_len=t)
+    return s.removeSplitter()
+
+
+def write_bom_assembly_step(path):
+    """A small table: 1 top 200 × 100 × 10, 4 identical legs 10 × 10 × 80, 2 identical stretchers 180 × 10 × 10."""
+    import Import  # type: ignore
+    doc = App.newDocument("BomAsm")
+    asm = doc.addObject("App::Part", "Table")
+
+    def add(name, label, shape, at):
+        part = doc.addObject("App::Part", name + "Part")
+        asm.addObject(part)
+        o = doc.addObject("Part::Feature", name)
+        o.Shape = shape
+        o.Label = label
+        part.addObject(o)
+        part.Placement = App.Placement(at, App.Rotation())
+
+    add("Top", "TOP", Part.makeBox(200, 100, 10), V(0, 0, 80))
+    for k, (x, y) in enumerate(((0, 0), (190, 0), (0, 90), (190, 90))):
+        add(f"Leg{k}", f"LEG-{k + 1}", Part.makeBox(10, 10, 80), V(x, y, 0))
+    for k, y in enumerate((0, 90)):
+        add(f"Rail{k}", f"RAIL-{k + 1}", Part.makeBox(180, 10, 10), V(10, y, 30))
+    doc.recompute()
+    Import.export([asm], path)
+    App.closeDocument(doc.Name)
+    return path
+
+
+def write_clash_fcstd(path):
+    """Three 20 mm cubes: A at x 0…20, B at x 10…30 (overlaps A by 10 × 20 × 20 = 4000 mm³), C at x 32…52 (2 mm from B)."""
+    doc = App.newDocument("Clash")
+    for name, x in (("A", 0), ("B", 10), ("C", 32)):
+        o = doc.addObject("Part::Feature", name)
+        o.Shape = Part.makeBox(20, 20, 20, V(x, 0, 0))
+    doc.recompute()
+    doc.saveAs(path)
+    App.closeDocument(doc.Name)
+    return path
+
+
 def write_pad_fcstd(path):
     """PartDesign Body: 40 × 30 rectangle sketch padded 10 mm (Pad.Length drives the Z size)."""
     import Sketcher  # type: ignore

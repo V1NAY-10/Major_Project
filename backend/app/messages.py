@@ -19,7 +19,8 @@ def _jsonable(doc):
     return doc
 
 
-async def add(session_id, role, content, operations=None, version=None, kind=None, selection=None):
+async def add(session_id, role, content, operations=None, version=None, kind=None, selection=None, plan=None,
+              choices=None):
     doc = {
         "session_id": session_id,
         "role": role,
@@ -34,6 +35,10 @@ async def add(session_id, role, content, operations=None, version=None, kind=Non
         doc["kind"] = kind
     if selection:
         doc["selection"] = selection
+    if plan:
+        doc["plan"] = plan  # a previewed plan waiting for approval (Phase 3)
+    if choices:
+        doc["choices"] = choices  # clickable answers to a question
     db = get_db()
     if db is not None:
         res = await db.messages.insert_one(doc)
@@ -70,6 +75,10 @@ async def history_for_llm(session_id, limit=HISTORY_MESSAGES):
         ops = [o for o in m.get("operations") or [] if o.get("ok")]
         if ops:
             content += "\n[Edits applied: " + "; ".join(o["message"].split("\n")[0] for o in ops) + "]"
+        if m.get("plan"):
+            content += f"\n[Plan proposed, waiting for the user's approval: {m['plan'].get('summary', '')}]"
+        if m.get("choices"):
+            content += "\n[Choices offered: " + ", ".join(f"{c['id']} {c['label']}" for c in m["choices"]) + "]"
         if m.get("version") is not None and m["role"] == "assistant":
             content += f"\n[Model version {m['version']}]"
         out.append({"role": m["role"], "content": content})

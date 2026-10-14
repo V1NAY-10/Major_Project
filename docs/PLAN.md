@@ -91,3 +91,20 @@ Query:
 LLM config (any OpenAI-compatible endpoint with tool calling):
 `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`. The defaults are Groq and `openai/gpt-oss-120b`
 using `GROQ_API_KEY`. A stronger tool-calling model noticeably improves reference resolution.
+
+## 6. Next-phase roadmap (from 2026-10-14)
+
+The rebuild above is done (see [STATUS.md](../STATUS.md)). The next phases extend the same architecture, one at a
+time, each with tests and updated docs:
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1. Precision foundations | Units and number parsing, display unit/precision, tolerance-checked edits with rollback, side-effect report, locks (design intent), datums A/B/C, ISO standard hole sizes, angle / radial / hole-to-hole / coaxiality dimensions | ✅ Done 2026-10-14 (STATUS §7, ARCHITECTURE §22) |
+| 2. Better feature recognition | Slots `SL#`, pockets `PK#`, chamfers `CH#`, edge IDs `E#`, threads, wall thickness, toroidal fillets and fillet chains; fix: fillets left behind by face moves, pockets above bosses, grid hole count | ✅ Done 2026-10-15 (STATUS §8, ARCHITECTURE §23) |
+| 3. Safer, smarter editing | Preview (dry run + ghost), multi-step plans in one version, pre-edit checks, mirror / shell / pattern / slot / pocket / counterbore / countersink / draft / split ops, version tree and compare, clickable disambiguation | ✅ Done 2026-10-15 (STATUS §9, ARCHITECTURE §24) |
+| 4. Analysis and manufacturing | Materials and mass properties, DFM checks with fixes, BOM, interference, TechDraw PDF/SVG, cost estimate | ✅ Done 2026-10-15 (STATUS §10, ARCHITECTURE §25) |
+| 5. Viewer and UX | Exact face picking (glTF or face map), section plane, measuring, 3D annotations, streaming chat, command palette, shortcuts | Planned |
+| 6. Robustness and deployment | Evaluation suite (≥ 50 cases, LLM comparison), job queue / worker pool, limits, structured logs, CI on headless FreeCAD, Docker Compose | Planned |
+
+Phase 1 already covers part of the original "Phase 3" item list (counterbores/countersinks via standard sizes) and
+prepares Phase 3's preview (edits are now fully measured before they are committed).

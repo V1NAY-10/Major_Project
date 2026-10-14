@@ -14,7 +14,8 @@ import openai
 from openai import AsyncOpenAI
 
 from .. import cad_service as cad
-from . import fastpath, prompt, tools
+from .. import precision
+from . import fastpath, plans, prompt, tools
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.groq.com/openai/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("GROQ_API_KEY")
@@ -140,9 +141,25 @@ def _describe(records):
     return "; ".join(ok)[:300] or "Edit"
 
 
-_ID_RE = re.compile(r"\b(PAT\d+|B\d+|[HCRPKSF]\d+(?:-[HCRPKS]\d+)?)\b")
+_ID_RE = re.compile(r"\b(PAT\d+|SL\d+|PK\d+|CH\d+|B\d+|E\d+|[HCRPKSF]\d+(?:[-∠◎][HCRPKS]\d+|\.(?:Ø|R))?)(?!\w)")
 MAX_HIGHLIGHT = 12
 _NOTE_RE = re.compile(r"^\s*\[(?:Edits applied|Model version|Selected)[^\n]*\]\s*$", re.M)
+
+
+_CLAIM_RE = re.compile(r"(✓|\bverified\b|\b(?:resized|added|moved|filleted|rounded|removed|increased|changed|set)\b"
+                       r"[^\n]{0,80}\d)", re.I)
+
+
+def _guard_unverified_claims(content, records, extra):
+    """The model must not report edits it didn't make. When a turn made no edit (and proposed no plan) but the reply
+    reads like edit results, say so plainly instead of passing the claims on."""
+    if records or extra.get("plan") or extra.get("choices") or not content:
+        return content
+    if not _CLAIM_RE.search(content):
+        return content
+    print("[agent] reply claimed edits without any tool call; replaced")
+    return ("⚠ No change was made: the assistant described edits it did not actually run, so its reply was withheld. "
+            "Please send the request again (or split it into single steps).")
 
 
 def _highlight_ids(meta, records, content):
@@ -152,13 +169,17 @@ def _highlight_ids(meta, records, content):
     known |= {p["id"] for p in info.get("patterns") or []}
     known |= {d["id"] for d in info.get("dimensions") or []}
     known |= {o["id"] for o in info.get("objects") or [] if o.get("id")}
+    edges = set(((meta.get("registry") or {}).get("edges") or {}).keys())
     out = []
 
     def add(x):
         if not isinstance(x, str):
             return
         x = x.strip().upper()
-        parts = x.split("-")
+        parts = precision.dim_refs(x)
+        if re.fullmatch(r"E\d+", x) and x in edges and x not in out:
+            out.append(x)
+            return
         if (x in known or (len(parts) == 2 and all(p in known for p in parts))) and x not in out:
             out.append(x)
 
@@ -171,6 +192,11 @@ def _highlight_ids(meta, records, content):
             add((r.get("args") or {}).get(k))
         for fid in (r.get("args") or {}).get("features") or []:
             add(fid)
+        for k in ("slot", "pocket", "chamfer"):
+            add((r.get("args") or {}).get(k))
+        for sel in (r.get("args") or {}).get("edges") or []:
+            if isinstance(sel, dict):
+                add(sel.get("edge"))
         for v in r.get("verified") or []:
             if v.get("status") == "ok":
                 add(v.get("id"))
@@ -183,18 +209,84 @@ async def _fast_turn(meta, parsed):
     name, args = parsed
     result, rec = await tools.execute(meta, name, args)
     records = [rec] if rec is not None else []
-    return fastpath.reply(result), records
+    return fastpath.reply(result, precision.settings_of(meta)), records
+
+
+def _fast_parse(meta, text, selection):
+    """Fast-path parse with the session's display unit (bare numbers) and its angle dimensions."""
+    if meta is None:
+        return None
+    unit = precision.settings_of(meta)["display_unit"]
+    return fastpath.parse(text, selection, unit, lambda did: tools.is_angle_dimension(meta.get("info"), did))
+
+
+_EDIT_VERBS = re.compile(
+    r"\b(make|set|change|increase|decrease|reduce|extend|lengthen|shorten|resize|enlarge|add|drill|bore|tap|cut|"
+    r"round|fillet|chamfer|bevel|move|shift|remove|delete|fill|mirror|pattern|copy|shell|hollow|split|draft|rotate|"
+    r"scale|thicken|widen|deepen|counterbore|countersink)\b", re.I)
+
+
+def is_compound(text):
+    """A request for two or more different edits ("make it 150 long, add two holes and round the corners"):
+    its edits are collected into a plan the user approves instead of being applied one by one."""
+    verbs = {m.group(1).lower() for m in _EDIT_VERBS.finditer(text or "")}
+    clauses = [c for c in re.split(r",|;|\band\b|\bthen\b", text or "", flags=re.I) if _EDIT_VERBS.search(c)]
+    return len(clauses) >= 2 and len(verbs) >= 2
+
+
+_APPLY_WORDS = re.compile(r"^\s*(apply|apply it|yes|yes please|go ahead|do it|ok|okay|confirm|approve|apply the plan)\s*[.!]*\s*$", re.I)
+_CANCEL_WORDS = re.compile(r"^\s*(cancel|no|discard|don'?t|stop|cancel the plan)\s*[.!]*\s*$", re.I)
+_PREVIEW = re.compile(r"^\s*preview\s*:?\s+(.+)$", re.I)
+
+
+async def _plan_turn(meta, user_message, selection):
+    """Plan control without the LLM: approve / cancel the pending plan, or 'preview <command>'.
+    Returns (content, records, extra) or None."""
+    if meta.get("pending") and _APPLY_WORDS.match(user_message):
+        content, records, _ = await plans.apply(meta)
+        return content, records, {}
+    if meta.get("pending") and _CANCEL_WORDS.match(user_message):
+        plans.cancel(meta)
+        return "Cancelled the plan; nothing was changed.", [], {}
+    m = _PREVIEW.match(user_message)
+    if m:
+        parsed = _fast_parse(meta, m.group(1), selection)
+        if parsed and parsed[0] in tools.EDIT_TOOLS:
+            pending = await plans.preview(meta, [{"tool": parsed[0], "args": parsed[1]}], source="preview command")
+            return plans.describe(pending), [], {"plan": pending}
+    return None
+
+
+async def run_tool(session_id, tool, args, note=None):
+    """Apply one tool call outside the chat loop (a DFM fix, a quick action) as its own version."""
+    async with cad.lock(session_id):
+        meta = cad.require(session_id)
+        await cad.sync_manual_edits(meta)
+        try:
+            result, rec = await tools.execute(meta, tool, dict(args or {}))
+        except Exception:
+            await cad.discard_uncommitted(meta)
+            raise
+        if meta.get("dirty"):
+            await cad.commit_version(meta, (note or _describe([rec] if rec else [])))
+        else:
+            cad.save(meta)
+        records = [rec] if rec else []
+        return {"content": fastpath.reply(result, precision.settings_of(meta)), "operations": records,
+                "state": cad.public_state(meta), "highlight": _highlight_ids(meta, records, "")}
 
 
 async def run_turn(session_id, user_message, history, selection=None):
     """Run one chat turn. `history` is a list of prior {role, content} messages (oldest first).
     `selection`: IDs the user selected in the viewer; the request applies to them.
 
-    Returns {"content", "operations", "state", "highlight"}.
+    Returns {"content", "operations", "state", "highlight", "plan"?, "choices"?}.
     """
     meta = cad.load(session_id)
-    parsed = fastpath.parse(user_message, selection) if meta is not None else None
-    if not LLM_API_KEY and parsed is None:
+    parsed = _fast_parse(meta, user_message, selection)
+    plan_cmd = meta is not None and (bool(_PREVIEW.match(user_message)) or (bool(meta.get("pending")) and bool(
+        _APPLY_WORDS.match(user_message) or _CANCEL_WORDS.match(user_message))))
+    if not LLM_API_KEY and parsed is None and not plan_cmd:
         raise LLMError("No LLM API key configured (set LLM_API_KEY or GROQ_API_KEY in backend/.env).", 500)
     if meta is None:
         msg = await _complete([{"role": "system", "content": prompt.NO_MODEL_PROMPT}, *history,
@@ -204,31 +296,82 @@ async def run_turn(session_id, user_message, history, selection=None):
     async with cad.lock(session_id):
         meta = cad.require(session_id)  # re-read under the lock
         await cad.sync_manual_edits(meta)
-        records, content = [], ""
+        records, content, extra = [], "", {}
         try:
-            if parsed is not None:
+            parsed = _fast_parse(meta, user_message, selection)  # meta re-read under the lock
+            planned = await _plan_turn(meta, user_message, selection)
+            if planned is not None:
+                content, records, extra = planned
+            elif parsed is not None:
                 content, records = await _fast_turn(meta, parsed)
             else:
                 messages = [{"role": "system", "content": prompt.build_system(meta)}, *history,
                             {"role": "user", "content": prompt.with_selection(user_message, meta.get("info"),
                                                                               selection or [])}]
-                tool_defs = tools.tools_for(meta)
+                groups = set(tools.groups_for_message(user_message))
+                tool_defs = tools.tools_for(meta, groups)
                 failures = 0
-                for _ in range(MAX_STEPS):
+                plan_mode = is_compound(user_message)
+                queued = []  # plan mode: edits collected for one previewed plan
+                plan_retries = 1  # a failed plan preview goes back to the model once before the user sees it
+                steps_left = MAX_STEPS
+                while steps_left > 0:
+                    steps_left -= 1
                     # After repeated failed edits, stop offering tools so the model explains the problem
                     # instead of burning the token budget on near-identical retries.
                     msg = await _complete(messages, tool_defs if failures < MAX_TOOL_FAILURES else None)
                     if not msg.tool_calls:
                         content = msg.content or ""
+                        if queued and plan_retries and steps_left > 0:
+                            pending = await plans.preview(meta, queued, (content or user_message).strip()[:200],
+                                                          source="compound request")
+                            if not pending.get("ok"):
+                                plan_retries -= 1
+                                queued, note = _plan_retry(pending)
+                                messages.append({"role": "assistant", "content": content})
+                                messages.append({"role": "user", "content": note})
+                                continue
+                            content, extra = plans.describe(pending), {"plan": pending}
                         break
-                    messages.append(_assistant_dict(msg))
+                    calls = []
                     for tc in msg.tool_calls:
                         try:
-                            args = json.loads(tc.function.arguments or "{}")
+                            calls.append((tc, json.loads(tc.function.arguments or "{}"), None))
                         except json.JSONDecodeError as e:
-                            result, rec = {"ok": False, "error": f"Arguments are not valid JSON: {e}"}, None
+                            calls.append((tc, None, f"Arguments are not valid JSON: {e}"))
+                    # Ends the turn: a plan / question for the user, or large edits shown as a preview first.
+                    stop = await _stop_calls(meta, msg, calls, plan_mode, queued)
+                    if stop is not None:
+                        content, extra = stop
+                        pend = extra.get("plan")
+                        if plan_mode and pend and not pend.get("ok") and plan_retries and steps_left > 0:
+                            plan_retries -= 1  # the model corrects a failed plan once before the user sees it
+                            (queued, note), extra = _plan_retry(pend), {}
+                            messages.append(_assistant_dict(msg))
+                            for tc, _a, _e in calls:
+                                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(
+                                    {"ok": False, "error": note})[:TOOL_RESULT_CHARS]})
+                            continue
+                        break
+                    messages.append(_assistant_dict(msg))
+                    for tc, args, err in calls:
+                        if err:
+                            result, rec = {"ok": False, "error": err}, None
+                        elif plan_mode and tc.function.name in tools.EDIT_TOOLS:
+                            queued.append({"tool": tc.function.name, "args": args})
+                            result, rec = {"ok": True, "queued": True, "note": (
+                                f"Queued as step {len(queued)} of a plan (not applied yet). Add the remaining edits the "
+                                "same way; when you are done, reply in one short line and the plan is previewed for the "
+                                "user to approve.")}, None
+                        elif tc.function.name == "load_tools":
+                            g = str((args or {}).get("group", ""))
+                            groups.add(g)
+                            tool_defs = tools.tools_for(meta, groups)
+                            result, rec = {"ok": True, "loaded": tools.GROUPS.get(g, [])}, None
                         else:
                             result, rec = await tools.execute(meta, tc.function.name, args)
+                        print(f"[agent] {tc.function.name} {json.dumps(args, default=str)[:300]} -> "
+                              f"{'ok' if result.get('ok', True) else 'FAILED: ' + str(result.get('error'))[:200]}")
                         if rec is not None:
                             records.append(rec)
                         if not result.get("ok", True):
@@ -237,6 +380,9 @@ async def run_turn(session_id, user_message, history, selection=None):
                                          "content": json.dumps(result, default=str)[:TOOL_RESULT_CHARS]})
                 else:
                     content = "I stopped after too many steps. Here is what was done so far."
+                if queued and not extra:
+                    pending = await plans.preview(meta, queued, (content or user_message).strip()[:200], source="compound request")
+                    content, extra = plans.describe(pending), {"plan": pending}
         except Exception:
             await cad.discard_uncommitted(meta)
             raise
@@ -247,7 +393,50 @@ async def run_turn(session_id, user_message, history, selection=None):
             cad.save(meta)  # registry may have changed during queries
         # Models sometimes copy the bookkeeping notes appended to history messages; drop them.
         content = _NOTE_RE.sub("", content or "").strip()
+        content = _guard_unverified_claims(content, records, extra)
         if not content and records:
             content = "\n".join(f"- {r['message']}" if r["ok"] else f"- Failed: {r['error']}" for r in records)
-        return {"content": content, "operations": records, "state": cad.public_state(meta),
-                "highlight": _highlight_ids(meta, records, content)}
+        hl = _highlight_ids(meta, records, content)
+        if extra.get("choices"):
+            hl = [c["id"] for c in extra["choices"] if isinstance(c, dict) and c.get("id")][:MAX_HIGHLIGHT]
+        return {"content": content, "operations": records, "state": cad.public_state(meta), "highlight": hl, **extra}
+
+
+def _plan_retry(pending):
+    """(steps kept, note for the model) after a plan preview failed at step N: steps 1..N-1 previewed fine and stay
+    queued; the model is asked only for what replaces step N onwards, keeping the user's values."""
+    steps = [{"tool": st["tool"], "args": st["args"]} for st in pending.get("steps") or []]
+    m = re.match(r"step (\d+)", str(pending.get("error") or ""), re.I)
+    n = int(m.group(1)) if m else 1
+    kept = steps[:n - 1]
+    done = "; ".join(plans.label(st) for st in kept) or "none"
+    return kept, (f"The plan preview failed: {pending.get('error')}. Nothing was changed. Steps kept (they worked, "
+                  f"do not send them again): {done}. Call the edit tools for step {n} onwards again, corrected (for "
+                  "example other feature or face IDs or edge selectors) but with the values the user asked for; "
+                  "then reply in one line.")
+
+
+async def _stop_calls(meta, msg, calls, plan_mode=False, queued=()):
+    """(content, extra) when this LLM step ends the turn: propose_plan, ask_user, or edits big enough to preview.
+    In plan mode edits are queued by the caller (they all end up in one plan), so they never stop the turn here."""
+    by_name = {tc.function.name: args for tc, args, err in calls if not err}
+    if "ask_user" in by_name:
+        a = by_name["ask_user"] or {}
+        choices = [{"id": str(c.get("id", "")).upper(), "label": str(c.get("label", ""))}
+                   for c in a.get("choices") or [] if isinstance(c, dict)]
+        return a.get("question") or "Which one do you mean?", {"choices": choices}
+    if "propose_plan" in by_name:
+        a = by_name["propose_plan"] or {}
+        steps = [{"tool": st.get("tool"), "args": st.get("args") or {}} for st in a.get("steps") or [] if isinstance(st, dict)]
+        steps = [q for q in queued if q not in steps] + steps  # edits queued earlier in this turn come first
+        try:
+            pending = await plans.preview(meta, steps, a.get("summary") or "")
+        except cad.CadError as e:
+            return f"I couldn't prepare that plan: {e}", {}
+        return plans.describe(pending), {"plan": pending}
+    edits = [{"tool": tc.function.name, "args": args} for tc, args, err in calls
+             if not err and tc.function.name in tools.EDIT_TOOLS]
+    if not plan_mode and edits and len(edits) == len(calls) and plans.is_large(edits):
+        pending = await plans.preview(meta, edits, (msg.content or "").strip()[:200], source="large edit")
+        return plans.describe(pending), {"plan": pending}
+    return None

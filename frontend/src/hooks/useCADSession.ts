@@ -109,6 +109,115 @@ export function useCADSession() {
     }
   }, []);
 
+  /** Display unit / precision / tolerance of the session. */
+  const updateSettings = useCallback(
+    async (patch: { display_unit?: "mm" | "in"; precision?: number; tolerance_length?: number; tolerance_angle?: number }) => {
+      if (!sessionId) return;
+      const state = await apiFetch<CadState>(`/cad/settings/${sessionId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(patch),
+      });
+      setCad(state);
+    },
+    [sessionId]
+  );
+
+  /** Lock (or unlock) a dimension / feature at its current value; mode "centered" keeps a feature centred. */
+  const setLock = useCallback(
+    async (target: string, locked: boolean, mode: "value" | "centered" = "value", axis?: "X" | "Y" | "Z") => {
+      if (!sessionId) return;
+      const state = await postJson<CadState>(`/cad/locks/${sessionId}${locked ? "" : "/remove"}`, { target, mode, axis });
+      setCad(state);
+    },
+    [sessionId]
+  );
+
+  /** Choose datum faces (plane IDs); "default" resets a letter. */
+  const setDatums = useCallback(
+    async (datums: Partial<Record<"A" | "B" | "C", string>>) => {
+      if (!sessionId) return;
+      const state = await apiFetch<CadState>(`/cad/datums/${sessionId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(datums),
+      });
+      setCad(state);
+    },
+    [sessionId]
+  );
+
+  /** GET a JSON analysis endpoint of this session, e.g. getJson("/cad/mass"). */
+  const getJson = useCallback(
+    async <T,>(path: string, params: Record<string, string | number> = {}): Promise<T | null> => {
+      if (!sessionId) return null;
+      const q = new URLSearchParams(Object.entries(params).map(([k, v]) => [k, String(v)])).toString();
+      return apiFetch<T>(`${path}/${sessionId}${q ? `?${q}` : ""}`);
+    },
+    [sessionId]
+  );
+
+  /** POST to a session endpoint that returns {message, state}; the state replaces the current one. */
+  const postAction = useCallback(
+    async <T extends { state?: CadState },>(path: string, body?: unknown): Promise<T | null> => {
+      if (!sessionId) return null;
+      const res = await postJson<T>(path.replace("{sid}", sessionId), body);
+      if (res?.state) setCad(res.state);
+      return res;
+    },
+    [sessionId]
+  );
+
+  /** Version tree: make version v current (the next edit branches from it). */
+  const checkout = useCallback(
+    async (v: number) => {
+      if (!sessionId) return;
+      setCad(await postJson<CadState>(`/cad/checkout/${sessionId}/${v}`));
+    },
+    [sessionId]
+  );
+
+  const renameVersion = useCallback(
+    async (v: number, name: string) => {
+      if (!sessionId) return;
+      setCad(
+        await apiFetch<CadState>(`/cad/versions/${sessionId}/${v}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        })
+      );
+    },
+    [sessionId]
+  );
+
+  const setMaterial = useCallback(
+    async (part: string, material: string) => {
+      if (!sessionId) return;
+      setCad(
+        await apiFetch<CadState>(`/cad/materials/${sessionId}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ part, material }),
+        })
+      );
+    },
+    [sessionId]
+  );
+
+  /** Save a file the backend generates (BOM CSV / XLSX, drawing PDF / SVG). */
+  const downloadFile = useCallback(async (path: string, fallbackName: string) => {
+    const { blob, filename } = await apiBlob(path);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename ?? fallbackName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, []);
+
   /** Exports are fetched as a blob and saved via a temporary link (keeps the backend error message on failure). */
   const download = useCallback(
     async (format: string) => {
@@ -144,6 +253,15 @@ export function useCADSession() {
     showInFreeCAD,
     pick,
     freecadSelection,
+    updateSettings,
+    setLock,
+    setDatums,
+    getJson,
+    postAction,
+    checkout,
+    renameVersion,
+    setMaterial,
+    downloadFile,
   };
 }
 
