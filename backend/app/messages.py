@@ -20,7 +20,7 @@ def _jsonable(doc):
 
 
 async def add(session_id, role, content, operations=None, version=None, kind=None, selection=None, plan=None,
-              choices=None):
+              choices=None, options=None):
     doc = {
         "session_id": session_id,
         "role": role,
@@ -39,6 +39,8 @@ async def add(session_id, role, content, operations=None, version=None, kind=Non
         doc["plan"] = plan  # a previewed plan waiting for approval (Phase 3)
     if choices:
         doc["choices"] = choices  # clickable answers to a question
+    if options:
+        doc["options"] = options  # alternatives offered for an open-ended request, each previewed
     db = get_db()
     if db is not None:
         res = await db.messages.insert_one(doc)
@@ -77,6 +79,10 @@ async def history_for_llm(session_id, limit=HISTORY_MESSAGES):
             content += "\n[Edits applied: " + "; ".join(o["message"].split("\n")[0] for o in ops) + "]"
         if m.get("plan"):
             content += f"\n[Plan proposed, waiting for the user's approval: {m['plan'].get('summary', '')}]"
+        if m.get("options"):
+            content += "\n[Options offered (the user can pick one by number): " + "; ".join(
+                f"{o['key']}. {o['title']}" + ("" if o.get("ok") else " (not possible)")
+                for o in m["options"].get("options") or []) + "]"
         if m.get("choices"):
             content += "\n[Choices offered: " + ", ".join(f"{c['id']} {c['label']}" for c in m["choices"]) + "]"
         if m.get("version") is not None and m["role"] == "assistant":

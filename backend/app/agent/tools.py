@@ -210,6 +210,17 @@ TOOLS = [
             "steps": {"type": "array", "items": {"type": "object", "properties": {
                 "tool": {"type": "string"}, "args": {"type": "object"}}, "required": ["tool", "args"]}}},
         ["summary", "steps"]),
+    _fn("propose_options", "For an open-ended request (smoother, stronger, lighter, nicer, 'improve …') or one with "
+        "several sensible ways to do it: offer 2-4 genuinely different alternatives, each a short title, one line on "
+        "its trade-off and its edit tool calls with exact values from the model data. Each is dry-run and previewed in "
+        "3D; the user picks one (alternatives that fail are shown as not possible). Then stop.", {
+            "question": {"type": "string", "description": "One line, e.g. 'Three ways to smooth the nose:'"},
+            "options": {"type": "array", "minItems": 2, "maxItems": 4, "items": {"type": "object", "properties": {
+                "title": {"type": "string"}, "description": {"type": "string"},
+                "steps": {"type": "array", "items": {"type": "object", "properties": {
+                    "tool": {"type": "string"}, "args": {"type": "object"}}, "required": ["tool", "args"]}}},
+                "required": ["title", "description", "steps"]}}},
+        ["question", "options"]),
     _fn("ask_user", "When a reference matches several features, ask which one: the user gets clickable choices "
         "(highlighted in the 3D view). Then stop.", {
             "question": {"type": "string"},
@@ -301,7 +312,7 @@ GROUPS["more"] = ["set_datums", "lock_dimension", "unlock_dimension", "list_lock
                   "list_objects"]
 GROUPED = {t for g in ("modeling", "analysis") for t in GROUPS[g]}
 ANALYSIS_TOOLS = set(GROUPS["analysis"])
-CONTROL_TOOLS = {"propose_plan", "ask_user", "load_tools"}
+CONTROL_TOOLS = {"propose_plan", "propose_options", "ask_user", "load_tools"}
 _GROUP_WORDS = {
     "modeling": ("mirror", "symmetr", "pattern", "array", "copies", "copy the", "add a slot", "add slot", "new slot",
                  "add a pocket", "add pocket", "new pocket", "counterbore", "countersink", "cbore", "csk", "draft",

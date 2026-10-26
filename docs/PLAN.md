@@ -103,8 +103,11 @@ time, each with tests and updated docs:
 | 2. Better feature recognition | Slots `SL#`, pockets `PK#`, chamfers `CH#`, edge IDs `E#`, threads, wall thickness, toroidal fillets and fillet chains; fix: fillets left behind by face moves, pockets above bosses, grid hole count | ✅ Done 2026-10-15 (STATUS §8, ARCHITECTURE §23) |
 | 3. Safer, smarter editing | Preview (dry run + ghost), multi-step plans in one version, pre-edit checks, mirror / shell / pattern / slot / pocket / counterbore / countersink / draft / split ops, version tree and compare, clickable disambiguation | ✅ Done 2026-10-15 (STATUS §9, ARCHITECTURE §24) |
 | 4. Analysis and manufacturing | Materials and mass properties, DFM checks with fixes, BOM, interference, TechDraw PDF/SVG, cost estimate | ✅ Done 2026-10-15 (STATUS §10, ARCHITECTURE §25) |
+| 4b. Alternatives | Open-ended requests get 2–4 dry-run alternatives with 3D ghosts; the user picks one, applied as one version | ✅ Done 2026-10-26, not committed yet (STATUS §12, ARCHITECTURE §24.6) |
 | 5. Viewer and UX | Exact face picking (glTF or face map), section plane, measuring, 3D annotations, streaming chat, command palette, shortcuts | Planned |
 | 6. Robustness and deployment | Evaluation suite (≥ 50 cases, LLM comparison), job queue / worker pool, limits, structured logs, CI on headless FreeCAD, Docker Compose | Planned |
 
 Phase 1 already covers part of the original "Phase 3" item list (counterbores/countersinks via standard sizes) and
 prepares Phase 3's preview (edits are now fully measured before they are committed).
+
+What is still open (housekeeping, Phases 5–6, limitations) is tracked in [STATUS.md §13](../STATUS.md#13-whats-remaining).

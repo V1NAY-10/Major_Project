@@ -71,6 +71,8 @@ export default function Home() {
   const [hiddenParts, setHiddenParts] = useState<string[]>([]);
   const [explode, setExplode] = useState(0);
   const [showGhost, setShowGhost] = useState(true);
+  // The alternative whose dry-run result is shown as the ghost (while its option set is still current).
+  const [optionGhost, setOptionGhost] = useState<{ setId: string; key: number; url: string } | null>(null);
   const freecad = useFreeCADStatus();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   // Session created by this page during upload/send: its data is already in local state, don't refetch.
@@ -158,6 +160,9 @@ export default function Home() {
       });
       setMessages((prev) => [...prev, res.message]);
       if (res.state) setCad(res.state);
+      // Alternatives offered: show the first workable one as the ghost straight away.
+      const first = res.message.options?.options.find((o) => o.ok && o.mesh_url);
+      setOptionGhost(first && res.message.options ? { setId: res.message.options.id, key: first.key, url: first.mesh_url! } : null);
       // Keep showing the selection (IDs are stable across edits); otherwise show what the reply touched.
       if (target.length) highlight(target);
       else if (res.highlight?.length) highlight(res.highlight);
@@ -192,6 +197,21 @@ export default function Home() {
     try {
       const res = await postAction<{ message: Message; state: CadState }>(`/cad/plan/{sid}/${what}`);
       if (res?.message) setMessages((prev) => [...prev, res.message]);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  /** Apply one of the offered alternatives as a new version. */
+  const applyOption = async (setId: string, key: number) => {
+    setError("");
+    setLoading(true);
+    try {
+      const res = await postAction<{ message: Message; state: CadState }>(`/cad/options/{sid}/apply`, { key, set_id: setId });
+      if (res?.message) setMessages((prev) => [...prev, res.message]);
+      setOptionGhost(null);
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -397,6 +417,12 @@ export default function Home() {
                   onCancelPlan={() => planAction("cancel")}
                   onChoose={onChoose}
                   onHoverChoice={(id) => highlight(id ? [id] : selection)}
+                  activeOptionsId={cad?.options?.id ?? null}
+                  previewOption={optionGhost && optionGhost.setId === cad?.options?.id ? optionGhost.key : null}
+                  onPreviewOption={(o) =>
+                    setOptionGhost(o?.mesh_url && msg.options ? { setId: msg.options.id, key: o.key, url: o.mesh_url } : null)
+                  }
+                  onApplyOption={(key) => msg.options && applyOption(msg.options.id, key)}
                   busy={loading}
                 />
               ))}
@@ -497,7 +523,15 @@ export default function Home() {
                     fitKey={`${cad.session_id}:${cad.filename}`}
                     highlights={highlights}
                     onPick={onViewerPick}
-                    ghostPath={showGhost && cad.pending?.ok ? cad.pending.mesh_url : null}
+                    ghostPath={
+                      !showGhost
+                        ? null
+                        : optionGhost && optionGhost.setId === cad.options?.id
+                          ? optionGhost.url
+                          : cad.pending?.ok
+                            ? cad.pending.mesh_url
+                            : null
+                    }
                     diff={compare?.geometry.meshes ?? []}
                     parts={
                       assemblyOn && assembly && assembly.version === cad.version
@@ -527,7 +561,7 @@ export default function Home() {
                     }
                     toolbar={
                       <>
-                        {cad.pending?.ok && (
+                        {(cad.pending?.ok || (optionGhost && optionGhost.setId === cad.options?.id)) && (
                           <button
                             onClick={() => setShowGhost((g) => !g)}
                             title="Show / hide the previewed result"

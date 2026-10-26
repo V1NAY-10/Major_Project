@@ -174,6 +174,9 @@ def public_state(meta):
         "can_redo": bool(_children(meta, head)),
         "materials": meta.get("materials") or {},
         "pending": {k: v for k, v in (meta.get("pending") or {}).items() if k != "records_full"} or None,
+        # Alternatives waiting for the user's pick; stale once the model has moved to another version.
+        "options": ({"id": meta["options"]["id"], "base_version": meta["options"]["base_version"]}
+                    if (meta.get("options") or {}).get("base_version") == head else None),
         "dirty": meta.get("dirty", False),
         "info": meta["info"],
         "mesh_url": f"/cad/model/{meta['session_id']}?v={head}",

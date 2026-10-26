@@ -254,6 +254,25 @@ export interface PendingPlan {
   mesh_url: string | null;
 }
 
+/** One alternative for an open-ended request, dry-run like a plan (not possible when the dry run failed). */
+export interface DesignOption {
+  key: number;
+  title: string;
+  description: string;
+  steps: { tool: string; args: Record<string, unknown>; label: string }[];
+  records: PendingPlan["records"];
+  ok: boolean;
+  error?: string | null;
+  mesh_url: string | null;
+}
+
+export interface OptionSet {
+  id: string;
+  question: string;
+  options: DesignOption[];
+  base_version: number;
+}
+
 export interface CadState {
   session_id: string;
   filename: string;
@@ -271,6 +290,8 @@ export interface CadState {
   /** Part ID → material key. */
   materials?: Record<string, string>;
   pending?: PendingPlan | null;
+  /** Alternatives waiting for the user's pick (only while the model is still at their base version). */
+  options?: { id: string; base_version: number } | null;
 }
 
 export interface FreeCADStatus {

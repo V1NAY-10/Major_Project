@@ -226,6 +226,10 @@ npm run dev                      # http://localhost:3000
    *"counterbore H2 Ø11 × 5"*, *"shell it to 2 mm, open at the top"*, *"draft the side walls 5°"*, *"split at z = 5"*.
    The **History** tab is a version tree: go to, name and compare versions (changed dimensions; added / removed
    material in green / red). Ambiguous requests get clickable choices that highlight in 3D.
+   **Alternatives:** open-ended requests (*"make the nose end smoother"*, *"make it lighter"*, *"what are my
+   options to …"*) get 2–4 different approaches instead of one guess. Each is dry-run in FreeCAD with its verified
+   values; ones that can't work on the model are listed as not possible, with the reason. **Preview** shows an
+   option as a ghost; **Apply** (or typing *option 2*) makes it one new version.
 6. **Analysis** (Phase 4, Analysis tab or chat): *"material all steel"*, *"mass"*, *"dfm cnc"* / *"dfm print"* /
    *"dfm sheet"* (findings with one-click fixes), *"bom"* (CSV / XLSX download), *"interference"*, *"drawing"*
    (A3 PDF / SVG with views, dimensions and hole callouts), *"cost cnc 10"*. The **Assembly** button shows parts
@@ -236,7 +240,7 @@ npm run dev                      # http://localhost:3000
 ```bash
 # Engine: parsing + every edit + analysis, against parts with known ground truth (headless FreeCAD, ~30 s, 383 checks)
 "C:/Program Files/FreeCAD 1.1/bin/freecadcmd.exe" backend/tests/test_engine.py
-# Backend unit tests: fast path, units, standards, side effects, tool units, threads, materials, BOM, plans (56 tests)
+# Backend unit tests: fast path, units, standards, side effects, tool units, threads, materials, BOM, plans, alternatives (62 tests)
 cd backend && venv\Scripts\python -m unittest discover -s app -t .
 # Frontend
 cd frontend && npx tsc --noEmit && npm run lint && npm run build

@@ -65,6 +65,8 @@ export interface Message {
   plan?: import("./cad").PendingPlan;
   /** Clickable answers to a question in this message. */
   choices?: { id: string; label: string }[];
+  /** Alternatives offered for an open-ended request; the user previews and applies one. */
+  options?: import("./cad").OptionSet;
   created_at?: string;
 }
 

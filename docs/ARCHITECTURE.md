@@ -1706,6 +1706,17 @@ feature on hover and send "Use <id>" with it selected. To keep the per-request t
 optional tools are in groups (`modeling`, `analysis`, `more`) loaded by `load_tools` or pre-loaded by keywords
 (`tools.groups_for_message`). `runner._guard_unverified_claims` replaces a reply that reports edits when no tool ran.
 
+### 24.6 Alternatives (`plans.propose_options`, `runner.is_open_ended`)
+
+An open-ended request (qualitative wording, no digits) puts the turn in options mode: direct edit calls are refused
+and the model calls `propose_options(question, options[{title, description, steps}])` with 2–4 options. Each goes
+through `plans._dry_run`, the same dry run as a plan; a workable one keeps its mesh as `preview_opt<N>.stl`, a failed
+one is kept as "not possible" with its error. The set is stored in `meta["options"]` (`id`, `base_version`, options
+with records). If all fail, the model gets the errors once. The user picks with the option card,
+`POST /cad/options/{sid}/apply` or a chat reply matching `_OPTION_PICK` (`2`, `option 2`, `use 1`); `apply_option`
+turns the option into `meta["pending"]` and runs `plans.apply`, so it commits one version or nothing. A set is stale
+once `head` moves.
+
 ## 25. Analysis and manufacturing (Phase 4)
 
 ### 25.1 Materials and mass (`app/materials.py`, `manufacturing.mass_properties`)
@@ -1760,3 +1771,5 @@ CNC: stock = bbox + 2 mm per side, material = stock mass × price, machining = r
 | POST | `/cad/run-tool/{sid}` | Run one tool call (DFM fixes) as a chat turn |
 | GET | `/cad/bom/{sid}?format=json\|csv\|xlsx`, `/cad/interference/{sid}?clearance=`, `/cad/part-meshes/{sid}` | Assembly |
 | POST / GET | `/cad/drawing/{sid}?format=svg\|pdf` | Make / download the drawing |
+| POST | `/cad/options/{sid}/apply` `{key, set_id}` | Apply one previewed alternative |
+| GET | `/cad/preview-mesh/{sid}?opt=N` | Ghost STL of alternative N |

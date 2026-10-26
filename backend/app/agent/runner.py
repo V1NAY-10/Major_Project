@@ -99,6 +99,8 @@ async def _complete(messages, tool_defs=None):
             # with the provider's reason so the model can fix the arguments instead of repeating them.
             last_err = e
             print(f"[agent] provider rejected the request (attempt {attempt + 1}): {_rejection(e)}")
+            if kwargs.get("tools"):
+                kwargs["tools"] = kwargs["tools"] + _unsent_tools(_rejection(e), kwargs["tools"])
             messages = messages + [{"role": "system", "content":
                                     "Your previous tool call was rejected: " + _rejection(e) + " Call the tool "
                                     "again with arguments that match its schema exactly (e.g. points are "
@@ -110,6 +112,15 @@ async def _complete(messages, tool_defs=None):
         raise LLMError("The AI made an invalid tool call three times, so nothing was changed. Try rephrasing the "
                        f"request. (Provider said: {_rejection(last_err)[:300]})", 502)
     raise LLMError(f"LLM request failed: {last_err}")
+
+
+def _unsent_tools(text, sent):
+    """Definitions of known tools the model tried to call although they weren't sent (e.g. draft_faces before
+    load_tools "modeling"), so the retry can offer them."""
+    have = {t["function"]["name"] for t in sent}
+    named = set(re.findall(r"[a-z_]+", text or ""))
+    return [t for t in tools.TOOLS if t["function"]["name"] in named - have
+            and (tools.ALLOW_PYTHON or t["function"]["name"] != "run_freecad_python")]
 
 
 def _retry_after(err):
@@ -153,7 +164,7 @@ _CLAIM_RE = re.compile(r"(✓|\bverified\b|\b(?:resized|added|moved|filleted|rou
 def _guard_unverified_claims(content, records, extra):
     """The model must not report edits it didn't make. When a turn made no edit (and proposed no plan) but the reply
     reads like edit results, say so plainly instead of passing the claims on."""
-    if records or extra.get("plan") or extra.get("choices") or not content:
+    if records or extra.get("plan") or extra.get("choices") or extra.get("options") or not content:
         return content
     if not _CLAIM_RE.search(content):
         return content
@@ -234,6 +245,20 @@ def is_compound(text):
     return len(clauses) >= 2 and len(verbs) >= 2
 
 
+_OPEN_ENDED = re.compile(
+    r"\b(smooth(?:er|en)?|sleek(?:er)?|nicer|better|improve|stronger|stiffer|lighter|reduce (?:the )?weight|"
+    r"aerodynamic|streamline[d]?|ergonomic|softer|round(?:er)? (?:it )?off|clean(?:er)? up|refine|optimi[sz]e|"
+    r"modern|elegant|blunt(?:er)?|sharper|options|alternatives|(?:different|other) ways)\b", re.I)
+
+
+def is_open_ended(text):
+    """A qualitative request with no exact values ("make the nose end smoother"): several edits could satisfy it,
+    so the agent offers alternatives for the user to pick instead of choosing one itself."""
+    return bool(_OPEN_ENDED.search(text or "")) and not re.search(r"\d", text or "")
+
+
+_OPTION_PICK = re.compile(r"^\s*(?:(?:apply|use|go with|pick|choose|take)\s+)?(?:(option|alternative|choice|#)\s*)?"
+                          r"(\d)\s*(?:please)?\s*[.!]*\s*$", re.I)
 _APPLY_WORDS = re.compile(r"^\s*(apply|apply it|yes|yes please|go ahead|do it|ok|okay|confirm|approve|apply the plan)\s*[.!]*\s*$", re.I)
 _CANCEL_WORDS = re.compile(r"^\s*(cancel|no|discard|don'?t|stop|cancel the plan)\s*[.!]*\s*$", re.I)
 _PREVIEW = re.compile(r"^\s*preview\s*:?\s+(.+)$", re.I)
@@ -242,6 +267,14 @@ _PREVIEW = re.compile(r"^\s*preview\s*:?\s+(.+)$", re.I)
 async def _plan_turn(meta, user_message, selection):
     """Plan control without the LLM: approve / cancel the pending plan, or 'preview <command>'.
     Returns (content, records, extra) or None."""
+    offer = meta.get("options")
+    m = _OPTION_PICK.match(user_message)
+    if offer and offer.get("base_version") == meta["head"] and m and (m.group(1) or not selection):
+        content, records, _ = await plans.apply_option(meta, int(m.group(2)))
+        return content, records, {}
+    if offer and _CANCEL_WORDS.match(user_message):
+        plans.cancel(meta)
+        return "Dropped the options; nothing was changed.", [], {}
     if meta.get("pending") and _APPLY_WORDS.match(user_message):
         content, records, _ = await plans.apply(meta)
         return content, records, {}
@@ -285,7 +318,8 @@ async def run_turn(session_id, user_message, history, selection=None):
     meta = cad.load(session_id)
     parsed = _fast_parse(meta, user_message, selection)
     plan_cmd = meta is not None and (bool(_PREVIEW.match(user_message)) or (bool(meta.get("pending")) and bool(
-        _APPLY_WORDS.match(user_message) or _CANCEL_WORDS.match(user_message))))
+        _APPLY_WORDS.match(user_message) or _CANCEL_WORDS.match(user_message))) or (bool(meta.get("options")) and bool(
+        _OPTION_PICK.match(user_message) or _CANCEL_WORDS.match(user_message))))
     if not LLM_API_KEY and parsed is None and not plan_cmd:
         raise LLMError("No LLM API key configured (set LLM_API_KEY or GROQ_API_KEY in backend/.env).", 500)
     if meta is None:
@@ -312,6 +346,13 @@ async def run_turn(session_id, user_message, history, selection=None):
                 tool_defs = tools.tools_for(meta, groups)
                 failures = 0
                 plan_mode = is_compound(user_message)
+                options_mode = not plan_mode and is_open_ended(user_message)
+                if options_mode:
+                    messages.append({"role": "system", "content": (
+                        "This request is open-ended. Look up what you need, then call propose_options with 2-4 "
+                        "different alternatives (exact values); do not apply an edit directly.")})
+                option_retries = 1  # alternatives that all fail go back to the model once
+                tried = []  # (tool, error) of failed calls, for the reply when the model gives up
                 queued = []  # plan mode: edits collected for one previewed plan
                 plan_retries = 1  # a failed plan preview goes back to the model once before the user sees it
                 steps_left = MAX_STEPS
@@ -319,7 +360,14 @@ async def run_turn(session_id, user_message, history, selection=None):
                     steps_left -= 1
                     # After repeated failed edits, stop offering tools so the model explains the problem
                     # instead of burning the token budget on near-identical retries.
-                    msg = await _complete(messages, tool_defs if failures < MAX_TOOL_FAILURES else None)
+                    try:
+                        msg = await _complete(messages, tool_defs if failures < MAX_TOOL_FAILURES else None)
+                    except LLMError:
+                        if failures < MAX_TOOL_FAILURES:
+                            raise
+                        # Tools were withdrawn after repeated failures and the model still won't answer in text.
+                        content = _gave_up(tried)
+                        break
                     if not msg.tool_calls:
                         content = msg.content or ""
                         if queued and plan_retries and steps_left > 0:
@@ -343,6 +391,18 @@ async def run_turn(session_id, user_message, history, selection=None):
                     stop = await _stop_calls(meta, msg, calls, plan_mode, queued)
                     if stop is not None:
                         content, extra = stop
+                        offer = extra.get("options")
+                        if offer and not any(o["ok"] for o in offer["options"]) and option_retries and steps_left > 0:
+                            option_retries -= 1  # every alternative failed its dry run: the model gets one more go
+                            note = ("None of the alternatives worked, nothing was changed: " + "; ".join(
+                                f"{o['title']}: {o['error']}" for o in offer["options"]) + ". Call propose_options "
+                                "again with alternatives that avoid these errors (other features, edges or tools).")
+                            extra = {}
+                            messages.append(_assistant_dict(msg))
+                            for tc, _a, _e in calls:
+                                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                                 "content": json.dumps({"ok": False, "error": note})[:TOOL_RESULT_CHARS]})
+                            continue
                         pend = extra.get("plan")
                         if plan_mode and pend and not pend.get("ok") and plan_retries and steps_left > 0:
                             plan_retries -= 1  # the model corrects a failed plan once before the user sees it
@@ -357,6 +417,10 @@ async def run_turn(session_id, user_message, history, selection=None):
                     for tc, args, err in calls:
                         if err:
                             result, rec = {"ok": False, "error": err}, None
+                        elif options_mode and tc.function.name in tools.EDIT_TOOLS:
+                            result, rec = {"ok": False, "error": (
+                                "Not applied: this request is open-ended. Offer this edit as one alternative of "
+                                "propose_options (2-4 alternatives) so the user can choose.")}, None
                         elif plan_mode and tc.function.name in tools.EDIT_TOOLS:
                             queued.append({"tool": tc.function.name, "args": args})
                             result, rec = {"ok": True, "queued": True, "note": (
@@ -376,6 +440,7 @@ async def run_turn(session_id, user_message, history, selection=None):
                             records.append(rec)
                         if not result.get("ok", True):
                             failures += 1
+                            tried.append((tc.function.name, str(result.get("error"))[:200]))
                         messages.append({"role": "tool", "tool_call_id": tc.id,
                                          "content": json.dumps(result, default=str)[:TOOL_RESULT_CHARS]})
                 else:
@@ -402,6 +467,19 @@ async def run_turn(session_id, user_message, history, selection=None):
         return {"content": content, "operations": records, "state": cad.public_state(meta), "highlight": hl, **extra}
 
 
+def _gave_up(tried):
+    """Reply when the model stopped after repeated failed tool calls: what was tried and why it failed."""
+    lines = ["I couldn't make that change; nothing was modified. What I tried:"]
+    seen = set()
+    for name, err in tried:
+        if (name, err) not in seen:
+            seen.add((name, err))
+            lines.append(f"- `{name}`: {err}")
+    lines.append("Try describing the change differently, select the face or edge you mean, or ask "
+                 "\"what are my options to ...\" to get alternatives.")
+    return "\n".join(lines[:8])
+
+
 def _plan_retry(pending):
     """(steps kept, note for the model) after a plan preview failed at step N: steps 1..N-1 previewed fine and stay
     queued; the model is asked only for what replaces step N onwards, keeping the user's values."""
@@ -425,6 +503,13 @@ async def _stop_calls(meta, msg, calls, plan_mode=False, queued=()):
         choices = [{"id": str(c.get("id", "")).upper(), "label": str(c.get("label", ""))}
                    for c in a.get("choices") or [] if isinstance(c, dict)]
         return a.get("question") or "Which one do you mean?", {"choices": choices}
+    if "propose_options" in by_name:
+        a = by_name["propose_options"] or {}
+        opts = [o for o in a.get("options") or [] if isinstance(o, dict)]
+        if not opts:
+            return "I couldn't put alternatives together for that; please describe the change in more detail.", {}
+        offer = await plans.propose_options(meta, a.get("question") or "", opts)
+        return plans.describe_options(offer), {"options": offer}
     if "propose_plan" in by_name:
         a = by_name["propose_plan"] or {}
         steps = [{"tool": st.get("tool"), "args": st.get("args") or {}} for st in a.get("steps") or [] if isinstance(st, dict)]

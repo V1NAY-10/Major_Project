@@ -3,6 +3,7 @@ import { Check, CheckCircle2, ChevronRight, Copy, Crosshair, Eye, GitCommitHoriz
 import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { Message, Operation, SideEffects, Verification } from "@/types/chat";
+import { DesignOption } from "@/types/cad";
 import { Units, useUnits } from "@/lib/units";
 
 const TOOL_LABELS: Record<string, string> = {
@@ -194,6 +195,91 @@ function OperationCard({ op }: { op: Operation }) {
   );
 }
 
+/** One alternative: title, trade-off, previewed values; Preview shows its ghost, Apply makes it a version. */
+function OptionCard({
+  opt,
+  active,
+  previewing,
+  busy,
+  onPreview,
+  onApply,
+}: {
+  opt: DesignOption;
+  active: boolean;
+  previewing: boolean;
+  busy?: boolean;
+  onPreview?: () => void;
+  onApply?: () => void;
+}) {
+  const verified = opt.records.flatMap((r) => (r?.verified ?? []) as Verification[]).filter((v) => v.status === "ok");
+  const warnings = opt.records.flatMap((r) => r?.warnings ?? []);
+  return (
+    <div
+      className={`rounded-xl border px-3 py-2 text-xs ${
+        !opt.ok
+          ? "border-border opacity-60"
+          : previewing
+            ? "border-cyan-500/60 bg-cyan-500/10"
+            : "border-border hover:border-purple-500/50"
+      }`}
+    >
+      <div className="flex items-start gap-2">
+        <span
+          className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full font-mono text-[10px] font-bold ${
+            opt.ok ? "bg-purple-600 text-white" : "bg-foreground/10 text-foreground/50"
+          }`}
+        >
+          {opt.key}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="font-semibold">{opt.title}</p>
+          <p className="text-foreground/60">{opt.description}</p>
+          {opt.ok ? (
+            <>
+              {verified.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-1.5">
+                  {verified.map((v, i) => (
+                    <VerifiedChip key={i} v={v} />
+                  ))}
+                </div>
+              )}
+              {warnings.map((w, i) => (
+                <p key={i} className="mt-1 text-[10px] text-amber-600 dark:text-amber-400">⚠ {w}</p>
+              ))}
+              <p className="mt-1 font-mono text-[10px] text-foreground/40 break-words">
+                {opt.steps.map((st) => st.label).join(" → ")}
+              </p>
+            </>
+          ) : (
+            <p className="mt-1 text-[10px] text-red-500/80">Not possible: {opt.error}</p>
+          )}
+        </div>
+        {opt.ok && (
+          <div className="flex shrink-0 flex-col gap-1">
+            <button
+              onClick={onPreview}
+              disabled={!active}
+              title="Show this result as a ghost in the 3D view"
+              className={`flex items-center gap-1 rounded-lg border px-2 py-0.5 text-[11px] font-semibold disabled:opacity-30 ${
+                previewing ? "border-cyan-500/60 bg-cyan-500/20" : "border-border"
+              }`}
+            >
+              <Eye size={11} /> Preview
+            </button>
+            <button
+              onClick={onApply}
+              disabled={!active || busy}
+              className="rounded-lg bg-purple-600 px-2 py-0.5 text-[11px] font-semibold text-white disabled:opacity-30"
+            >
+              Apply
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 interface ChatMessageProps {
   message: Message;
   /** ID of the plan currently waiting for approval (its buttons are active only then). */
@@ -203,12 +289,31 @@ interface ChatMessageProps {
   /** A clickable answer was chosen / hovered (highlight it in the 3D view). */
   onChoose?: (id: string, label: string) => void;
   onHoverChoice?: (id: string | null) => void;
+  /** ID of the option set still waiting for a pick (its buttons are active only then). */
+  activeOptionsId?: string | null;
+  /** Key of the option whose ghost is shown in the 3D view. */
+  previewOption?: number | null;
+  onPreviewOption?: (opt: DesignOption | null) => void;
+  onApplyOption?: (key: number) => void;
   busy?: boolean;
 }
 
-export default function ChatMessage({ message, pendingPlanId, onApplyPlan, onCancelPlan, onChoose, onHoverChoice, busy }: ChatMessageProps) {
+export default function ChatMessage({
+  message,
+  pendingPlanId,
+  onApplyPlan,
+  onCancelPlan,
+  onChoose,
+  onHoverChoice,
+  activeOptionsId,
+  previewOption,
+  onPreviewOption,
+  onApplyOption,
+  busy,
+}: ChatMessageProps) {
   const [copied, setCopied] = useState(false);
-  const { role, content, operations, version, kind, selection, plan, choices } = message;
+  const { role, content, operations, version, kind, selection, plan, choices, options } = message;
+  const optionsActive = !!options && options.id === activeOptionsId;
   const planActive = !!plan && plan.ok && plan.id === pendingPlanId;
   const isAssistant = role === "assistant";
 
@@ -303,6 +408,23 @@ export default function ChatMessage({ message, pendingPlanId, onApplyPlan, onCan
             >
               Cancel
             </button>
+          </div>
+        )}
+
+        {!!options?.options.length && (
+          <div className="mt-3 space-y-1.5">
+            {options.options.map((o) => (
+              <OptionCard
+                key={o.key}
+                opt={o}
+                active={optionsActive}
+                previewing={optionsActive && previewOption === o.key}
+                busy={busy}
+                onPreview={() => onPreviewOption?.(previewOption === o.key ? null : o)}
+                onApply={() => onApplyOption?.(o.key)}
+              />
+            ))}
+            {!optionsActive && <p className="text-[10px] text-foreground/40">These options are no longer current.</p>}
           </div>
         )}
 

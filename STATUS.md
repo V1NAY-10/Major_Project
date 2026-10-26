@@ -1,6 +1,6 @@
 # AetherCAD — Project Status
 
-_Last updated: 2026-10-15_
+_Last updated: 2026-10-26_
 
 ## Phases
 
@@ -9,8 +9,9 @@ _Last updated: 2026-10-15_
 | Rebuild (2026-10-13) | Architecture review, precise parsing, dimension layer, FreeCAD side by side, component IDs, click-to-select | ✅ Done (sections 1–6 below) |
 | Phase 1 — Precision foundations (2026-10-14) | Units, tolerance-checked edits, side-effect report, locks, datums, standard hole sizes, angle/radial/hole-to-hole dimensions | ✅ Done and approved ([section 7](#7-phase-1--precision-foundations-2026-10-14)) |
 | Phase 2 — Better feature recognition (2026-10-15) | Slots, pockets, chamfers, edge IDs, threads, wall thickness, fillet chains, the three known limitations of §5 | ✅ Done and approved ([section 8](#8-phase-2--better-feature-recognition-2026-10-15)) |
-| **Phase 3 — Safer, smarter editing** (2026-10-15) | Preview, multi-step plans, pre-edit checks, 10 new ops, version tree + compare, clickable ambiguity choices | ✅ Done ([section 9](#9-phase-3--safer-smarter-editing-2026-10-15)); waiting for approval |
-| **Phase 4 — Analysis and manufacturing** (2026-10-15) | Materials + mass properties, DFM (CNC / 3D print / sheet metal) with fixes, BOM CSV/XLSX, interference, exploded view, 2D drawing PDF/SVG, cost estimate | ✅ Done ([section 10](#10-phase-4--analysis-and-manufacturing-2026-10-15)); waiting for approval |
+| Phase 3 — Safer, smarter editing (2026-10-15) | Preview, multi-step plans, pre-edit checks, 10 new ops, version tree + compare, clickable ambiguity choices | ✅ Done, committed in `0e6eb44` ([section 9](#9-phase-3--safer-smarter-editing-2026-10-15)) |
+| Phase 4 — Analysis and manufacturing (2026-10-15) | Materials + mass properties, DFM (CNC / 3D print / sheet metal) with fixes, BOM CSV/XLSX, interference, exploded view, 2D drawing PDF/SVG, cost estimate | ✅ Done, committed in `0e6eb44` ([section 10](#10-phase-4--analysis-and-manufacturing-2026-10-15)) |
+| **Alternatives for open-ended requests** (after Phase 4) | "Make the nose smoother" → 2–4 dry-run alternatives with 3D ghosts; pick one to apply | ✅ Done, **not committed yet** ([section 12](#12-alternatives-for-open-ended-requests-after-phase-4)) |
 | Phase 5 — Viewer and UX | glTF picking, sections, measurement, streaming chat, shortcuts | ⏳ Not started |
 | Phase 6 — Robustness, evaluation, deployment | Eval suite, concurrency, security, logging, CI, Docker | ⏳ Not started |
 
@@ -30,9 +31,9 @@ _Last updated: 2026-10-15_
 | Feature recognition (Phase 2) | ✅ Done and tested (engine, backend API end to end against headless FreeCAD, frontend build) |
 | Safer, smarter editing (Phase 3) | ✅ Done and tested (engine, API, simulation; frontend build) |
 | Analysis and manufacturing (Phase 4) | ✅ Done and tested (engine, API, simulation; frontend build) |
-| Automated tests | ✅ 383/383 engine checks; 56/56 backend unit tests; simulations: Phases 1–2 43/43 (§8.7), Phases 3–4 38/38 steps that ran, 11 LLM steps skipped for the Groq quota (§11) |
-| Documentation | ✅ README.md, docs/ARCHITECTURE.md, docs/PLAN.md and this file updated for Phases 3 and 4 |
-| Git commit | ⏳ Phases 1–4 not committed yet (the rebuild is committed as `9a71faa`) |
+| Automated tests | ✅ 383/383 engine checks (last run with Phase 4); 62/62 backend unit tests (re-run 2026-10-26); simulations: Phases 1–2 43/43 (§8.7), Phases 3–4 38/38 steps that ran, 11 LLM steps skipped for the Groq quota (§11) |
+| Documentation | ✅ README.md, docs/ARCHITECTURE.md, docs/PLAN.md and this file updated through the Alternatives feature |
+| Git commit | Rebuild in `9a71faa`, Phases 1–4 in `0e6eb44`. ⏳ The Alternatives feature, `agent/test_options.py` and the `demo/5_payload_adapter` files are not committed yet |
 
 ---
 
@@ -152,7 +153,7 @@ which is unreliable. That layer has now been added on top of the existing design
    - Frontend: `cd frontend && npm run dev`, then open http://localhost:3000.
 2. **Optional:** use a stronger or higher-limit LLM. The Groq free tier (8k tokens per minute) works but pauses between steps. Set `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` in `backend/.env`.
 3. **Optional:** delete the unused `CLERK_SECRET_KEY` line from `backend/.env`.
-4. **Commit the work** once you're happy with it (nothing is committed yet).
+4. **Commit the Alternatives work** once you're happy with it (Phases 1–4 are committed). Everything else still open is in [§13](#13-whats-remaining).
 
 ---
 
@@ -173,9 +174,8 @@ _Still open:_
 
 ## 6. Possible next steps
 
-- Preview an edit before applying it.
-- More operations: shell, mirror, slot and pocket edits, and changing a grid's hole count.
-- Run the engine test suite in CI on headless FreeCAD.
+Superseded: preview, shell, mirror, slot / pocket edits and grid hole counts were done in Phases 2–3. The current
+list of open work is in [§13](#13-whats-remaining).
 
 ---
 
@@ -462,3 +462,71 @@ Found by the LLM runs earlier the same day, and fixed:
 After the fix, gpt-oss-20b mirrored the hole correctly and also added the slot. The skipped LLM steps should be
 re-run once the quota resets: run `simulate.py` from the scratchpad, or use the chat.
 
+---
+
+## 12. Alternatives for open-ended requests (after Phase 4)
+
+Goal: a qualitative request with no numbers ("make the nose end smoother", "make it lighter", "what are my options
+to …") should not make the agent silently pick one edit. It now offers 2–4 genuinely different approaches, each
+dry-run in FreeCAD, and the user picks one.
+
+### 12.1 What was built
+
+| Piece | Implementation |
+|---|---|
+| Detection | `runner.is_open_ended`: qualitative words (smoother, lighter, stronger, nicer, improve, options, other ways …) **and** no digits in the message. In that mode the model gets a system note to call `propose_options`, and any direct edit-tool call is refused with "offer this as one alternative" |
+| `propose_options` tool | Control tool, always sent (like `propose_plan` / `ask_user`): `question` + 2–4 options, each `{title, description, steps[{tool, args}]}` |
+| Dry runs | `plans.propose_options` runs each option through the same `_dry_run` as plans (refactored out of `plans.preview`); a workable option's mesh is kept as `preview_opt<N>.stl`. An option that fails stays in the list as "not possible" with the reason. Stored in `meta["options"]` with its base version |
+| Retry | If every option fails its dry run, the errors go back to the model once to try other features / edges / tools |
+| Picking | Option card **Preview** (ghost in the 3D view) / **Apply** in the chat, or type `2`, `option 2`, `use 1`, `#2`. `plans.apply_option` turns it into a pending plan and applies it as **one** version (all steps or nothing). `cancel` drops the options. Options go stale when the head version changes |
+| Robustness | `_unsent_tools`: if the model calls a known tool that wasn't sent (e.g. `draft_faces` before `load_tools`), the retry includes it. `_gave_up`: when tools were withdrawn after repeated failures and the model still won't answer, the reply lists what was tried, why it failed, and that nothing was modified |
+| Prompt | New rule for open-ended requests; free-form `F#` faces can't be drafted or pushed, so work on their edges, neighbouring planar faces or the whole part |
+| API | `POST /cad/options/{sid}/apply {key, set_id}`; `GET /cad/preview-mesh/{sid}?opt=N`; `public_state` exposes `options {id, base_version}` while current; chat messages store `options`, and the history sent to the LLM notes which options were offered |
+| Frontend | `DesignOption` / `OptionSet` types, `OptionCard` in `ChatMessage.tsx` (title, trade-off, verified values, warnings, Preview / Apply); the first workable option is shown as the ghost automatically (`page.tsx`) |
+
+### 12.2 Files
+
+`backend/app/agent/plans.py`, `runner.py`, `tools.py`, `prompt.py`, `backend/app/cad_service.py`, `messages.py`,
+`routes.py`, `backend/app/agent/test_options.py` (new, 6 tests), `frontend/src/types/cad.ts`, `types/chat.ts`,
+`components/chat/ChatMessage.tsx`, `app/page.tsx`, `README.md`. New demo part: `demo/5_payload_adapter.step` / `.FCStd`.
+
+### 12.3 Verification
+
+| Check | Result |
+|---|---|
+| Backend unit tests | **62 passed** (6 new in `test_options.py`: open-ended detection, option-pick parsing, unsent tools, tool always offered, reply text, give-up text) |
+| Engine suite | Not re-run for this change (no engine code changed); 383/383 at the end of Phase 4 |
+| Frontend typecheck / lint / build | Not re-run on 2026-10-26: run `npx tsc --noEmit && npm run lint && npm run build` before committing |
+| LLM end to end | Not recorded; try "make the nose end smoother" on `demo/5_payload_adapter.step` |
+
+### 12.4 Known limitations
+
+- Detection is a keyword regex: an open-ended request phrased without those words is handled as a normal edit, and
+  any digit in the message (e.g. "make the R5 end smoother") turns options mode off.
+- At most 4 options, dry-run one after another, so a turn with 4 multi-step options takes noticeably longer.
+- Options are only valid at the version they were previewed on; after any other edit the user must ask again.
+
+---
+
+## 13. What's remaining
+
+**Housekeeping**
+
+1. Run the frontend checks, then commit the Alternatives feature, `test_options.py` and the payload-adapter demo files.
+2. Re-run the 11 LLM steps of the Phases 3–4 simulation that were skipped for the Groq quota (§11).
+3. Check in a browser the UI added since Phase 1 (settings bar, ✓/⚠ chips, side-effect table, locks, option cards);
+   it has never been checked visually.
+4. Optional: remove the unused `CLERK_SECRET_KEY` from `backend/.env`; use a higher-limit LLM than the Groq free tier.
+
+**Phase 5 — Viewer and UX** (not started): exact face picking (glTF or face map instead of STL), section plane,
+measuring tool, 3D annotations, streaming chat replies, command palette and keyboard shortcuts.
+
+**Phase 6 — Robustness, evaluation, deployment** (not started): evaluation suite (≥ 50 model + prompt cases with
+expected measured results, LLM comparison), job queue / worker pool (today: one backend process and one FreeCAD,
+sessions served one at a time), request limits and security, structured logging, CI running the engine suite on
+headless FreeCAD, Docker Compose.
+
+**Open limitations worth tackling** (details in §5, §7.6, §8.6, §9.3, §10.3, §12.4): free-form faces stay
+unclassified; slots / pockets need vertical walls; pocket length / width aren't editable; no conical chamfers; fillet
+chains aren't re-made on face moves; draft is a rotation, not a true draft op; mirror / pattern don't handle fillets or
+chamfers; the drawing has only overall dimensions and hole callouts; the cost model uses illustrative prices.

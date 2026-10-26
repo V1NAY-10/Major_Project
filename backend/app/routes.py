@@ -247,7 +247,7 @@ async def chat(body: ChatRequest):
     version = result["state"]["version"] if result["state"] else None
     saved = await messages.add(body.session_id, "assistant", result["content"],
                                operations=result["operations"], version=version, plan=result.get("plan"),
-                               choices=result.get("choices"))
+                               choices=result.get("choices"), options=result.get("options"))
     return {"message": saved, "state": result["state"], "highlight": result.get("highlight", [])}
 
 
@@ -292,9 +292,25 @@ async def plan_cancel(session_id: str = Depends(owned)):
         return {"message": msg, "state": cad.public_state(meta)}
 
 
+class OptionRequest(BaseModel):
+    key: int
+    set_id: Optional[str] = None
+
+
+@router.post("/cad/options/{session_id}/apply")
+async def option_apply(body: OptionRequest, session_id: str = Depends(owned)):
+    """Apply the alternative the user picked (all its steps as one version, or nothing)."""
+    async with cad.lock(session_id):
+        meta = cad.require(session_id)
+        content, records, ok = await runner.plans.apply_option(meta, body.key, body.set_id)
+        msg = await messages.add(session_id, "assistant", content, operations=records, version=meta["head"],
+                                 **({} if ok else {"kind": "error"}))
+        return {"message": msg, "state": cad.public_state(meta), "ok": ok}
+
+
 @router.get("/cad/preview-mesh/{session_id}")
-async def preview_mesh(session_id: str = Depends(owned)):
-    path = cad.preview_mesh_path(session_id)
+async def preview_mesh(session_id: str = Depends(owned), opt: Optional[int] = None):
+    path = runner.plans.option_mesh_path(session_id, opt) if opt else cad.preview_mesh_path(session_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="No preview")
     return FileResponse(path, media_type="model/stl", headers={"Cache-Control": "no-store"})

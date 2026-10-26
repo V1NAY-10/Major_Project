@@ -7,9 +7,12 @@ Pending plans: previews (dry runs) of one or more edits, applied as one version 
   apply(meta)           run the pending steps for real; if step N fails, everything is rolled back to the version the
                         plan started from; otherwise the steps become one new version.
   cancel(meta)          drop the pending plan.
+  propose_options(...)  dry-run 2-4 alternative ways to do an open-ended request (meta["options"]);
+  apply_option(meta, k) apply the alternative the user picked, like a plan.
 """
 
 import copy
+import shutil
 import uuid
 
 from .. import cad_service as cad
@@ -46,14 +49,9 @@ def _record(rec):
     return {k: rec.get(k) for k in ("tool", "ok", "message", "error", "verified", "warnings", "side_effects")}
 
 
-async def preview(meta, steps, summary="", source="agent"):
-    """Dry-run the steps and store them as meta["pending"]. Returns the pending plan."""
-    steps = [{"tool": s["tool"], "args": dict(s.get("args") or {})} for s in steps]
-    bad = [s["tool"] for s in steps if s["tool"] not in tools.EDIT_TOOLS]
-    if not steps or bad:
-        raise cad.CadError("A plan lists edit tool calls only" + (f" (not {', '.join(bad)})" if bad else ""))
+async def _dry_run(meta, steps):
+    """Run the steps without keeping them; the result mesh is written to preview.stl. Returns (records, ok, error)."""
     sid = meta["session_id"]
-    head = meta["head"]
     records, ok, error = [], True, None
     if len(steps) == 1:
         result, rec = await tools.execute(meta, steps[0]["tool"], steps[0]["args"], preview=True)
@@ -76,6 +74,23 @@ async def preview(meta, steps, summary="", source="agent"):
             meta["registry"], meta["info"] = reg0, info0
             meta["dirty"] = True
             await cad.discard_uncommitted(meta)  # back to the head version, exactly
+    return records, ok, error
+
+
+def _clean_steps(steps):
+    steps = [{"tool": s["tool"], "args": dict(s.get("args") or {})} for s in steps]
+    bad = [s["tool"] for s in steps if s["tool"] not in tools.EDIT_TOOLS]
+    if not steps or bad:
+        raise cad.CadError("A plan lists edit tool calls only" + (f" (not {', '.join(bad)})" if bad else ""))
+    return steps
+
+
+async def preview(meta, steps, summary="", source="agent"):
+    """Dry-run the steps and store them as meta["pending"]. Returns the pending plan."""
+    steps = _clean_steps(steps)
+    sid = meta["session_id"]
+    head = meta["head"]
+    records, ok, error = await _dry_run(meta, steps)
     pending = {"id": uuid.uuid4().hex[:10], "summary": summary or "; ".join(label(s) for s in steps),
                "steps": [{**s, "label": label(s)} for s in steps], "records": records, "ok": ok, "error": error,
                "base_version": head, "source": source, "created_at": cad._now(),
@@ -85,6 +100,87 @@ async def preview(meta, steps, summary="", source="agent"):
     meta["pending"] = pending
     cad.save(meta)
     return pending
+
+
+# ── Alternatives: several ways to do an open-ended request, each previewed; the user picks one ──────────────────
+
+MAX_OPTIONS = 4
+
+
+async def propose_options(meta, question, options):
+    """Dry-run each alternative (a list of edit steps) and keep them as meta["options"] until the user picks one.
+    An alternative that fails its dry run stays in the list, marked not possible, with the reason."""
+    sid = meta["session_id"]
+    head = meta["head"]
+    set_id = uuid.uuid4().hex[:10]
+    out = []
+    for n, opt in enumerate(options[:MAX_OPTIONS], 1):
+        title = str(opt.get("title") or f"Option {n}")[:80]
+        try:
+            steps = _clean_steps(opt.get("steps") or [])
+        except cad.CadError as e:
+            out.append({"key": n, "title": title, "description": str(opt.get("description") or "")[:300],
+                        "steps": [], "records": [], "ok": False, "error": str(e), "mesh_url": None})
+            continue
+        records, ok, error = await _dry_run(meta, steps)
+        mesh_url = None
+        if ok:
+            shutil.copyfile(cad.preview_mesh_path(sid), option_mesh_path(sid, n))
+            mesh_url = f"/cad/preview-mesh/{sid}?opt={n}&v={head}&p={set_id}"
+        out.append({"key": n, "title": title, "description": str(opt.get("description") or "")[:300],
+                    "steps": [{**s, "label": label(s)} for s in steps], "records": records, "ok": ok,
+                    "error": error, "mesh_url": mesh_url})
+    meta.pop("pending", None)
+    meta["options"] = {"id": set_id, "question": str(question or "")[:300], "options": out, "base_version": head,
+                       "created_at": cad._now()}
+    cad.save(meta)
+    return meta["options"]
+
+
+def option_mesh_path(session_id, key):
+    return cad.preview_mesh_path(session_id).with_name(f"preview_opt{int(key)}.stl")
+
+
+async def apply_option(meta, key, set_id=None):
+    """Apply one previewed alternative as one version. Returns (reply text, records, ok)."""
+    offer = meta.get("options")
+    if not offer or (set_id and set_id != offer["id"]):
+        raise cad.CadError("Those options are no longer current; ask again")
+    if meta["head"] != offer["base_version"]:
+        meta.pop("options", None)
+        cad.save(meta)
+        raise cad.CadError("The model changed since these options were previewed; ask again")
+    opt = next((o for o in offer["options"] if o["key"] == int(key)), None)
+    if opt is None:
+        raise cad.CadError(f"There is no option {key}")
+    if not opt["ok"]:
+        raise cad.CadError(f"Option {key} ({opt['title']}) is not possible: {opt['error']}")
+    meta.pop("options", None)
+    meta["pending"] = {"id": offer["id"], "summary": f"Option {key}: {opt['title']}", "steps": opt["steps"],
+                       "base_version": offer["base_version"], "ok": True}
+    return await apply(meta)
+
+
+def describe_options(offer):
+    """The chat text for a set of alternatives."""
+    good = [o for o in offer["options"] if o["ok"]]
+    lines = [offer["question"] or "There are several ways to do this. Pick one:", ""]
+    for o in offer["options"]:
+        if not o["ok"]:
+            continue
+        shown = ", ".join(v.get("display", "") for r in o["records"] for v in (r or {}).get("verified") or []
+                          if v.get("display"))
+        lines.append(f"**{o['key']}. {o['title']}** — {o['description']}" + (f" ({shown})" if shown else ""))
+    bad = [o for o in offer["options"] if not o["ok"]]
+    if bad:
+        lines += ["", "Also considered, but not possible on this model:"]
+        lines += [f"- {o['title']}: {o['error']}" for o in bad]
+    if good:
+        lines += ["", "Hover or click **Preview** to see an option as a ghost in the 3D view, then **Apply** it "
+                      "(or type *option 2*). Nothing has been changed yet."]
+    else:
+        lines += ["", "None of the approaches works on this model, so nothing was changed."]
+    return "\n".join(lines)
 
 
 async def apply(meta, plan_id=None):
@@ -118,7 +214,8 @@ async def apply(meta, plan_id=None):
 
 
 def cancel(meta):
-    had = meta.pop("pending", None)
+    had = meta.pop("pending", None) or meta.pop("options", None)
+    meta.pop("options", None)
     cad.save(meta)
     return had is not None
 
