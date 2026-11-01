@@ -25,7 +25,7 @@ from . import materials as mats
 from . import precision, standards, units
 
 DATA_DIR = Path(os.getenv("AETHERCAD_DATA", Path(__file__).resolve().parent.parent / "data")) / "sessions"
-ALLOWED_EXTENSIONS = {"step", "stp", "iges", "igs", "brep", "brp", "fcstd"}
+ALLOWED_EXTENSIONS = {"step", "stp", "iges", "igs", "brep", "brp", "fcstd", "stl", "obj", "ply"}
 EXPORT_FORMATS = {"step": "step", "stp": "step", "iges": "igs", "igs": "igs", "stl": "stl",
                   "fcstd": "FCStd", "brep": "brep"}
 
@@ -180,6 +180,7 @@ def public_state(meta):
         "dirty": meta.get("dirty", False),
         "info": meta["info"],
         "mesh_url": f"/cad/model/{meta['session_id']}?v={head}",
+        "mesh_import": meta.get("mesh_import"),
     }
 
 
@@ -223,6 +224,7 @@ async def upload(session_id: str, filename: str, content: bytes):
             "locks": [],
             "datums": {},
             "threads": {},
+            **({"mesh_import": res["mesh_import"]} if res.get("mesh_import") else {}),
         }
         _set_info(meta, res["info"])
         _info_path(session_id, 0).write_text(json.dumps(meta["info"]), encoding="utf-8")

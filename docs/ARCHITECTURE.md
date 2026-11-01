@@ -30,6 +30,9 @@ It describes the code as it exists in this repository. For setup instructions se
 21. [Glossary](#21-glossary)
 22. [Precision layer (Phase 1): units, tolerance, side effects, locks, datums, standards](#22-precision-layer-phase-1)
 23. [Feature recognition (Phase 2): slots, pockets, chamfers, edges, threads, wall thickness](#23-feature-recognition-phase-2)
+24. [Safer, smarter editing (Phase 3)](#24-safer-smarter-editing-phase-3)
+25. [Analysis and manufacturing (Phase 4)](#25-analysis-and-manufacturing-phase-4)
+26. [Mesh import (STL / OBJ / PLY) and robustness fixes](#26-mesh-import-stl--obj--ply-and-robustness-fixes)
 
 ---
 
@@ -1773,3 +1776,79 @@ CNC: stock = bbox + 2 mm per side, material = stock mass × price, machining = r
 | POST / GET | `/cad/drawing/{sid}?format=svg\|pdf` | Make / download the drawing |
 | POST | `/cad/options/{sid}/apply` `{key, set_id}` | Apply one previewed alternative |
 | GET | `/cad/preview-mesh/{sid}?opt=N` | Ghost STL of alternative N |
+
+---
+
+## 26. Mesh import (STL / OBJ / PLY) and robustness fixes
+
+`freecad_bridge/mesh_import.py`, called by `engine.open_model` for `.stl`, `.obj`, `.ply`. A mesh has no faces,
+holes or dimensions, so each separate body (`Mesh.getSeparateComponents`) is rebuilt as an exact solid before the
+usual analysis runs. `rebuild(path)` returns `[(name, solid)]` and a report that `open_model` returns as
+`mesh_import`; the backend stores it in the session meta (`public_state.mesh_import`) and the upload message
+summarises it (`routes._mesh_summary`).
+
+### 26.1 Turned bodies (surfaces of revolution)
+
+1. **Axis.** Every normal line of a surface of revolution meets its axis. With the axis as a line (direction `a`,
+   moment `m`), normal line `(p, n)` meets it when `a·(p×n) + m·n = 0`, linear in `(a, m)`: the axis is the smallest
+   eigenvector of the area-weighted scatter matrix of `(p×n, n)`. Refitted 4 times on the triangles that agree
+   (drops radial holes and flats). The body is treated as turned when ≥ 85 % of its area agrees. The axis is
+   snapped to X/Y/Z when within 1e-4, pointed along +X/+Y/+Z, and its origin moved to the axis point nearest the
+   world origin, so profile values read in world coordinates (shoulder at Z -80, not -79.992).
+2. **Profile.** The mesh is cut by planes through the axis at 24 angles (`Mesh.crossSections`); the section with the
+   largest area (fewest holes crossed) is clipped to the half-plane r ≥ 0 (a solid tip crosses the axis).
+3. **Lines and arcs.** Greedy longest fit within the tolerance (`max(0.02, 2e-4 × size)` mm), arcs only below 20 ×
+   the profile size in radius and without sharp turns; neighbours that one arc fits are merged; each break is moved
+   to the least combined squared error (finds a 3° corner between the inner ogive and the tip cone).
+4. **Refit to vertices.** Section points lie on chords (up to the mesh deflection inside the surface), which biases
+   a shallow R 925 arc by several mm; mesh *vertices* lie exactly on the surface. Each primitive is refitted to the
+   vertices within 3 × tol of it and inside its chord span, kept only when it still runs through the section.
+   Corners are the intersections of neighbouring primitives, snapped to 0.01 / 0.1 / 1 mm when within tolerance.
+5. **Revolve** the closed wire. Triangles farther than 4 × tol from the profile are the off-axis features: each
+   connected group is fitted as a cylinder (axis = least-variance direction of the normals), snapped to radial
+   (square to and through the main axis, at a 0.5° angle) or axial, and cut; an end is extended past the surface
+   when no bottom triangles close it (through vs. blind).
+
+### 26.2 Prismatic bodies
+
+`makeShapeFromMesh` → solid → `removeSplitter` merges coplanar triangles into exact planes. Curved patches
+(triangles joined across edges bending 0.5–30°, joined across flat quad diagonals too) are fitted as cylinders.
+Because the tessellation's vertices lie exactly on the circle, an exact-size tool would only touch the polygon walls
+along lines; so the faceted feature is first filled (hole) or removed (boss) 1 µm oversize over its own extent,
+then the exact cylinder is cut / fused, extended past open ends (checked with `isInside` on the mesh solid).
+
+### 26.3 Accuracy check
+
+Per body: volume vs. the mesh (the mesh is inside the true surface, so +0.0–0.2 % is normal for curved parts) and
+the largest distance of 1,500 sampled mesh vertices from the new surface. Demo nose cone: 12 exact faces from
+30,446 triangles, max deviation 0.005 mm, volume within 0.0002 % of the original CAD.
+
+### 26.4 Fixes found by the nose-cone simulation (2026-10-29)
+
+| Where | Fix |
+|---|---|
+| `engine._boss_end_free` | A boss end is free when points just inside the boss's own radius beyond it are outside the part. It was sampled on the axis, which is inside the bore of a hollow boss: shrinking a nose-cone shoulder cut an 8 mm groove into the ogive |
+| `engine._apply_once` | `MATERIAL_OPS` (add_primitive, push_pull_face, fillet/chamfer_edges, remove_features) that leave volume, area and centre of mass unchanged, with no verified target, are refused ("did not change the geometry") |
+| `engine._unknown_params` | Arguments an op function doesn't take are dropped and reported instead of raising `TypeError` |
+| `engine._edge_selectors` | Bare IDs are accepted as edge selectors (E# edge, H# hole, C# boss, other IDs face); invalid names get the accepted forms |
+| `engine.op_add_primitive` | `add` / `union` / `join` → fuse, `subtract` / `remove` / `difference` → cut |
+| `engine._exact_bbox` | Reported bounding boxes use `optimalBoundingBox` (exact geometry), not the display triangulation |
+| `plans._drastic` | An alternative that replaces a part with a primitive, deletes a part, or removes over 40 % of a part's volume is listed as not possible |
+| `runner._fit_budget`, `_complete` | Older chat messages are shortened too; a provider 413 is retried once with only the tools in use and a 60 % budget; one more attempt allowed |
+
+### 26.x Nozzle run additions (2026-11-01)
+
+- **Profile on the vertices.** `_revolved_solid` first segments the section polygon (tolerance `tol`), then
+  segments again on `_vertex_profile`: the mesh vertices near the outline, ordered along it, with a tight tolerance
+  (`max(0.005, tol / 8)`). The second split is kept unless it has more than two extra primitives (a mesh whose
+  vertices are not on the true surface). Corners then snap only within that tight tolerance.
+- **Tangent junctions.** `_tangent_point` returns the exact junction of a line and an arc (foot of the centre) or two
+  arcs (on the line of centres) meeting within 2°; it replaces the ill-conditioned intersection and is not snapped.
+- **Axial holes on turned parts** snap in polar coordinates (radius, angle in 0.5° steps) about the part axis.
+- **Tapered push** (`engine._tapered_push`): moving a planar face whose circular rims belong to cones square to it
+  continues those cones (cylinder rims stay straight), with wall faces trimmed from the neighbours' own surfaces;
+  `_unify_same_domain` (OCC UnifySameDomain) then merges them, which `removeSplitter` does not do for cones.
+- **Boss growth** fills holes that open on the boss surface and re-cuts them whole through the new wall
+  (registry `t` updated).
+- **Patterns**: a group of equal holes that fits no pattern is split into concentric rings around its centroid.
+- **`_clean`** keeps a `removeSplitter` result only if it is valid and the volume is unchanged.

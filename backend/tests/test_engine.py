@@ -531,6 +531,21 @@ def test_dimension_edits():
 
 def test_pattern_edits():
     section("edit_hole_pattern")
+    # equal holes on two concentric circles (a bolt circle and an attachment circle, both Ø11): two patterns
+    import Part  # type: ignore
+    disc = Part.makeCylinder(100, 10).cut(Part.makeCylinder(54, 10))
+    for n_, r_, off in ((8, 70, 0.0), (6, 90, 0.5)):
+        for k in range(n_):
+            t = 2 * math.pi * (k + off) / n_
+            disc = disc.cut(Part.makeCylinder(5.5, 12, App.Vector(r_ * math.cos(t), r_ * math.sin(t), -1)))
+    two = Session(step("two_circles", disc.removeSplitter()))
+    pats = sorted((p.get("pcd"), p.get("count")) for p in two.info["patterns"])
+    check("two concentric bolt circles with equal holes: PCD 140 × 8 and PCD 180 × 6", pats == [(140.0, 8), (180.0, 6)],
+          pats)
+    pid = next(p["id"] for p in two.info["patterns"] if p["count"] == 8)
+    two.apply("edit_hole_pattern", pattern=pid, count=12)
+    pats = sorted((p.get("pcd"), p.get("count")) for p in two.info["patterns"])
+    check("inner circle edited to 12, outer circle kept", pats == [(140.0, 12), (180.0, 6)], pats)
     s = Session(step("flange_p", fx.flange()))
     pid = s.info["patterns"][0]["id"]
     ids = list(s.info["patterns"][0]["holes"])
@@ -1512,6 +1527,154 @@ def test_performance():
     check("dimensions < 5 s", t_dims < 5, f"{t_dims:.2f}s")
 
 
+def test_mesh_import():
+    section("STL mesh upload: rebuilt as exact solids")
+    ref = fx.nosecone()
+    n = Session(fx.write_nosecone_stl(os.path.join(TMP, "nosecone.stl")))
+    o = n.info["objects"][0]
+    check("nose cone: one exact solid with 12 faces", len(n.info["objects"]) == 1 and o["faces"] == 12, o["faces"])
+    check_close("nose cone: volume of the original CAD (±0.01 %)", o["volume"], ref.Volume, ref.Volume * 1e-4)
+    check("nose cone: bounding box 100 × 100 × 375.59 from Z -80 (tip at the design Z 295.588, not rounded)",
+          o["bbox"]["size"][:2] == [100.0, 100.0] and close(o["bbox"]["size"][2], ref.BoundBox.ZLength, 0.005)
+          and close(o["bbox"]["min"][2], -80), o["bbox"])
+    radial = [h for h in n.feats("hole") if close(h["diameter"], 4)]
+    check("nose cone: 4 × Ø4 radial through holes at Z -70", len(radial) == 4 and
+          all(h["through"] and close(h["center"][2], -70) and close(h["direction"][2], 0) for h in radial),
+          [(h["id"], h["center"]) for h in radial])
+    coax = [d for d in n.info["dimensions"] if d["type"] == "coaxial"]
+    check("nose cone: opposite radial holes exactly coaxial", len(coax) == 2 and all(d["value"] == 0 for d in coax), coax)
+    check("nose cone: shoulder Ø96 × 80 and bore Ø92", any(close(b["diameter"], 96) and close(b["length"], 80)
+          for b in n.feats("boss")) and any(close(h["diameter"], 92) for h in n.feats("hole")))
+    shoulder = next(b for b in n.feats("boss") if close(b["diameter"], 96))
+    n.apply("set_dimension", dimension=f"{shoulder['id']}.Ø", value=95.8)
+    sh = [b for b in n.feats("boss") if close(b["diameter"], 95.8)]
+    check("nose cone: rebuilt solid is editable (shoulder Ø95.8)", len(sh) == 1)
+    check("nose cone: thinner shoulder keeps its 80 mm length and doesn't cut into the ogive (hollow boss end "
+          "is not free)", sh and close(sh[0]["length"], 80) and not any(0.1 < p["center"][2] < 290
+                                                                      for p in n.feats("plane")),
+          [(p["id"], p["center"][2]) for p in n.feats("plane")])
+    n2 = Session(fx.write_nosecone_stl(os.path.join(TMP, "nosecone2.stl")))
+    bottom = min(n2.feats("plane"), key=lambda p: p["center"][2])
+    tip = max(n2.feats("plane"), key=lambda p: p["center"][2])
+    v0 = n2.info["objects"][0]["volume"]
+    length = tip["center"][2] - bottom["center"][2]
+    n2.apply("set_dimension", dimension=f"{bottom['id']}-{tip['id']}", value=length + 10, anchor="end")
+    bore = next(h for h in n2.feats("hole") if close(h["diameter"], 92))
+    check("nose cone: shoulder 10 mm longer: bore 10 mm deeper, no step cut into the ogive (cut ends flush where "
+          "the cavity narrows)", close(bore["depth"], 150.73, 0.01) and not any(0.1 < p["center"][2] < 290
+                                                                            for p in n2.feats("plane")),
+          [bore["depth"], [(p["id"], p["center"][2]) for p in n2.feats("plane")]])
+    check_close("nose cone: added volume = shoulder ring 590.62 mm² × 10 mm", n2.info["objects"][0]["volume"] - v0,
+                5906.2, 1.0)
+    # nozzle: a chain of tangent lines and arcs; the throat arcs are small (R10 sags 0.09 mm over its 15°), so
+    # the profile is split on the exact mesh vertices, not on the section's chord points
+    from freecad_bridge import mesh_import as MI
+    ref = fx.nozzle()
+    path = fx.write_nozzle_stl(os.path.join(TMP, "nozzle.stl"))
+    body = MI.rebuild(path)[1]["bodies"][0]
+    radii = sorted(round(p["radius"], 2) for p in body["profile"] if p["kind"] == "arc")
+    check("nozzle: throat / blend arcs R6 R10 R20 R24 R26 R30 (inner contour and its 4 mm offset)",
+          radii == [6.0, 10.0, 20.0, 24.0, 26.0, 30.0], radii)
+    corners = body["profile_corners"]
+    tangents = [(35.0, 47.321), (75.359, 24.019), (90.359, 20.0), (92.947, 20.341)]
+    check("nozzle: tangent points of the flow contour exact (not rounded), throat Ø40 at Z 90.359",
+          all(any(close(c, t_, 0.002) for c in corners) for t_ in tangents), corners)
+    check("nozzle: max deviation from the mesh < 0.01 mm", body["max_deviation_mm"] < 0.01, body["max_deviation_mm"])
+    z = Session(path)
+    o = z.info["objects"][0]
+    check_close("nozzle: volume of the original CAD (±0.02 %)", o["volume"], ref.Volume, ref.Volume * 2e-4)
+    check_close("nozzle: exit plane at the design Z 240.958 (not rounded to 241)", o["bbox"]["max"][2],
+                ref.BoundBox.ZMax, 0.01)
+    bolts = [h for h in z.feats("hole") if close(h["diameter"], 9)]
+    taps = [h for h in z.feats("hole") if close(h["diameter"], 3)]
+    check("nozzle: 8 × Ø9 axial bolt holes and 2 × Ø3 radial taps", len(bolts) == 8 and len(taps) == 2
+          and all(close(h["direction"][2], 1) or close(h["direction"][2], -1) for h in bolts), (len(bolts), len(taps)))
+    check("nozzle: bolt holes snapped in polar coordinates: all on R70 (45° ones at 49.497, not 49.5)",
+          all(close(math.hypot(*h["center"][:2]), 70, 1e-4) for h in bolts),
+          [round(math.hypot(*h["center"][:2]), 4) for h in bolts])
+    # longer / shorter nozzle: the exit face is pushed along the cone walls (taper kept, exit Ø grows / shrinks),
+    # not extruded as a cylindrical stub
+    import Part  # type: ignore
+    exit_face = next(f_ for f_ in ref.Faces if isinstance(f_.Surface, Part.Plane)
+                     and abs(f_.CenterOfMass.z - ref.BoundBox.ZMax) < 1e-6)
+    r_out = max(e.Curve.Radius for e in exit_face.Edges)
+    tn = math.tan(math.radians(15))
+
+    def ring(h, ri, ro):  # walls continued by h along Z, radii growing by tan 15° per mm
+        cone = lambda r: math.pi * h / 3 * (r * r + r * (r + tn * h) + (r + tn * h) ** 2)
+        return cone(ro) - cone(ri)
+    for h in (20.0, -20.0):
+        z = Session(path)
+        top = max(z.feats("plane"), key=lambda p: p["center"][2])
+        bottom = min(z.feats("plane"), key=lambda p: p["center"][2])
+        v0 = z.info["objects"][0]["volume"]
+        z.apply("set_dimension", dimension=f"{bottom['id']}-{top['id']}", value=top["center"][2] + h, anchor="start")
+        dv = z.info["objects"][0]["volume"] - v0
+        word = "longer" if h > 0 else "shorter"
+        check_close(f"nozzle 20 mm {word}: volume change = the 15° wall continued (exit Ø {120 + 2 * tn * h:.2f})",
+                    dv, ring(h, 60.0, r_out), abs(ring(h, 60.0, r_out)) * 1e-3)
+        check(f"nozzle 20 mm {word}: no cylindrical stub at the exit, still two 15° cones",
+              not any(x["diameter"] > 100 for x in z.feats("hole") if x["center"][2] > 200)
+              and sum(1 for k in z.feats("cone") if close(k["half_angle_deg"], 15, 0.01)) == 2,
+              [(k["id"], k["half_angle_deg"]) for k in z.feats("cone")])
+    # a thicker chamber wall (outer boss Ø108 → Ø112) keeps the radial pressure taps open through it
+    z = Session(path)
+    c1 = next(b for b in z.feats("boss") if close(b["diameter"], 108))
+    z.apply("set_dimension", dimension=f"{c1['id']}.Ø", value=112)
+    taps = [h for h in z.feats("hole") if close(h["diameter"], 3)]
+    check("nozzle: chamber boss Ø112: both Ø3 taps still through, now 6 mm long (r 50 → 56)",
+          len(taps) == 2 and all(h["through"] and close(h["depth"], 6, 0.01) for h in taps),
+          [(h["id"], h["through"], h["depth"]) for h in taps])
+    # a later hole edit on that model changes exactly that hole (the taps were left in coincident pieces before,
+    # and the clean-up after the next edit merged them wrongly: 2,930 mm³ lost, self-intersecting solid)
+    bolt = next(h for h in z.feats("hole") if close(h["diameter"], 9))
+    v0 = z.info["objects"][0]["volume"]
+    z.apply("resize_hole", hole=bolt["id"], diameter=11)
+    check_close("nozzle: after the boss edit, resizing a bolt hole Ø9 → Ø11 removes exactly π(5.5²−4.5²)×12",
+                v0 - z.info["objects"][0]["volume"], math.pi * (5.5 ** 2 - 4.5 ** 2) * 12, 0.5)
+    shp = next(o for o in z.doc().Objects if hasattr(o, "Shape") and o.Shape.Solids).Shape
+    try:
+        shp.check(True)
+        bop = "ok"
+    except Exception as e:  # noqa: BLE001
+        bop = str(e)[:120]
+    check("nozzle: solid passes the full BOP check (no self-intersections)", bop == "ok", bop)
+    f = Session(fx.write_fin_stl(os.path.join(TMP, "fin.stl")))
+    o = f.info["objects"][0]
+    check("fin: planes merged and holes snapped: 13 faces like the original", o["faces"] == 13, o["faces"])
+    check_close("fin: volume of the original CAD", o["volume"], fx.fin().Volume, 0.05)
+    ds = sorted(h["diameter"] for h in f.feats("hole"))
+    check("fin: holes Ø4.5, Ø4.5, Ø12", ds == [4.5, 4.5, 12.0], ds)
+    h = next(h for h in f.feats("hole") if close(h["diameter"], 4.5))
+    f.apply("set_hole_profile", **{"hole": h["id"], "diameter": 5.5})
+    check("fin: holes editable (Ø5.5)", any(close(x["diameter"], 5.5) for x in f.feats("hole")))
+
+
+def test_noop_and_unknown_args():
+    section("Edits that change nothing; unknown arguments")
+    p = Session(fx.write_step(fx.plate(), os.path.join(TMP, "plate_noop.step")))
+    obj = p.info["objects"][0]["name"]
+    try:
+        p.apply("add_primitive", shape="cylinder", operation="cut", object=obj,
+                dimensions={"radius": 2, "height": 5}, position=[500, 500, 0])
+        check("cutting tool that misses the part is refused", False, "applied")
+    except E.EngineError as e:
+        check("cutting tool that misses the part is refused", "did not change the geometry" in str(e), e)
+    face = p.plane("top")["id"]
+    res = p.apply("push_pull_face", face=face, distance=1, object=obj)
+    check("an argument the op doesn't take is ignored and reported", "Ignored argument" in res["message"]
+          and close(p.info["objects"][0]["bbox"]["size"][2], 11), res["message"][-120:])
+    try:
+        p.apply("fillet_edges", radius=1, edges=["E_tip"])
+        check("an invented edge name is refused with the accepted forms", False, "applied")
+    except E.EngineError as e:
+        check("an invented edge name is refused with the accepted forms", "Unknown edge selector 'E_tip'" in str(e), e)
+    v0 = p.info["objects"][0]["volume"]
+    p.apply("add_primitive", shape="box", operation="add", object=obj, dimensions={"length": 10, "width": 10, "height": 5},
+            position=[50, 30, 13.5])
+    check("operation 'add' means fuse", close(p.info["objects"][0]["volume"], v0 + 500, 0.01), p.info["objects"][0]["volume"])
+
+
 def main():
     t0 = time.time()
     for fn in (test_plate_recognition, test_flange_recognition, test_linear_and_bracket, test_other_recognition,
@@ -1520,7 +1683,7 @@ def main():
                test_locks, test_datums, test_hole_profile, test_slots, test_pockets, test_chamfers, test_fillet_chains,
                test_edges, test_wall_thickness_and_threads, test_phase2_regressions, test_preview, test_new_ops,
                test_pre_edit_checks, test_compare_versions, test_mass_properties, test_dfm, test_assembly_tools,
-               test_drawing, test_performance):
+               test_drawing, test_mesh_import, test_noop_and_unknown_args, test_performance):
         guarded(fn)
     for name in list(App.listDocuments()):
         try:

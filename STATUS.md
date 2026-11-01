@@ -1,6 +1,6 @@
 # AetherCAD — Project Status
 
-_Last updated: 2026-10-26_
+_Last updated: 2026-11-01_
 
 ## Phases
 
@@ -12,6 +12,8 @@ _Last updated: 2026-10-26_
 | Phase 3 — Safer, smarter editing (2026-10-15) | Preview, multi-step plans, pre-edit checks, 10 new ops, version tree + compare, clickable ambiguity choices | ✅ Done, committed in `0e6eb44` ([section 9](#9-phase-3--safer-smarter-editing-2026-10-15)) |
 | Phase 4 — Analysis and manufacturing (2026-10-15) | Materials + mass properties, DFM (CNC / 3D print / sheet metal) with fixes, BOM CSV/XLSX, interference, exploded view, 2D drawing PDF/SVG, cost estimate | ✅ Done, committed in `0e6eb44` ([section 10](#10-phase-4--analysis-and-manufacturing-2026-10-15)) |
 | **Alternatives for open-ended requests** (after Phase 4) | "Make the nose smoother" → 2–4 dry-run alternatives with 3D ghosts; pick one to apply | ✅ Done, **not committed yet** ([section 12](#12-alternatives-for-open-ended-requests-after-phase-4)) |
+| **Mesh import + launch-vehicle demo** (2026-10-29) | STL / OBJ / PLY rebuilt as exact solids; end-to-end simulation on a nose-cone STL; 9 bugs it found fixed | ✅ Done, **not committed yet** ([section 14](#14-stl-mesh-import-and-the-nose-cone-demo-2026-10-29)) |
+| **Rocket-nozzle demo: forced changes** (2026-11-01) | Second launch-vehicle STL (nozzle + thrust-mount ring); 11 structural / performance edits checked against hand calculations; 7 bugs it found fixed | ✅ Done, **not committed yet** ([section 15](#15-rocket-nozzle-stl-and-forced-design-changes-2026-11-01)) |
 | Phase 5 — Viewer and UX | glTF picking, sections, measurement, streaming chat, shortcuts | ⏳ Not started |
 | Phase 6 — Robustness, evaluation, deployment | Eval suite, concurrency, security, logging, CI, Docker | ⏳ Not started |
 
@@ -31,9 +33,9 @@ _Last updated: 2026-10-26_
 | Feature recognition (Phase 2) | ✅ Done and tested (engine, backend API end to end against headless FreeCAD, frontend build) |
 | Safer, smarter editing (Phase 3) | ✅ Done and tested (engine, API, simulation; frontend build) |
 | Analysis and manufacturing (Phase 4) | ✅ Done and tested (engine, API, simulation; frontend build) |
-| Automated tests | ✅ 383/383 engine checks (last run with Phase 4); 62/62 backend unit tests (re-run 2026-10-26); simulations: Phases 1–2 43/43 (§8.7), Phases 3–4 38/38 steps that ran, 11 LLM steps skipped for the Groq quota (§11) |
+| Automated tests | ✅ 417/417 engine checks and 62/62 backend unit tests (2026-11-01); nozzle STL simulation 14/14 deterministic steps, 2 LLM steps failed (§15); nose-cone STL simulation 14/14 deterministic steps (§14); earlier simulations: Phases 1–2 43/43 (§8.7), Phases 3–4 38/38 steps that ran, 11 LLM steps skipped for the Groq quota (§11) |
 | Documentation | ✅ README.md, docs/ARCHITECTURE.md, docs/PLAN.md and this file updated through the Alternatives feature |
-| Git commit | Rebuild in `9a71faa`, Phases 1–4 in `0e6eb44`. ⏳ The Alternatives feature, `agent/test_options.py` and the `demo/5_payload_adapter` files are not committed yet |
+| Git commit | Rebuild in `9a71faa`, Phases 1–4 in `0e6eb44`. ⏳ The Alternatives feature, `agent/test_options.py` and the `demo/5_payload_adapter` files are not committed yet, nor the STL import (§14), `demo/nosecone/`, the nozzle fixes (§15) and `demo/nozzle/` |
 
 ---
 
@@ -530,3 +532,116 @@ headless FreeCAD, Docker Compose.
 unclassified; slots / pockets need vertical walls; pocket length / width aren't editable; no conical chamfers; fillet
 chains aren't re-made on face moves; draft is a rotation, not a true draft op; mirror / pattern don't handle fillets or
 chamfers; the drawing has only overall dimensions and hole callouts; the cost model uses illustrative prices.
+
+---
+
+## 14. STL mesh import and the nose-cone demo (2026-10-29)
+
+Goal: demo the whole project on a launch-vehicle part supplied as an STL. STL / OBJ / PLY uploads were refused
+("meshes cannot be edited"), so they are now rebuilt as exact, editable solids first.
+
+### 14.1 What was built
+
+| Piece | Implementation |
+|---|---|
+| `freecad_bridge/mesh_import.py` (new) | Each separate body of the mesh → exact solid. **Turned parts**: axis from the triangle normals (line-complex fit), half cross-section cut through the axis, split into lines and arcs, each refitted to the mesh vertices (exact on the surface), revolved; off-axis holes fitted as cylinders, snapped radial / axial, cut blind or through. **Other parts**: coplanar triangles merged into exact planes, cylindrical patches filled then cut / fused as exact cylinders. Report per body: exact faces, max deviation from the mesh, volume vs mesh |
+| `engine.open_model` | `.stl / .obj / .ply` go through `mesh_import.rebuild`; result carries `mesh_import` |
+| Backend | `cad_service`: STL/OBJ/PLY allowed, report stored in meta and `public_state.mesh_import`; `routes._mesh_summary` adds the rebuild summary to the upload message |
+| Frontend | File picker and drop zone accept `.stl,.obj,.ply`; upload hints mention STL |
+| Demo part | `demo/nosecone/`: `nosecone_assembly.stl` (nose cone + bulkhead, 34,238 triangles), single-part STLs, STEP / FCStd originals and `make_nosecone.py` |
+
+Result on the demo STL: 2 bodies → 12 exact faces each; tangent ogive arcs R 925.000 / R 923.000; all profile
+corners at the design values; max deviation 0.005 mm; nose volume 194,801.63 mm³ vs 194,801.97 mm³ in the original
+CAD; 4 radial Ø4 holes and 4 blind Ø3.3 tap-drill holes found, opposite holes exactly coaxial.
+
+### 14.2 Bugs found by the simulation and fixed
+
+| Found | Fix |
+|---|---|
+| Shrinking the hollow shoulder (`C1 Ø95.8`) cut an 8 mm groove into the ogive: the boss end was tested for air on the axis, which is inside the bore | `engine._boss_end_free`: sampled just inside the boss's radius |
+| Lengthening the shoulder re-cut the Ø92 bore 8 mm past its end into the narrowing ogive cavity (wall 2 → 1.44 mm) | `engine._clear_beyond`: a through hole is overshot only where the space beyond is clear at its radius |
+| An "alternative" for *make the tip blunter* replaced the whole nose cone with a cylinder | `plans._drastic`: alternatives that replace / delete a part or remove > 40 % of its volume are not offered |
+| A cut that missed the part was recorded as a version that changed nothing | `MATERIAL_OPS` edits with identical geometry and no verified target are refused |
+| LLM extra argument (`object=` on push_pull_face) crashed the op | `engine._unknown_params`: ignored and reported |
+| LLM edge selector `["E_tip"]` crashed (`'str' has no attribute 'get'`); `operation: "add"` refused | `_edge_selectors` accepts bare IDs, clear error otherwise; add / subtract → fuse / cut |
+| Requests over Groq's 8,000 TPM (8,049–8,381 tokens) failed the turn | `_fit_budget` also shortens older chat messages; a 413 is retried with only the tools in use; one more attempt |
+| Bounding boxes of curved parts read from the display mesh (99.969 instead of 100) | `engine._exact_bbox` uses the exact geometry |
+| Hole axes fitted 1e-6 off 45° made the analysis drop one hole of each coaxial pair | `mesh_import._snap_to_turned` |
+
+### 14.3 Verification
+
+| Check | Result |
+|---|---|
+| Engine suite | **401 / 401** (new: STL nose cone and fin import, shoulder Ø / length edits on the rebuilt nose cone, no-op refusal, unknown arguments, bare edge IDs, `add` operation) |
+| Backend unit tests | **62 / 62** |
+| Frontend | `tsc --noEmit`, `npm run lint`, `npm run build` pass |
+| Simulation, deterministic steps 1–14 (upload, features, walls, mass/CG, interference, preview + plan, dimension edit, DFM, cost, BOM, drawing, version branch + compare, STEP export) | **14 / 14 pass**, every check against the design values |
+| Simulation, LLM steps 15–18 | `gpt-oss-120b` (before its daily quota ran out): wall/shoulder question correct, the 4-hole edit passed (all at 15.000 mm), alternatives offered (exposed the replace bug). Final run on `gpt-oss-20b`: it moved holes the wrong way, missed H10 and misread the shoulder; the app executed and verified what it asked. Re-run on 120b when the quota resets |
+
+Interactive report (3D view of every version, step log, drawing, fixes): https://claude.ai/artifact/LegT22aXz1DwK9tEiuFGBw
+
+### 14.4 Known limitations
+
+- Turned parts need ≥ 85 % of their area to be one surface of revolution; off-axis features other than cylinders
+  (flats, slots on a tube) are not rebuilt on turned parts. The prismatic path rebuilds planes and cylinders only;
+  fillets, cones and free-form patches stay as small triangular faces there.
+- Mesh volume is inside the true surface, so the report's "volume vs mesh" is +0.0–0.2 % on curved parts.
+- On Groq's free tier a multi-step LLM edit on this model takes 3 minutes (one ~8k-token request per minute) and
+  the daily quota covers roughly one full simulation.
+
+---
+
+## 15. Rocket-nozzle STL and forced design changes (2026-11-01)
+
+Goal: show the project works on another launch-vehicle part and that structural and other changes forced on it
+really change the geometry. New demo part `demo/nozzle/` (`make_nozzle.py`): a conical 15° convergent-divergent
+nozzle (chamber Ø100, 30° converging cone, throat Ø40 between tangent arcs R30 / R10, exit Ø120, area ratio 9,
+4 mm wall, flange Ø160 × 12 with 8 × Ø9 bolt holes on PCD 140, 2 × Ø3 radial pressure taps) and the aluminium
+thrust-mount ring it bolts to (8 matching holes, 6 × Ø11 attachment holes on PCD 180). `nozzle_assembly.stl` has
+39,672 triangles.
+
+### 15.1 Forced changes (simulation steps 5–12, each checked against a hand calculation)
+
+| Change | Result |
+|---|---|
+| Flange 12 → 16 mm | +41,745.5 mm³ = (π(80²−54²) − 8·π·4.5²) × 4; bolt holes stay through, now 16 deep |
+| M8 → M10 bolts, 16 holes on both parts (one previewed plan) | all Ø11 (ISO 273 normal), −4,021.2 / −2,513.3 mm³, holes still aligned |
+| 8 → 12 bolts on both parts | 30° pitch on PCD 140, nozzle and ring holes coincide, attachment circle untouched |
+| Flange OD 160 → 170 | +41,469.0 mm³ = π(85²−80²) × 16; edge distance 4.5 → 9.5 mm |
+| Nozzle 20 mm longer | exit Ø 120 → 130.72, area ratio 9.00 → 10.68; added volume = the 15° walls continued |
+| Pressure taps Ø3 → Ø4 | both still through |
+| Chamber wall 4 → 6 mm (boss Ø108 → Ø112) | taps re-opened through the thicker wall (6.0 deep) |
+| Throat radius R30 → R40 | refused (toroidal face); model unchanged |
+| Mass / CG after all changes | masses follow the new volumes × density; still no interference |
+
+### 15.2 Bugs found by the simulation and fixed
+
+| Found | Fix |
+|---|---|
+| Throat rebuilt wrong from the mesh: R10 read as a line, R30 as R28.9 + a stray cone, tangent points rounded (92.947 → 93); max deviation 0.055 mm | `mesh_import._vertex_profile`: the profile is split on the mesh vertices (on the true surface) with a tight tolerance; `_tangent_point` computes tangent junctions exactly and leaves them unrounded. Now 0.008 mm, volume −0.009 % |
+| Exit plane rounded 240.958 → 241 | with exact corners only rounding noise is snapped. The nose-cone tip now reads the true Z 295.588 (was 295.6; tests updated) |
+| 45° bolt holes snapped to X/Y 49.5 instead of 49.497 (PCD 140.0036) | `mesh_import._snap_to_turned`: axial holes snapped by radius and angle about the part axis |
+| Lengthening the nozzle added a straight Ø120 tube; shortening would leave a sliver of wall | `engine._tapered_push`: a face bounded by cone rims continues the cone walls, built on the neighbours' own surfaces and merged by `_unify_same_domain` (one face per cone) |
+| Growing the chamber boss buried the radial taps (through → 3.67 mm blind) | `engine._resize_boss`: holes opening on the boss are filled and re-cut whole through the new wall |
+| Equal holes on two concentric bolt circles (ring after M10: Ø11 bolt and attachment holes) gave no pattern | `analysis.hole_patterns`: a group that fits no pattern is split into rings around its centre |
+| A later hole edit silently corrupted the solid (−2,930 mm³, self-intersecting) | `engine._clean`: a `removeSplitter` result is kept only if valid with an unchanged volume; root cause fixed in `_resize_boss` above |
+
+### 15.3 Verification
+
+| Check | Result |
+|---|---|
+| Engine suite | **417 / 417** (new: nozzle rebuild arcs / tangent points / exit plane / polar bolt snap, nozzle 20 mm longer and shorter, chamber boss with taps, BOP-clean later edit, two concentric equal-hole bolt circles) |
+| Backend unit tests | **62 / 62** |
+| Simulation, deterministic steps 1–14 | **14 / 14 pass** (upload, features, mass/CG, wall + interference, 7 forced changes, refused throat edit, mass after changes, DFM / cost / BOM / drawing / STEP) |
+| Simulation, LLM steps 15–16 (`gpt-oss-120b`) | **fail**: asked for throat and exit Ø it guessed from hole / boss sizes (no bore-profile measurement); the M12 request ran into the 8k TPM cap and ended as options with a wrong size. The first run's LLM edit exposed the silent-corruption bug above |
+
+Interactive report (3D view of every version, change summary, step log, drawing): https://claude.ai/artifact/U8tzFyaeCZXc4VMKgHCzNb
+
+### 15.4 Known limitations
+
+- No structural analysis (stress, pressure load, bolt preload, buckling, thermal). "Structural" changes here are
+  geometric, with mass / CG / wall thickness / edge distance / interference as the checks.
+- No profile-level edits for turned parts: throat diameter, the torus blends (R30 / R10) and cone half-angles can't
+  be changed. A boss diameter edit is local (it leaves a step at the next blend instead of offsetting the wall).
+- No bore-profile measurement (throat / exit diameter), so the LLM can't answer those questions correctly.
+- Groq free tier: models with many holes push requests past 8,000 TPM, and the LLM then degrades.

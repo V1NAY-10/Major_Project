@@ -1,6 +1,6 @@
 # AetherCAD — Rebuild Plan
 
-Goal: upload an existing CAD file (STEP / IGES / BREP / FCStd), it opens in FreeCAD,
+Goal: upload an existing CAD file (STEP / IGES / BREP / FCStd, or an STL / OBJ / PLY mesh), it opens in FreeCAD,
 then a chat drives **precise** edits and answers questions. Every edit shows up both
 in FreeCAD and in the web viewer, with undo.
 
@@ -104,6 +104,8 @@ time, each with tests and updated docs:
 | 3. Safer, smarter editing | Preview (dry run + ghost), multi-step plans in one version, pre-edit checks, mirror / shell / pattern / slot / pocket / counterbore / countersink / draft / split ops, version tree and compare, clickable disambiguation | ✅ Done 2026-10-15 (STATUS §9, ARCHITECTURE §24) |
 | 4. Analysis and manufacturing | Materials and mass properties, DFM checks with fixes, BOM, interference, TechDraw PDF/SVG, cost estimate | ✅ Done 2026-10-15 (STATUS §10, ARCHITECTURE §25) |
 | 4b. Alternatives | Open-ended requests get 2–4 dry-run alternatives with 3D ghosts; the user picks one, applied as one version | ✅ Done 2026-10-26, not committed yet (STATUS §12, ARCHITECTURE §24.6) |
+| 4c. Mesh import + launch-vehicle demo | STL / OBJ / PLY rebuilt as exact solids (turned profile, or planes + snapped cylinders); end-to-end simulation on a nose-cone STL; 7 fixes found by it | ✅ Done 2026-10-29, not committed (STATUS §14, ARCHITECTURE §26) |
+| 4d. Rocket-nozzle demo: forced changes | Second launch-vehicle STL (nozzle + thrust-mount ring); 11 structural / performance edits checked against hand calculations; 7 fixes found by it (exact throat rebuild, polar bolt snap, tapered face push, boss growth keeps holes, concentric equal-hole patterns, safe clean-up) | ✅ Done 2026-11-01, not committed (STATUS §15, ARCHITECTURE §26.x) |
 | 5. Viewer and UX | Exact face picking (glTF or face map), section plane, measuring, 3D annotations, streaming chat, command palette, shortcuts | Planned |
 | 6. Robustness and deployment | Evaluation suite (≥ 50 cases, LLM comparison), job queue / worker pool, limits, structured logs, CI on headless FreeCAD, Docker Compose | Planned |
 

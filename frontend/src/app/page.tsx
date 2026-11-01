@@ -402,7 +402,7 @@ export default function Home() {
                   </div>
                   <h2 className="text-3xl font-black tracking-tight">Edit CAD by talking to it.</h2>
                   <p className="text-foreground/50 text-sm leading-relaxed">
-                    Attach or drop a STEP, IGES, BREP or FreeCAD file. It opens in FreeCAD, and you can ask questions or
+                    Attach or drop a STEP, IGES, BREP, FreeCAD or STL mesh file. It opens in FreeCAD, and you can ask questions or
                     request precise changes. Every edit is measured, versioned and mirrored here and in FreeCAD.
                   </p>
                 </div>

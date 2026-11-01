@@ -399,3 +399,106 @@ def write_assembly_fcstd(path):
     doc.saveAs(path)
     App.closeDocument(doc.Name)
     return path
+
+
+# ── Meshes (STL upload): launch-vehicle parts with known design values ──────
+
+def _write_stl(shape, path):
+    import MeshPart  # type: ignore
+    MeshPart.meshFromShape(Shape=shape, LinearDeflection=0.05, AngularDeflection=math.radians(5),
+                           Relative=False).write(path)
+    return path
+
+
+def nosecone():
+    """Tangent-ogive nose cone, Z up: base Ø100 at Z 0, length 300 (ogive radius 925), 2 mm wall, Ø3 flat tip,
+    shoulder Ø96 / bore Ø92 from Z 0 down to Z -80, 4 × Ø4 radial screw holes at Z -70 (45°, 135°, …)."""
+    R, L, T = 50.0, 300.0, 2.0
+    rho = (R * R + L * L) / (2 * R)
+    c = R - rho  # arc centre radius (negative)
+
+    def z_at(arc_r, r):
+        return math.sqrt(arc_r ** 2 - (r - c) ** 2)
+
+    def r_at(arc_r, z):
+        return c + math.sqrt(arc_r ** 2 - z ** 2)
+
+    z_tip, z_tin, z46 = z_at(rho, 1.5), z_at(rho - T, 3.0), z_at(rho - T, 46.0)
+    outer = Part.Arc(V(R, 0, 0), V(r_at(rho, z_tip / 2), 0, z_tip / 2), V(1.5, 0, z_tip)).toShape()
+    zm = (z_tin + z46) / 2
+    inner = Part.Arc(V(3, 0, z_tin), V(r_at(rho - T, zm), 0, zm), V(46, 0, z46)).toShape()
+    pts = [V(46, 0, z46), V(46, 0, -80), V(48, 0, -80), V(48, 0, 0), V(R, 0, 0)]
+    edges = [Part.LineSegment(pts[i], pts[i + 1]).toShape() for i in range(4)]
+    edges += [outer, Part.LineSegment(V(1.5, 0, z_tip), V(0, 0, z_tip)).toShape(),
+              Part.LineSegment(V(0, 0, z_tip), V(3, 0, z_tin)).toShape(), inner]
+    s = Part.Face(Part.Wire(Part.__sortEdges__(edges))).revolve(V(0, 0, 0), Z, 360)
+    s = Part.Solid(Part.Shell(s.Faces)) if s.ShapeType != "Solid" else s
+    for k in range(4):
+        a = math.radians(45 + 90 * k)
+        d = V(math.cos(a), math.sin(a), 0)
+        s = s.cut(Part.makeCylinder(2, 10, V(0, 0, -70) + d * 43, d))
+    return s.removeSplitter()
+
+
+def nozzle():
+    """Conical (15°) convergent-divergent rocket nozzle, Z = flow direction: chamber Ø100 from Z 0, blend R20,
+    30° converging cone, throat Ø40 between tangent arcs R30 / R10, 15° diverging cone to the exit Ø120; wall 4 mm
+    (the outer contour is the offset: R24 / R26 / R6); flange Ø160 × 12 at Z 0 with 8 × Ø9 bolt holes on PCD 140
+    and 2 × Ø3 radial pressure taps at Z 18.5. Every junction of the flow contour is tangent."""
+    rc, rt, re_, tc, td, rb, ru, rd, t, z1 = 50.0, 20.0, 60.0, math.radians(30), math.radians(15), 20.0, 30.0, 10.0, 4.0, 25.0
+    pb = (rc - rb + rb * math.cos(tc), z1 + rb * math.sin(tc))
+    lc = (rc - rb + rb * math.cos(tc) - rt - ru + ru * math.cos(tc)) / math.sin(tc)
+    zt = z1 + rb * math.sin(tc) + lc * math.cos(tc) + ru * math.sin(tc)
+    pu = (rt + ru - ru * math.cos(tc), zt - ru * math.sin(tc))
+    pd = (rt + rd - rd * math.cos(td), zt + rd * math.sin(td))
+    ze = pd[1] + (re_ - pd[0]) / math.tan(td)
+
+    def arc(c, r, a0, a1):
+        pt = lambda a: V(c[0] + r * math.cos(a), 0, c[1] + r * math.sin(a))
+        return Part.Arc(pt(a0), pt((a0 + a1) / 2), pt(a1)).toShape()
+
+    def contour(off):
+        nc, nd = (math.cos(tc), math.sin(tc)), (math.cos(td), -math.sin(td))
+        b, u, d = ((p[0] + off * n[0], p[1] + off * n[1]) for p, n in ((pb, nc), (pu, nc), (pd, nd)))
+        r_exit = d[0] + (ze - d[1]) * math.tan(td)
+        z0 = 12.0 if off else 0.0
+        return [Part.LineSegment(V(rc + off, 0, z0), V(rc + off, 0, z1)).toShape(), arc((rc - rb, z1), rb + off, 0, tc),
+                Part.LineSegment(V(b[0], 0, b[1]), V(u[0], 0, u[1])).toShape(),
+                arc((rt + ru, zt), ru - off, math.pi + tc, math.pi), arc((rt + rd, zt), rd - off, math.pi, math.pi - td),
+                Part.LineSegment(V(d[0], 0, d[1]), V(r_exit, 0, ze)).toShape()], r_exit
+
+    inner, _ = contour(0.0)
+    outer, r_out = contour(t)
+    pts = [V(re_, 0, ze), V(r_out, 0, ze)], [V(rc, 0, 0), V(80, 0, 0)], [V(80, 0, 0), V(80, 0, 12)], [V(80, 0, 12), V(rc + t, 0, 12)]
+    edges = inner + outer + [Part.LineSegment(a, b).toShape() for a, b in pts]
+    s = Part.Face(Part.Wire(Part.__sortEdges__(edges))).revolve(V(0, 0, 0), Z, 360)
+    s = Part.Solid(Part.Shell(s.Faces)) if s.ShapeType != "Solid" else s
+    for k in range(8):
+        a = 2 * math.pi * k / 8
+        s = s.cut(Part.makeCylinder(4.5, 14, V(70 * math.cos(a), 70 * math.sin(a), -1)))
+    for k in range(2):
+        d = V(math.cos(math.pi * k), math.sin(math.pi * k), 0)
+        s = s.cut(Part.makeCylinder(1.5, 8, V(0, 0, 18.5) + d * 48, d))
+    return s.removeSplitter()
+
+
+def fin():
+    """Trapezoidal fin 3 mm thick (root 120, tip 60, span 80) with a root tab, 2 × Ø4.5 holes and a Ø12
+    lightening hole: 13 faces."""
+    s = Part.Face(Part.makePolygon([V(0, 0, 0), V(120, 0, 0), V(110, 80, 0), V(50, 80, 0), V(0, 0, 0)])).extrude(V(0, 0, 3))
+    s = s.fuse(Part.makeBox(100, 12, 3, V(10, -12, 0))).removeSplitter()
+    for x in (30, 90):
+        s = s.cut(Part.makeCylinder(2.25, 5, V(x, -6, -1)))
+    return s.cut(Part.makeCylinder(6, 5, V(80, 40, -1))).removeSplitter()
+
+
+def write_nosecone_stl(path):
+    return _write_stl(nosecone(), path)
+
+
+def write_fin_stl(path):
+    return _write_stl(fin(), path)
+
+
+def write_nozzle_stl(path):
+    return _write_stl(nozzle(), path)

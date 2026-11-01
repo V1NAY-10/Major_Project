@@ -60,10 +60,26 @@ async def upload(file: UploadFile = File(...), session_id: str = Form(...)):
     await require_session(session_id)
     state = await cad.upload(session_id, file.filename or "model", await file.read())
     await messages.add(session_id, "assistant",
-                       f"Loaded **{state['filename']}** in FreeCAD. {_upload_summary(state['info'])}\n\n"
+                       f"Loaded **{state['filename']}** in FreeCAD. {_mesh_summary(cad.load(session_id))}"
+                       f"{_upload_summary(state['info'])}\n\n"
                        "Ask me about it or tell me what to change.",
                        version=0, kind="upload")
     return state
+
+
+def _mesh_summary(meta):
+    """How a mesh upload (STL / OBJ / PLY) was rebuilt as exact solids, and how faithful each body is."""
+    rep = (meta or {}).get("mesh_import")
+    if not rep:
+        return ""
+    bodies = []
+    for b in rep.get("bodies") or []:
+        kind = "turned profile" if b.get("type") == "turned" else "planes + fitted cylinders"
+        holes = sum(1 for f in b.get("features") or [] if f.get("kind") == "hole")
+        extra = f", {holes} off-axis hole{'s' if holes > 1 else ''}" if holes and b.get("type") == "turned" else ""
+        bodies.append(f"{b['name']} ({b['facets']} triangles → {b['faces']} exact faces, {kind}{extra}; "
+                      f"max deviation {b['max_deviation_mm']} mm, volume {b['volume_error_pct']:+} %)")
+    return ("The mesh was rebuilt as exact, editable solids: " + "; ".join(bodies) + ". ") if bodies else ""
 
 
 def _upload_summary(info):

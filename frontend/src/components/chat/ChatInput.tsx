@@ -1,7 +1,7 @@
 import { Send, Loader2, Paperclip, Crosshair, X } from "lucide-react";
 import { useRef } from "react";
 
-export const CAD_ACCEPT = ".step,.stp,.iges,.igs,.brep,.brp,.fcstd";
+export const CAD_ACCEPT = ".step,.stp,.iges,.igs,.brep,.brp,.fcstd,.stl,.obj,.ply";
 
 interface ChatInputProps {
   prompt: string;
@@ -94,7 +94,7 @@ export default function ChatInput({
             onClick={() => fileInputRef.current?.click()}
             disabled={isUploadingCad || loading}
             className="p-4 text-foreground/30 hover:text-purple-400 transition-all transform hover:scale-110 disabled:opacity-30"
-            title={hasCad ? "Replace CAD file" : "Attach CAD file (STEP, IGES, BREP, FCStd)"}
+            title={hasCad ? "Replace CAD file" : "Attach CAD file (STEP, IGES, BREP, FCStd, STL)"}
           >
             {isUploadingCad ? <Loader2 size={20} className="animate-spin text-purple-400" /> : <Paperclip size={20} />}
           </button>

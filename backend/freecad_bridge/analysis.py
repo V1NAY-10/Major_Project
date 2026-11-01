@@ -297,21 +297,37 @@ def hole_patterns(feats, tol):
         else:
             groups.append([h])
 
+    def fit(g):
+        a = g[0]["_a"]
+        e1, e2 = basis(a)
+        entry_t = _v3(g[0]["entry"]).dot(a)
+        pts = [(h["_base"].dot(e1), h["_base"].dot(e2)) for h in g]
+        return (_circular(g, pts, a, e1, e2, entry_t, tol) or _grid(g, pts, a, e1, e2, entry_t, tol)
+                or _linear(g, pts, a, e1, e2, entry_t, tol)), pts
+
     patterns = []
     for g in groups:
         if len(g) < 3:
             continue
         g = sorted(g, key=lambda f: int("".join(c for c in f["id"] if c.isdigit()) or 0))
-        a = g[0]["_a"]
-        e1, e2 = basis(a)
-        entry_t = _v3(g[0]["entry"]).dot(a)
-        pts = [(h["_base"].dot(e1), h["_base"].dot(e2)) for h in g]
-        pat = _circular(g, pts, a, e1, e2, entry_t, tol) or _grid(g, pts, a, e1, e2, entry_t, tol) \
-            or _linear(g, pts, a, e1, e2, entry_t, tol)
-        if pat:
-            pat["object"] = g[0]["_obj"]
-            pat["hole_diameter"] = g[0]["diameter"]
-            pat["holes"] = [h["id"] for h in pat.pop("_members")]
+        pat, pts = fit(g)
+        found = [pat] if pat else []
+        if not pat and len(g) >= 6:
+            # equal holes on two or more concentric bolt circles (a flange bolt circle and an attachment circle
+            # with the same hole size): split them by their distance from the common centre and fit each ring
+            cx, cy = sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+            rings = {}
+            for (x, y), h in zip(pts, g):
+                d = math.hypot(x - cx, y - cy)
+                key = next((k for k in rings if abs(k - d) < tol * 10), d)
+                rings.setdefault(key, []).append(h)
+            if len(rings) > 1:
+                found = [p for p, _ in (fit(sub) for sub in rings.values() if len(sub) >= 3) if p]
+        for pat in found:
+            members = pat.pop("_members")
+            pat["object"] = members[0]["_obj"]
+            pat["hole_diameter"] = members[0]["diameter"]
+            pat["holes"] = [h["id"] for h in members]
             patterns.append(pat)
     patterns.sort(key=lambda p: int("".join(c for c in p["holes"][0] if c.isdigit()) or 0))
     for i, p in enumerate(patterns, 1):

@@ -42,15 +42,24 @@ def _tokens(obj):
     return len(json.dumps(obj, default=str)) // 3  # conservative estimate (~3-4 chars per token)
 
 
-def _fit_budget(messages, tool_defs):
-    """Shorten older tool results (oldest first) until the request fits INPUT_TOKEN_BUDGET."""
-    over = _tokens(messages) + _tokens(tool_defs or []) - INPUT_TOKEN_BUDGET
+def _fit_budget(messages, tool_defs, budget=None):
+    """Shorten older tool results, then older chat messages (oldest first), until the request fits the budget
+    (INPUT_TOKEN_BUDGET). The system prompt and the current request are never shortened."""
+    over = _tokens(messages) + _tokens(tool_defs or []) - (budget or INPUT_TOKEN_BUDGET)
     for m in messages[:-1]:
         if over <= 0:
-            break
+            return
         if m["role"] == "tool" and len(m["content"]) > 300:
             over -= (len(m["content"]) - 300) // 3
             m["content"] = m["content"][:300] + " …[older result truncated]"
+    last_user = max((i for i, m in enumerate(messages) if m["role"] == "user"), default=len(messages))
+    for m in messages[1:last_user]:
+        if over <= 0:
+            return
+        c = m.get("content")
+        if m["role"] in ("user", "assistant") and isinstance(c, str) and len(c) > 240:
+            over -= (len(c) - 240) // 3
+            m["content"] = c[:240] + " …[earlier message shortened]"
 
 
 def _rejection(err):
@@ -70,7 +79,7 @@ async def _complete(messages, tool_defs=None):
     if tool_defs:
         kwargs.update(tools=tool_defs, tool_choice="auto")
     last_err = None
-    for attempt in range(3):
+    for attempt in range(4):  # one more than the provider-rejection retries: a 413 retry narrows the tools first
         try:
             return (await _client.chat.completions.create(**kwargs)).choices[0].message
         except openai.RateLimitError as e:
@@ -86,6 +95,17 @@ async def _complete(messages, tool_defs=None):
                            f"Try again {when}" + (" (or use another API key / model in backend/.env)." if daily else ".")
                            + " Exact commands like `H2 Ø8` or `P5-P6 = 120` still work without the AI.", 429)
         except openai.APIStatusError as e:
+            if e.status_code == 413:
+                print(f"[agent] request too large (estimated {_tokens(messages) + _tokens(tool_defs or [])} tokens, "
+                      f"{len(messages)} messages, {len(tool_defs or [])} tools): {_rejection(e)[:300]}")
+            if e.status_code == 413 and attempt == 0:
+                # Retry once, smaller: only the tools this turn is already using (plus the control tools) — the
+                # ~30 tool definitions are most of a request — and older messages shortened further.
+                if kwargs.get("tools"):
+                    kwargs["tools"] = _tools_in_use(messages, kwargs["tools"])
+                _fit_budget(messages, kwargs.get("tools"), int(INPUT_TOKEN_BUDGET * 0.6))
+                kwargs["messages"] = messages
+                continue
             if e.status_code == 413:
                 raise LLMError("The request is larger than the LLM provider allows per minute (free-tier "
                                "token limit). Lower MODEL_SUMMARY_CHARS / LLM_HISTORY_MESSAGES in "
@@ -112,6 +132,14 @@ async def _complete(messages, tool_defs=None):
         raise LLMError("The AI made an invalid tool call three times, so nothing was changed. Try rephrasing the "
                        f"request. (Provider said: {_rejection(last_err)[:300]})", 502)
     raise LLMError(f"LLM request failed: {last_err}")
+
+
+def _tools_in_use(messages, sent):
+    """The sent tool definitions that this conversation has called, plus the control tools."""
+    called = {c["function"]["name"] for m in messages if m.get("role") == "assistant"
+              for c in (m.get("tool_calls") or []) if isinstance(c, dict) and c.get("function")}
+    keep = [t for t in sent if t["function"]["name"] in called | tools.CONTROL_TOOLS]
+    return keep or sent
 
 
 def _unsent_tools(text, sent):

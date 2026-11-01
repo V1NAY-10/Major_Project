@@ -46,7 +46,8 @@ def label(step):
 def _record(rec):
     if rec is None:
         return None
-    return {k: rec.get(k) for k in ("tool", "ok", "message", "error", "verified", "warnings", "side_effects")}
+    return {k: rec.get(k) for k in ("tool", "ok", "message", "error", "verified", "warnings", "side_effects",
+                                    "volume_before", "volume_after")}
 
 
 async def _dry_run(meta, steps):
@@ -123,6 +124,10 @@ async def propose_options(meta, question, options):
                         "steps": [], "records": [], "ok": False, "error": str(e), "mesh_url": None})
             continue
         records, ok, error = await _dry_run(meta, steps)
+        if ok:
+            drastic = _drastic(steps, records, meta)
+            if drastic:
+                ok, error = False, drastic
         mesh_url = None
         if ok:
             shutil.copyfile(cad.preview_mesh_path(sid), option_mesh_path(sid, n))
@@ -135,6 +140,32 @@ async def propose_options(meta, question, options):
                        "created_at": cad._now()}
     cad.save(meta)
     return meta["options"]
+
+
+MAX_OPTION_VOLUME_LOSS = 0.4
+
+
+def _drastic(steps, records, meta):
+    """Why an alternative is too drastic to offer for an open-ended request ("make the tip blunter"), or None.
+    Alternatives are refinements of the design: replacing a part's whole shape with a primitive, or removing most of a
+    part, is not one (the dry run of "replace the tip with a cylinder" replaced the whole nose cone)."""
+    for s in steps:
+        if s["tool"] == "add_primitive" and str((s.get("args") or {}).get("operation", "")).lower() == "replace":
+            return "it would replace the whole part with a primitive, losing its shape and features"
+        if s["tool"] == "delete_object":
+            return "it deletes a part"
+    labels = {o["name"]: o.get("label") or o["name"] for o in (meta.get("info") or {}).get("objects") or []}
+    first, last = {}, {}
+    for r in records:
+        for name, v in ((r or {}).get("volume_before") or {}).items():
+            first.setdefault(name, v)
+        last.update((r or {}).get("volume_after") or {})
+    for name, v0 in first.items():
+        v1 = last.get(name)
+        if v0 and v1 is not None and v1 < (1 - MAX_OPTION_VOLUME_LOSS) * v0:
+            return (f"it would remove {round(100 * (1 - v1 / v0))} % of {labels.get(name, name)}'s volume "
+                    f"({v0:g} → {v1:g} mm³), which is not a refinement of the design")
+    return None
 
 
 def option_mesh_path(session_id, key):

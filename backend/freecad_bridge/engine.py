@@ -18,6 +18,7 @@ Design rules
 
 import contextlib
 import copy
+import inspect
 import io
 import math
 import os
@@ -28,6 +29,7 @@ import FreeCAD as App  # type: ignore
 import Part  # type: ignore
 
 from freecad_bridge import analysis
+from freecad_bridge import mesh_import
 
 GUI = bool(getattr(App, "GuiUp", 0))
 if GUI:
@@ -299,6 +301,23 @@ def _inside_any(shape, pt, tol):
     return False
 
 
+def _boss_end_free(shape, a, base, t, r, outward, tol):
+    """True when there is air just beyond a boss's end. Sampled just inside the boss's own radius (at 4 angles),
+    not on the axis: a hollow boss (a tube, e.g. a nose-cone shoulder) has its bore on the axis, while the body
+    it stands on continues over its wall."""
+    eps = max(tol * 20, 0.01)
+    u = a.cross(V(1, 0, 0)) if abs(a.x) < 0.9 else a.cross(V(0, 1, 0))
+    u.normalize()
+    w = a.cross(u)
+    rr = max(r - max(tol * 100, min(0.05, r * 0.1)), r * 0.5)
+    for k in range(4):
+        ang = math.pi / 2 * k + 0.3
+        pt = base + a * (t + outward * eps) + (u * math.cos(ang) + w * math.sin(ang)) * rr
+        if _inside_any(shape, pt, tol):
+            return False
+    return True
+
+
 def _semantic_position(p, bb):
     labels = []
     for val, lo, hi, names in (
@@ -513,10 +532,9 @@ def _features_of_shape(objname, shape):
                 # A boss's end faces stay ordinary visible planes (unlike hole bottoms): its top face is a
                 # real face users refer to, and for a plain cylinder body they are the part's own faces.
                 caps = [idx for kind, idx in caps0 + caps1 if kind == "plane"]
-                # The free end has air beyond it on the axis; the base end runs into the body.
-                eps = max(tol * 20, 0.01)
-                free1 = not _inside_any(shape, base + a * (t1 + eps), tol)
-                free0 = not _inside_any(shape, base + a * (t0 - eps), tol)
+                # The free end has air just beyond it; the base end runs into the body.
+                free1 = _boss_end_free(shape, a, base, t1, r, 1, tol)
+                free0 = _boss_end_free(shape, a, base, t0, r, -1, tol)
                 free_t = t1 if (free1 or not free0) else t0
                 base_t = t0 if free_t == t1 else t1
                 feats.append({
@@ -913,6 +931,15 @@ def _bbox_dict(bb):
             "size": [_r(bb.XLength, 3), _r(bb.YLength, 3), _r(bb.ZLength, 3)]}
 
 
+def _exact_bbox(s):
+    """Bounding box from the exact geometry. Shape.BoundBox uses the display triangulation once a shape has been
+    meshed, which reads a revolved / curved part up to the mesh deflection small (99.969 instead of 100)."""
+    try:
+        return s.optimalBoundingBox(False, False)
+    except Exception:
+        return s.BoundBox
+
+
 def _model_info(doc, an, with_features=True):
     objs = an.objs
     feats = an.feats if with_features else []
@@ -920,7 +947,7 @@ def _model_info(doc, an, with_features=True):
     objects = []
     for o in objs:
         s = an.shapes.get(o.Name) or _gshape(o)
-        bb = s.BoundBox
+        bb = _exact_bbox(s)
         gbb = bb if gbb is None else gbb.united(bb)
         try:
             parent = o.getParentGeoFeatureGroup()
@@ -966,7 +993,10 @@ def _model_info(doc, an, with_features=True):
 def _clean(shape):
     try:
         cleaned = shape.removeSplitter()
-        if not cleaned.isNull() and cleaned.Solids:
+        # removeSplitter can merge split faces wrongly (seen on a hole wall left in coincident pieces): the
+        # result is kept only when it is still valid and encloses the same volume
+        if not cleaned.isNull() and cleaned.Solids and cleaned.isValid() and \
+                abs(cleaned.Volume - shape.Volume) <= 1e-7 * abs(shape.Volume) + 1e-6:
             shape = cleaned
     except Exception:
         pass
@@ -1123,9 +1153,36 @@ def _fill_holes(shape, holes):
     return filled
 
 
+def _clear_beyond(shape, a, base, t, outward, r, length):
+    """True when nothing of the part is within radius r of the axis for `length` beyond axial position t.
+    A through hole usually opens into open air, but a large bore can open into a cavity that narrows (a nose cone's
+    shoulder bore into the ogive), where overshooting the cut would thin the wall."""
+    _, tol = _tolerances(shape)
+    u = a.cross(V(1, 0, 0)) if abs(a.x) < 0.9 else a.cross(V(0, 1, 0))
+    u.normalize()
+    w = a.cross(u)
+    rr = max(r - max(tol * 100, 0.01), r * 0.5)
+    for frac in (0.02, 0.1, 0.3, 0.6, 1.0):
+        c = base + a * (t + outward * length * frac)
+        for k in range(8):
+            ang = math.pi / 4 * k + 0.2
+            if _inside_any(shape, c + (u * math.cos(ang) + w * math.sin(ang)) * rr, tol):
+                return False
+    return True
+
+
 def _hole_cutter(shape, h, base, r, diag):
-    """Cutting solid that recreates hole h (tip, countersinks) with axis through `base` and radius r."""
+    """Cutting solid that recreates hole h (tip, countersinks) with axis through `base` and radius r. An open end
+    is overshot only where the space beyond it is clear at the hole's radius; otherwise the cut ends flush."""
     open0, open1 = h["_open"]
+    margin = max(diag * 0.02, 1.0)
+    t0, t1 = h["_t"]
+    # an end with a countersink opens into the countersink, which is re-cut by its own cone tool
+    cs_end = {0 if abs(cs["outer_t"] - t0) < abs(cs["outer_t"] - t1) else 1 for cs in h.get("_cs", [])}
+    if open0 and 0 not in cs_end:
+        open0 = _clear_beyond(shape, h["_a"], base, t0, -1, r, margin)
+    if open1 and 1 not in cs_end:
+        open1 = _clear_beyond(shape, h["_a"], base, t1, 1, r, margin)
     tool = _hole_tool(h["_a"], base, h["_t"][0], h["_t"][1], r, open0, open1, diag, _tip_semi(shape, h))
     for cone in _countersink_tools(h, base, r, max(diag * 0.02, 1.0)):
         tool = tool.fuse(cone)
@@ -1202,6 +1259,73 @@ def _push_profile(shape, face, n, d):
         return profile
     except Exception:
         return face
+
+
+def _tapered_push(shape, face, n, d):
+    """The solid to add (d > 0) or remove (d < 0) when moving a planar face whose boundary is circles on cones
+    square to it (a nozzle exit, a tapered skirt or interstage end): the cone walls are continued, so the taper is
+    kept. A straight extrusion of the face would add a cylindrical stub, or pulling in would leave a sliver of the
+    wall. The walls are trimmed from the neighbours' own surfaces so they merge back into one face each
+    (_unify_same_domain). None when the face isn't bounded by circles or none of its neighbours is such a cone."""
+    _, tol = _tolerances(shape)
+    walls, tapered = [], False
+    for w in face.Wires:
+        circ = [e.Curve for e in w.Edges if isinstance(e.Curve, Part.Circle)]
+        if len(circ) != len(w.Edges) or any(c.Center.distanceToPoint(circ[0].Center) > tol or
+                                            abs(c.Radius - circ[0].Radius) > tol for c in circ):
+            return None
+        c = circ[0]
+        if abs(abs(c.Axis.dot(n)) - 1) > 1e-6:
+            return None
+        surf, slope = None, 0.0
+        for e in w.Edges:
+            for nb in shape.ancestorsOfType(e, Part.Face):
+                sf = nb.Surface
+                if isinstance(sf, Part.Cone) and abs(abs(sf.Axis.dot(n)) - 1) < 1e-6 and                         (c.Center - sf.Apex).cross(n).Length < tol:
+                    # the radius grows away from the apex (SemiAngle is signed by the surface's own axis)
+                    sgn = 1.0 if (c.Center - sf.Apex).dot(n) > 0 else -1.0
+                    surf, slope, tapered = sf, sgn * math.tan(abs(sf.SemiAngle)), True
+                elif surf is None and isinstance(sf, Part.Cylinder) and abs(abs(sf.Axis.dot(n)) - 1) < 1e-6:
+                    surf = sf
+        if surf is None:
+            return None
+        if c.Radius + slope * d <= tol:
+            raise EngineError(f"Moving the face by {_r(d)} mm would run the cone down to a point")
+        p0 = c.value(0)
+        radial = p0 - c.Center
+        radial.normalize()
+        p1 = p0 + n * d + radial * (slope * d)
+        v0, v1 = surf.parameter(p0)[1], surf.parameter(p1)[1]
+        walls.append(surf.toShape(0, 2 * math.pi, min(v0, v1), max(v0, v1)))
+    if not tapered:
+        return None
+    try:
+        faces = list(walls)
+        for plane_pt in (face.CenterOfMass, face.CenterOfMass + n * d):  # the two annular caps
+            rims = sorted((e for wf in walls for e in wf.Edges if isinstance(e.Curve, Part.Circle)
+                           and abs((e.Curve.Center - plane_pt).dot(n)) < tol), key=lambda e: -e.Curve.Radius)
+            faces.append(Part.Face([Part.Wire([e]) for e in rims]))
+        shell = Part.Shell(faces)
+        shell.sewShape()
+        solid = Part.Solid(shell)
+        if solid.Volume < 0:
+            solid.reverse()
+        return solid if solid.isValid() else None
+    except Exception:
+        return None
+
+
+def _unify_same_domain(shape):
+    """Merge faces that lie on one surface (OCC UnifySameDomain); removeSplitter leaves cone pieces split."""
+    try:
+        u = Part.ShapeUpgrade.UnifySameDomain(shape)
+        u.build()
+        out = u.shape()
+        if out.isValid() and out.Solids and abs(out.Volume - shape.Volume) <= 1e-6 * max(abs(shape.Volume), 1):
+            return out.Solids[0] if len(out.Solids) == 1 else out
+    except Exception:
+        pass
+    return shape
 
 
 def _opening_centers(face):
@@ -1370,13 +1494,19 @@ def _push_faces(ctx, moves, note):
         faces = located
 
     result = base
-    prisms = [(_push_profile(base, f, p["_n"], d).extrude(p["_n"] * d), d) for f, p, d in faces]
+    prisms, tapered = [], False
+    for f, p, d in faces:
+        tool = _tapered_push(base, f, p["_n"], d)
+        tapered |= tool is not None
+        prisms.append((tool if tool is not None else _push_profile(base, f, p["_n"], d).extrude(p["_n"] * d), d))
     for prism, d in prisms:
         if d > 0:
             result = result.fuse(prism)
     for prism, d in prisms:
         if d < 0:
             result = result.cut(prism)
+    if tapered:
+        result = _unify_same_domain(result)
     for h, s in sorted(shifts.values(), key=lambda it: -it[0]["_r"]):  # counterbores before their holes
         g = _shifted_hole(h, s)
         result = result.cut(_hole_cutter(shape, g, h["_base"], h["_r"], diag))
@@ -1522,9 +1652,27 @@ def _dedupe_edges(edges):
     return out
 
 
-def _select_edges(ctx, shape, selectors):
-    if isinstance(selectors, dict):
+def _edge_selectors(selectors):
+    """Selectors as dicts. A bare ID is accepted too: E# an edge, H# a hole, C# a boss, any other ID a face
+    (all its edges); anything else is refused with the accepted forms."""
+    if isinstance(selectors, (dict, str)):
         selectors = [selectors]
+    out = []
+    for sel in selectors or []:
+        if isinstance(sel, dict):
+            out.append(sel)
+            continue
+        sid = str(sel).strip().upper()
+        if not re.fullmatch(r"[A-Z]+\d+", sid):
+            raise EngineError(f"Unknown edge selector '{sel}'. Use an edge ID like E12 (from the model data), "
+                              "{\"face\": \"P3\"}, {\"between\": [\"P1\", \"P3\"]} or {\"hole\": \"H2\", \"end\": \"entry\"}")
+        key = {"E": "edge", "H": "hole", "C": "boss"}.get(re.match(r"[A-Z]+", sid).group(0), "face")
+        out.append({key: sid})
+    return out
+
+
+def _select_edges(ctx, shape, selectors):
+    selectors = _edge_selectors(selectors)
     if not selectors:
         raise EngineError("Provide at least one edge selector")
     edges = []
@@ -1832,9 +1980,8 @@ def _resize_boss(ctx, f, new_r):
     diag, tol = _tolerances(shape)
     a, base, r = f["_a"], f["_base"], f["_r"]
     t0, t1 = f["_t"]
-    eps = max(tol * 20, 0.01)
-    free0 = not _inside_any(shape, base + a * (t0 - eps), tol)
-    free1 = not _inside_any(shape, base + a * (t1 + eps), tol)
+    free0 = _boss_end_free(shape, a, base, t0, r, -1, tol)
+    free1 = _boss_end_free(shape, a, base, t1, r, 1, tol)
     skin = max(tol * 100, 0.01)  # overlap so booleans don't leave slivers
     if abs(new_r - r) < 1e-9:
         return f"{f['id']} is already Ø{_r(2 * new_r)} mm"
@@ -1843,13 +1990,41 @@ def _resize_boss(ctx, f, new_r):
         lo, hi = t0 - (m if free0 else 0.0), t1 + (m if free1 else 0.0)
         tube = Part.makeCylinder(r + skin, hi - lo, base + a * lo, a).cut(Part.makeCylinder(new_r, hi - lo, base + a * lo, a))
         result = shape.cut(tube)
-    else:
-        tube = Part.makeCylinder(new_r, t1 - t0, base + a * t0, a).cut(
-            Part.makeCylinder(max(r - skin, r * 0.5), t1 - t0, base + a * t0, a))
-        result = shape.fuse(tube)
+    reopened = []
+    if new_r > r:
+        # holes that open on the boss's surface (radial taps, cross holes) would be buried by the tube (a through
+        # hole would turn blind): they are filled, and cut again whole with that end on the new surface. Cutting
+        # only the new stretch would leave the hole wall in coincident pieces that later clean-ups mangle.
+        grow = []
+        for h in ctx.fmap.values():
+            if h["kind"] != "hole" or h["_obj"] != f["_obj"] or any(g is h for g, _ in grow):
+                continue
+            for end, sgn in ((0, -1.0), (1, 1.0)):
+                p = h["_base"] + h["_a"] * h["_t"][end]
+                d = p - base
+                radial = d - a * d.dot(a)
+                if not h["_open"][end] or not (t0 - tol <= d.dot(a) <= t1 + tol) or \
+                        abs(radial.Length - r) > max(h["_r"], tol * 10):
+                    continue
+                cos = (h["_a"] * sgn).dot(radial.normalize())
+                if cos >= 0.2:
+                    t_new = list(h["_t"])
+                    t_new[end] += sgn * (new_r - r) / cos
+                    grow.append((h, t_new))
+                    break
+        base_shape = _fill_holes(shape, [h for h, _ in grow]) if grow else shape
+        r_in = max(r - skin, r * 0.5)
+        tube = Part.makeCylinder(new_r, t1 - t0, base + a * t0, a).cut(Part.makeCylinder(r_in, t1 - t0, base + a * t0, a))
+        result = base_shape.fuse(tube)
+        for h, t_new in grow:
+            g = dict(h, _t=tuple(t_new))
+            result = result.cut(_hole_cutter(result, g, h["_base"], h["_r"], diag))
+            ctx.registry_updates[h["id"]] = {"t": t_new}
+            reopened.append(h["id"])
     _set_shape(ctx.doc, obj, result, f"{f['id']} Ø{_r(2 * r)} → Ø{_r(2 * new_r)}")
     ctx.registry_updates[f["id"]] = {"r": new_r}
-    return f"{f['id']}: Ø{_r(2 * r)} → Ø{_r(2 * new_r)} mm"
+    msg = f"{f['id']}: Ø{_r(2 * r)} → Ø{_r(2 * new_r)} mm"
+    return msg + (f"; {', '.join(reopened)} opened through the new wall" if reopened else "")
 
 
 def _refillet(ctx, f, new_r):
@@ -2402,8 +2577,7 @@ def op_chamfer_edges(ctx, size, edges, object=None):
 
 
 def _obj_from_selectors(ctx, selectors):
-    if isinstance(selectors, dict):
-        selectors = [selectors]
+    selectors = _edge_selectors(selectors)
     for sel in selectors or []:
         if "edge" in sel or "edges" in sel:
             ids = sel.get("edges") or [sel["edge"]]
@@ -2472,6 +2646,8 @@ def op_add_primitive(ctx, shape, dimensions, position, direction=None, operation
         return (f"Replaced the shape of {obj.Label} with a {shape}: volume {_r(base.Volume, 3)} → "
                 f"{_r(tool.Volume, 3)} mm³, bbox {_bbox_dict(tool.BoundBox)['size']}")
     ctx.allow_removed.add("*")  # a primitive can cover or cut through anything
+    operation = {"add": "fuse", "union": "fuse", "join": "fuse", "subtract": "cut", "remove": "cut",
+                 "difference": "cut", "intersection": "common"}.get(operation, operation)
     if operation == "fuse":
         result = base.fuse(tool)
     elif operation == "cut":
@@ -3188,7 +3364,18 @@ def ping():
 def open_model(session_id, source_path, work_path, registry=None):
     _close_session(session_id, work_path)
     ext = os.path.splitext(source_path)[1].lower()
-    if ext == ".fcstd":
+    mesh_report = None
+    if ext in mesh_import.MESH_EXTS:
+        # a triangle mesh: rebuilt as exact solids first (turned profile / planes + fitted cylinders)
+        try:
+            bodies, mesh_report = mesh_import.rebuild(source_path)
+        except mesh_import.MeshImportError as e:
+            raise EngineError(f"Could not rebuild a solid from the mesh: {e}")
+        doc = App.newDocument("AI_" + re.sub(r"\W", "", session_id)[-8:])
+        for name, solid in bodies:
+            o = doc.addObject("Part::Feature", name)
+            o.Shape = solid
+    elif ext == ".fcstd":
         doc = App.openDocument(source_path)
     else:
         doc = App.newDocument("AI_" + re.sub(r"\W", "", session_id)[-8:])
@@ -3221,7 +3408,8 @@ def open_model(session_id, source_path, work_path, registry=None):
     _arrange_window()
     _activate(doc, fit=True)
     an = _analyze(doc, registry)
-    return {"info": _model_info(doc, an), "registry": an.reg}
+    return {"info": _model_info(doc, an), "registry": an.reg,
+            **({"mesh_import": mesh_report} if mesh_report else {})}
 
 
 def reload(session_id, work_path, registry=None, datums=None):
@@ -3284,6 +3472,29 @@ def apply(session_id, work_path, op, params=None, registry=None, tolerance=None,
                       + "Unlock it first (unlock_dimension) or choose another edit.")
 
 
+def _unknown_params(fn, params):
+    """Arguments the op function doesn't take (none when it accepts **kwargs)."""
+    sig = inspect.signature(fn)
+    if any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()):
+        return []
+    return sorted(set(params) - set(sig.parameters) - {"ctx"})
+
+
+# Material-adding / removing edits: if nothing changed, the tool missed the part (a placement or a rotation of a
+# symmetric part can legitimately leave the geometry identical, so those are not checked).
+MATERIAL_OPS = {"add_primitive", "push_pull_face", "fillet_edges", "chamfer_edges", "remove_features"}
+
+
+def _geometry_key(an):
+    """Volume, area and centre of mass of every solid object: equal before and after = the edit was a no-op."""
+    out = []
+    for o in an.objs:
+        s = an.shapes[o.Name]
+        c = s.Solids[0].CenterOfMass if len(s.Solids) == 1 else s.BoundBox.Center
+        out.append((o.Name, round(s.Volume, 4), round(s.Area, 4), round(c.x, 5), round(c.y, 5), round(c.z, 5)))
+    return sorted(out)
+
+
 def _apply_once(doc, an, op, params, tol, locks, datums, preview_mesh=None, checks=None):
     before = {o.Name: _r(an.shapes[o.Name].Volume, 3) for o in an.objs}
     names_before = {o.Name for o in doc.Objects}
@@ -3291,9 +3502,15 @@ def _apply_once(doc, an, op, params, tol, locks, datums, preview_mesh=None, chec
     ctx = _Ctx(doc, an)
     ctx.checks = checks or {}
 
+    # LLMs sometimes add an argument the operation doesn't take (e.g. object= on a face edit): ignore it
+    ignored = _unknown_params(OPS[op], params)
+    params = {k: v for k, v in params.items() if k not in ignored}
+
     doc.openTransaction(f"AetherCAD: {op}")
     try:
         message = OPS[op](ctx, **params)
+        if ignored:
+            message += f"\n(Ignored argument{'s' if len(ignored) > 1 else ''} {op} doesn't take: {', '.join(ignored)}.)"
         doc.recompute()
         newly_bad = _invalid_objects(doc) - invalid_before
         if newly_bad:
@@ -3306,6 +3523,12 @@ def _apply_once(doc, an, op, params, tol, locks, datums, preview_mesh=None, chec
                 reg["items"][fid].update(patch)
         an2 = _analyze(doc, reg, datums)
         verified = [_verify_item(an2, item, doc, tol) for item in ctx.verify]
+        if (op in MATERIAL_OPS and not any(v.get("status") == "ok" for v in verified)
+                and _geometry_key(an) == _geometry_key(an2)):
+            # e.g. a cutting tool placed where it misses the part: don't record an edit that changed nothing
+            # (an edit whose requested value is verified, such as a size already at that value, is fine)
+            raise EngineError(f"{op} did not change the geometry (the tool may not touch the part: check its "
+                              "position and size), so nothing was changed.")
         # A requested value that can't be measured after the edit means the edit didn't produce it: roll back.
         unmeasured = [v for item, v in zip(ctx.verify, verified)
                       if len(item) > 2 and item[2] is not None and v.get("status") != "ok"]

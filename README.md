@@ -1,6 +1,7 @@
 # AetherCAD: Conversational CAD Editing on FreeCAD
 
-Upload an existing CAD model (STEP, IGES, BREP or FreeCAD `.FCStd`). It opens in FreeCAD, and a chat
+Upload an existing CAD model (STEP, IGES, BREP, FreeCAD `.FCStd`, or an STL / OBJ / PLY mesh, which is first rebuilt
+as exact solids). It opens in FreeCAD, and a chat
 interface lets you ask questions about it or request **precise** modifications in plain English.
 Every change is applied in FreeCAD, measured, versioned, and shown in the web 3D viewer.
 
@@ -118,6 +119,7 @@ backend/
     server.py              JSON-RPC server inside FreeCAD (GUI or headless)
     engine.py              Feature recognition, IDs, operations, verification, export
     analysis.py            B-spline surface fitting, counterbores, hole patterns, dimensions (incl. angles, radii)
+    mesh_import.py         STL / OBJ / PLY → exact solids (turned profile or planes + fitted cylinders)
     headless.py            Entry point for freecadcmd
   tests/                   Engine test suite (run with freecadcmd) + fixture parts
   data/sessions/<id>/      Per-session files (created at runtime)
@@ -205,6 +207,16 @@ npm run dev                      # http://localhost:3000
 
 ## Using it
 
+**Mesh files (STL / OBJ / PLY).** A mesh has only triangles, so the upload first rebuilds each separate body as an
+exact solid, which can then be edited like a STEP part. Turned parts (nose cones, body tubes, couplers, bulkheads,
+adapters) are rebuilt from their cross-section: the axis is found from the triangle normals, the half-profile is split
+into lines and arcs refitted to the mesh vertices, revolved, and off-axis holes are fitted and cut. Other parts (fins,
+plates, brackets) get exact planar faces and snapped cylinders. The upload message reports, per body, the exact face
+count and the largest distance of the mesh from the new surface (0.0004 mm for the demo nose cone,
+`demo/nosecone/`; 0.008 mm for the demo rocket nozzle and its thrust-mount ring, `demo/nozzle/`).
+Free-form surfaces other than surfaces of revolution stay out of reach of the prismatic rebuild.
+
+
 1. Attach or drop a CAD file in the chat. It opens in FreeCAD and appears in the 3D workspace.
 2. Ask questions: *"How thick is the plate?"*, *"List the holes and their positions"*, *"Distance between H2 and H4?"*
 3. Request changes: *"Make the four 6 mm holes 8 mm"*, *"Make it 120 mm long"*,
@@ -238,7 +250,7 @@ npm run dev                      # http://localhost:3000
 ## Tests
 
 ```bash
-# Engine: parsing + every edit + analysis, against parts with known ground truth (headless FreeCAD, ~30 s, 383 checks)
+# Engine: parsing + every edit + analysis, against parts with known ground truth (headless FreeCAD, ~40 s, 399 checks)
 "C:/Program Files/FreeCAD 1.1/bin/freecadcmd.exe" backend/tests/test_engine.py
 # Backend unit tests: fast path, units, standards, side effects, tool units, threads, materials, BOM, plans, alternatives (62 tests)
 cd backend && venv\Scripts\python -m unittest discover -s app -t .
@@ -268,6 +280,7 @@ Check your limits at <https://console.groq.com/settings/limits>.
 | `LLM API key is missing or invalid` | Set `GROQ_API_KEY` or `LLM_API_KEY` in `backend/.env` and restart the backend. |
 | Changes to `backend/.env` have no effect | The auto-reloader only watches `.py` files; restart `python main.py`. |
 | `MongoDB unreachable` warning | Sessions fall back to memory. Check `MONGODB_URI` and your Atlas IP allow-list. |
-| `No solid geometry found in the file` | The file has only meshes or surfaces; only solids can be edited. |
+| `No solid geometry found in the file` | The file has only open surfaces; only solids can be edited. (Closed meshes, STL / OBJ / PLY, are rebuilt as solids.) |
+| `Could not rebuild a solid from the mesh` | The mesh isn't a closed body, or a turned part's cross-section couldn't be cut. Export a closed (watertight) mesh, or STEP if you have it. |
 
 More detail in [docs/ARCHITECTURE.md § Troubleshooting](docs/ARCHITECTURE.md#18-troubleshooting).
